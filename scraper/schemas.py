@@ -1,0 +1,458 @@
+"""Pydantic schemas for crawler, extraction, and storage artifacts."""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+from enum import Enum
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from scraper.config import load_json_resource
+from scraper.utils.text import generate_program_id, unique_preserve_order
+
+
+APPROVED_PROVINCES = set(load_json_resource("provinces.json"))
+APPROVED_MUNICIPALITIES = set(load_json_resource("municipalities.json"))
+
+
+class FundingType(str, Enum):
+    GRANT = "Grant"
+    LOAN = "Loan"
+    EQUITY = "Equity"
+    GUARANTEE = "Guarantee"
+    HYBRID = "Hybrid"
+    OTHER = "Other"
+    UNKNOWN = "Unknown"
+
+
+class DeadlineType(str, Enum):
+    FIXED_DATE = "FixedDate"
+    ROLLING = "Rolling"
+    OPEN = "Open"
+    UNKNOWN = "Unknown"
+
+
+class GeographyScope(str, Enum):
+    NATIONAL = "National"
+    PROVINCE = "Province"
+    MUNICIPALITY = "Municipality"
+    LOCAL = "Local"
+    INTERNATIONAL = "International"
+    UNKNOWN = "Unknown"
+
+
+class TriState(str, Enum):
+    YES = "Yes"
+    NO = "No"
+    MAYBE = "Maybe"
+    UNKNOWN = "Unknown"
+
+
+class InterestType(str, Enum):
+    FIXED = "Fixed"
+    PRIME_LINKED = "Prime-linked"
+    FACTOR_RATE = "Factor-rate"
+    UNKNOWN = "Unknown"
+
+
+class RepaymentFrequency(str, Enum):
+    WEEKLY = "Weekly"
+    MONTHLY = "Monthly"
+    VARIABLE = "Variable"
+    UNKNOWN = "Unknown"
+
+
+class ApplicationChannel(str, Enum):
+    ONLINE_FORM = "Online form"
+    EMAIL = "Email"
+    BRANCH = "Branch"
+    PARTNER_REFERRAL = "Partner referral"
+    UNKNOWN = "Unknown"
+
+
+class ProgrammeNature(str, Enum):
+    DIRECT_FUNDING = "direct_funding"
+    VOUCHER_SUPPORT = "voucher_support"
+    NON_FINANCIAL_SUPPORT = "non_financial_support"
+    UNKNOWN = "unknown"
+
+
+class DisplayCategory(str, Enum):
+    FUNDING = "funding"
+    SUPPORT = "support"
+    BOTH = "both"
+    UNKNOWN = "unknown"
+
+
+class SupportType(str, Enum):
+    VOUCHER = "voucher"
+    MENTORSHIP = "mentorship"
+    MARKET_LINKAGE = "market_linkage"
+    BUSINESS_MANAGEMENT_TRAINING = "business_management_training"
+    APPLICATION_SUPPORT = "application_support"
+    SPONSORSHIP = "sponsorship"
+    BUSINESS_SUPPORT = "business_support"
+    UNKNOWN = "unknown"
+
+
+class FieldEvidence(BaseModel):
+    """Field-level traceability for extracted evidence."""
+
+    field_name: str
+    snippet: str
+    source_url: str
+    confidence: float = 0.0
+    normalized_value: Optional[Any] = None
+    section_name: Optional[str] = None
+
+
+class CrawlTraceEntry(BaseModel):
+    """One crawl/discovery event for debugging and provenance."""
+
+    event: str
+    url: str
+    adapter_name: Optional[str] = None
+    source_url: Optional[str] = None
+    canonical_url: Optional[str] = None
+    depth: Optional[int] = None
+    score: Optional[float] = None
+    reason: Optional[str] = None
+    page_type: Optional[str] = None
+    page_role: Optional[str] = None
+    status_code: Optional[int] = None
+    records_found: int = 0
+    discovered_links: int = 0
+    document_links: int = 0
+    notes: List[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class PageFetchResult(BaseModel):
+    """Output of a fetcher call."""
+
+    url: str
+    requested_url: str
+    canonical_url: str
+    final_url: Optional[str] = None
+    status_code: Optional[int] = None
+    content_type: Optional[str] = None
+    html: str = ""
+    title: Optional[str] = None
+    fetch_method: str = "http"
+    fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    headers: Dict[str, str] = Field(default_factory=dict)
+    js_rendered: bool = False
+    notes: List[str] = Field(default_factory=list)
+
+    @property
+    def succeeded(self) -> bool:
+        return bool(self.status_code and 200 <= self.status_code < 400 and self.html)
+
+
+class FundingProgrammeRecord(BaseModel):
+    """Canonical normalized funding programme record."""
+
+    program_id: str = ""
+    program_name: Optional[str] = None
+    funder_name: Optional[str] = None
+    site_adapter: Optional[str] = None
+    page_type: Optional[str] = None
+    parent_programme_name: Optional[str] = None
+    programme_nature: ProgrammeNature = ProgrammeNature.UNKNOWN
+    display_category: DisplayCategory = DisplayCategory.UNKNOWN
+    support_type: SupportType = SupportType.UNKNOWN
+    source_url: str
+    source_urls: List[str] = Field(default_factory=list)
+    source_domain: str
+    source_page_title: Optional[str] = None
+    scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    raw_eligibility_data: Optional[List[str]] = None
+    evidence_by_field: Dict[str, List[str]] = Field(default_factory=dict)
+    extraction_confidence_by_field: Dict[str, float] = Field(default_factory=dict)
+
+    funding_type: FundingType = FundingType.UNKNOWN
+    funding_lines: List[str] = Field(default_factory=list)
+    ticket_min: Optional[float] = None
+    ticket_max: Optional[float] = None
+    currency: Optional[str] = None
+    program_budget_total: Optional[float] = None
+
+    deadline_type: DeadlineType = DeadlineType.UNKNOWN
+    deadline_date: Optional[date] = None
+    funding_speed_days_min: Optional[int] = None
+    funding_speed_days_max: Optional[int] = None
+
+    geography_scope: GeographyScope = GeographyScope.UNKNOWN
+    provinces: List[str] = Field(default_factory=list)
+    municipalities: List[str] = Field(default_factory=list)
+    postal_code_ranges: List[str] = Field(default_factory=list)
+
+    industries: List[str] = Field(default_factory=list)
+    use_of_funds: List[str] = Field(default_factory=list)
+    business_stage_eligibility: List[str] = Field(default_factory=list)
+    turnover_min: Optional[float] = None
+    turnover_max: Optional[float] = None
+    years_in_business_min: Optional[float] = None
+    years_in_business_max: Optional[float] = None
+    employee_min: Optional[int] = None
+    employee_max: Optional[int] = None
+    ownership_targets: List[str] = Field(default_factory=list)
+    entity_types_allowed: List[str] = Field(default_factory=list)
+    certifications_required: List[str] = Field(default_factory=list)
+
+    security_required: TriState = TriState.UNKNOWN
+    equity_required: TriState = TriState.UNKNOWN
+    payback_months_min: Optional[int] = None
+    payback_months_max: Optional[int] = None
+    interest_type: InterestType = InterestType.UNKNOWN
+    repayment_frequency: RepaymentFrequency = RepaymentFrequency.UNKNOWN
+
+    exclusions: List[str] = Field(default_factory=list)
+    required_documents: List[str] = Field(default_factory=list)
+
+    application_channel: ApplicationChannel = ApplicationChannel.UNKNOWN
+    application_url: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+
+    raw_text_snippets: Dict[str, List[str]] = Field(default_factory=dict)
+    extraction_confidence: Dict[str, float] = Field(default_factory=dict)
+    related_documents: List[str] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+    @field_validator(
+        "funding_lines",
+        "provinces",
+        "municipalities",
+        "postal_code_ranges",
+        "industries",
+        "use_of_funds",
+        "business_stage_eligibility",
+        "ownership_targets",
+        "entity_types_allowed",
+        "certifications_required",
+        "exclusions",
+        "required_documents",
+        "related_documents",
+        "notes",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_list_fields(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        cleaned: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = " ".join(str(item).split()).strip()
+            if text:
+                cleaned.append(text)
+        return unique_preserve_order(cleaned)
+
+    @field_validator("source_urls", mode="before")
+    @classmethod
+    def _normalize_source_urls(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return unique_preserve_order([str(item).strip() for item in value if str(item).strip()])
+
+    @field_validator("raw_eligibility_data", mode="before")
+    @classmethod
+    def _normalize_raw_eligibility(cls, value: Any) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = [value]
+        cleaned = unique_preserve_order([" ".join(str(item).split()).strip() for item in value if str(item).strip()])
+        return cleaned or None
+
+    @field_validator("raw_text_snippets", mode="before")
+    @classmethod
+    def _normalize_raw_snippets(cls, value: Any) -> Dict[str, List[str]]:
+        if not value:
+            return {}
+        normalized: Dict[str, List[str]] = {}
+        for field_name, snippets in value.items():
+            if snippets is None:
+                continue
+            if isinstance(snippets, str):
+                snippet_values = [snippets]
+            else:
+                snippet_values = list(snippets)
+            cleaned = unique_preserve_order(
+                [" ".join(str(item).split()).strip() for item in snippet_values if str(item).strip()]
+            )
+            if cleaned:
+                normalized[str(field_name)] = cleaned
+        return normalized
+
+    @field_validator("evidence_by_field", mode="before")
+    @classmethod
+    def _normalize_evidence_by_field(cls, value: Any) -> Dict[str, List[str]]:
+        return cls._normalize_raw_snippets(value)
+
+    @field_validator("extraction_confidence_by_field", mode="before")
+    @classmethod
+    def _normalize_extraction_confidence_by_field(cls, value: Any) -> Dict[str, float]:
+        if not value:
+            return {}
+        normalized: Dict[str, float] = {}
+        for field_name, confidence in value.items():
+            try:
+                normalized[str(field_name)] = max(0.0, min(float(confidence), 1.0))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    @field_validator("extraction_confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, value: Any) -> Dict[str, float]:
+        if not value:
+            return {}
+        normalized: Dict[str, float] = {}
+        for field_name, confidence in value.items():
+            try:
+                normalized[str(field_name)] = max(0.0, min(float(confidence), 1.0))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    @field_validator("source_url", "application_url")
+    @classmethod
+    def _validate_urls(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("URL must be http(s) with a host")
+        return value
+
+    @field_validator("contact_email")
+    @classmethod
+    def _validate_email(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return value.strip().lower()
+
+    @field_validator("provinces")
+    @classmethod
+    def _validate_provinces(cls, value: List[str]) -> List[str]:
+        invalid = [province for province in value if province not in APPROVED_PROVINCES]
+        if invalid:
+            raise ValueError("Unknown provinces: %s" % ", ".join(sorted(invalid)))
+        return value
+
+    @field_validator("municipalities")
+    @classmethod
+    def _validate_municipalities(cls, value: List[str]) -> List[str]:
+        invalid = [municipality for municipality in value if municipality not in APPROVED_MUNICIPALITIES]
+        if invalid:
+            raise ValueError("Unknown municipalities: %s" % ", ".join(sorted(invalid)))
+        return value
+
+    @model_validator(mode="after")
+    def _validate_ranges(self) -> "FundingProgrammeRecord":
+        self.ticket_min, self.ticket_max = self._normalize_order(self.ticket_min, self.ticket_max)
+        self.payback_months_min, self.payback_months_max = self._normalize_order(
+            self.payback_months_min,
+            self.payback_months_max,
+        )
+        self.years_in_business_min, self.years_in_business_max = self._normalize_order(
+            self.years_in_business_min,
+            self.years_in_business_max,
+        )
+        self.turnover_min, self.turnover_max = self._normalize_order(self.turnover_min, self.turnover_max)
+        self.employee_min, self.employee_max = self._normalize_order(self.employee_min, self.employee_max)
+        self.funding_speed_days_min, self.funding_speed_days_max = self._normalize_order(
+            self.funding_speed_days_min,
+            self.funding_speed_days_max,
+        )
+        if self.application_channel == ApplicationChannel.ONLINE_FORM and not self.application_url:
+            raise ValueError("application_url is required when application_channel is Online form")
+        if not self.source_urls:
+            self.source_urls = [self.source_url]
+        elif self.source_url not in self.source_urls:
+            self.source_urls.insert(0, self.source_url)
+        if not self.evidence_by_field and self.raw_text_snippets:
+            self.evidence_by_field = dict(self.raw_text_snippets)
+        if not self.raw_text_snippets and self.evidence_by_field:
+            self.raw_text_snippets = dict(self.evidence_by_field)
+        if not self.extraction_confidence_by_field and self.extraction_confidence:
+            self.extraction_confidence_by_field = dict(self.extraction_confidence)
+        if not self.extraction_confidence and self.extraction_confidence_by_field:
+            self.extraction_confidence = dict(self.extraction_confidence_by_field)
+        if not self.program_id:
+            self.program_id = generate_program_id(self.source_domain, self.funder_name, self.program_name)
+        return self
+
+    @staticmethod
+    def _normalize_order(
+        minimum: Optional[float],
+        maximum: Optional[float],
+    ) -> tuple[Optional[float], Optional[float]]:
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return maximum, minimum
+        return minimum, maximum
+
+    def overall_confidence(self) -> float:
+        if not self.extraction_confidence:
+            return 0.0
+        return round(sum(self.extraction_confidence.values()) / len(self.extraction_confidence), 4)
+
+
+class ExtractionResult(BaseModel):
+    """Parser output for a fetched page."""
+
+    page_url: str
+    page_title: Optional[str] = None
+    discovered_links: List[str] = Field(default_factory=list)
+    internal_links: List[str] = Field(default_factory=list)
+    application_links: List[str] = Field(default_factory=list)
+    document_links: List[str] = Field(default_factory=list)
+    records: List[FundingProgrammeRecord] = Field(default_factory=list)
+    evidence: List[FieldEvidence] = Field(default_factory=list)
+    page_type: str = "unknown"
+    notes: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class RunSummary(BaseModel):
+    """Top-level crawl report written to disk for QA and telemetry."""
+
+    run_id: str
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    status: str = "running"
+    seed_urls: List[str] = Field(default_factory=list)
+    total_urls_crawled: int = 0
+    pages_fetched_successfully: int = 0
+    pages_failed: int = 0
+    programmes_extracted: int = 0
+    programmes_after_dedupe: int = 0
+    records_with_missing_program_name: int = 0
+    records_with_missing_funder_name: int = 0
+    records_with_unknown_funding_type: int = 0
+    records_with_no_application_route: int = 0
+    records_with_low_confidence_extraction: int = 0
+    records_with_borderline_review: int = 0
+    records_rejected_for_quality: int = 0
+    low_confidence_threshold: float = 0.0
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class CrawlState(BaseModel):
+    """Persistent crawl progress so runs can resume between domains."""
+
+    run_id: Optional[str] = None
+    completed_domains: List[str] = Field(default_factory=list)
+    failed_domains: List[str] = Field(default_factory=list)
+    last_processed_domain: Optional[str] = None
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

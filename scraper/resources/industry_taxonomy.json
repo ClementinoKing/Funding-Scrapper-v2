@@ -1,0 +1,25 @@
+{
+  "Agriculture": ["agriculture", "farming", "agribusiness", "agri", "crop", "livestock"],
+  "Agri-processing": ["agri-processing", "agro-processing", "food processing", "processing plant"],
+  "Manufacturing": ["manufacturing", "factory", "fabrication", "industrial production"],
+  "Retail": ["retail", "shop", "store", "trading"],
+  "Wholesale": ["wholesale", "distribution", "merchant"],
+  "Construction": ["construction", "contractor", "built environment", "civil works"],
+  "Transport and Logistics": ["transport", "logistics", "fleet", "courier", "freight"],
+  "Tourism and Hospitality": ["tourism", "hospitality", "guesthouse", "hotel", "travel"],
+  "ICT": ["ict", "software", "technology", "digital", "saas", "it services"],
+  "FinTech": ["fintech", "payments", "lending platform", "financial technology"],
+  "HealthTech": ["healthtech", "medical technology", "digital health"],
+  "Education": ["education", "edtech", "training", "skills development"],
+  "Energy": ["energy", "solar", "renewable", "power"],
+  "Green Economy": ["green", "climate", "circular economy", "sustainability", "decarbonisation"],
+  "Mining": ["mining", "minerals", "extractives"],
+  "Creative Industries": ["creative", "media", "fashion", "design", "film", "music"],
+  "Business Services": ["business services", "consulting", "professional services"],
+  "Export": ["export", "international trade", "trade finance"],
+  "Social Enterprise": ["social enterprise", "community enterprise", "impact venture"],
+  "Property": ["property", "real estate", "commercial property"],
+  "Water and Sanitation": ["water", "sanitation", "wastewater"],
+  "Waste Management": ["waste", "recycling", "waste management"]
+}
+

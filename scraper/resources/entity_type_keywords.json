@@ -1,0 +1,11 @@
+{
+  "Sole proprietor": ["sole proprietor", "sole trader"],
+  "Partnership": ["partnership"],
+  "Private company": ["pty ltd", "private company", "private limited"],
+  "Close corporation": ["close corporation", "cc"],
+  "Cooperative": ["cooperative", "co-operative", "co-op"],
+  "Non-profit": ["npo", "npc", "non-profit", "non profit"],
+  "Trust": ["trust"],
+  "Joint venture": ["joint venture"]
+}
+

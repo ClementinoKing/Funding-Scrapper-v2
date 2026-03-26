@@ -1,0 +1,55 @@
+"""Storage interface definitions."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List, Protocol
+
+from scraper.schemas import CrawlState, CrawlTraceEntry, FundingProgrammeRecord, PageFetchResult, RunSummary
+
+
+class StorageBackend(Protocol):
+    output_root: Path
+    csv_path: Path
+
+    def initialize_run(self, run_id: str) -> None:
+        ...
+
+    def save_page_snapshot(self, page: PageFetchResult) -> Path:
+        ...
+
+    def append_crawl_trace(self, entry: CrawlTraceEntry) -> None:
+        ...
+
+    def append_extracted_record(self, record: FundingProgrammeRecord) -> None:
+        ...
+
+    def save_programmes(self, records: List[FundingProgrammeRecord]) -> Path:
+        ...
+
+    def write_normalized_records(self, records: List[FundingProgrammeRecord]) -> Path:
+        ...
+
+    def write_low_confidence_review(self, records: List[FundingProgrammeRecord]) -> Path:
+        ...
+
+    def write_borderline_review(self, records: List[FundingProgrammeRecord]) -> Path:
+        ...
+
+    def write_merge_trace(self, trace: List[dict]) -> Path:
+        ...
+
+    def write_run_summary(self, summary: RunSummary) -> Path:
+        ...
+
+    def load_normalized_records(self) -> List[FundingProgrammeRecord]:
+        ...
+
+    def load_crawl_state(self) -> CrawlState:
+        ...
+
+    def write_crawl_state(self, state: CrawlState) -> Path:
+        ...
+
+    def load_borderline_review_records(self) -> List[FundingProgrammeRecord]:
+        ...

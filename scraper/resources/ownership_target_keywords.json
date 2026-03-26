@@ -1,0 +1,11 @@
+{
+  "Black-owned": ["black-owned", "black owned", "bee", "b-bbee", "bbee", "broad-based black economic empowerment"],
+  "Women-owned": ["women-owned", "women owned", "female-owned", "female led", "black women"],
+  "Youth-owned": ["youth-owned", "youth owned", "young entrepreneur", "18-35", "under 35"],
+  "Disabled-owned": ["disabled-owned", "persons with disabilities", "entrepreneurs with disabilities", "disability-owned"],
+  "Township businesses": ["township", "township enterprise", "township business"],
+  "Rural enterprises": ["rural", "rural enterprise", "village economy"],
+  "Cooperatives": ["cooperative", "co-operative", "co-op"],
+  "Startups": ["startup", "start-up", "new venture", "early stage"]
+}
+

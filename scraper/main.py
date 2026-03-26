@@ -1,0 +1,176 @@
+"""CLI entrypoint for the funding programme scraper."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
+import typer
+
+from scraper.config import PACKAGE_ROOT, SupabaseSettings
+from scraper.adapters.registry import build_default_registry
+from scraper.pipeline import ScraperPipeline, build_settings_from_options, load_seed_urls
+from scraper.storage.supabase_store import SupabaseUploader
+
+
+app = typer.Typer(add_completion=False, no_args_is_help=True)
+
+
+def _print_summary(summary) -> None:
+    typer.echo("Run ID: %s" % summary.run_id)
+    typer.echo("Status: %s" % summary.status)
+    typer.echo("URLs crawled: %s" % summary.total_urls_crawled)
+    typer.echo("Pages fetched successfully: %s" % summary.pages_fetched_successfully)
+    typer.echo("Pages failed: %s" % summary.pages_failed)
+    typer.echo("Programmes extracted: %s" % summary.programmes_extracted)
+    typer.echo("Programmes after dedupe: %s" % summary.programmes_after_dedupe)
+    typer.echo("Low-confidence records: %s" % summary.records_with_low_confidence_extraction)
+    typer.echo("Borderline review records: %s" % summary.records_with_borderline_review)
+    typer.echo("Rejected records: %s" % summary.records_rejected_for_quality)
+    if summary.errors:
+        typer.echo("Errors: %s" % len(summary.errors))
+
+
+def _run_seed_pipeline(
+    seed_file: Path,
+    max_pages: int,
+    depth_limit: int,
+    output_path: Optional[Path],
+    headless: bool,
+    browser_fallback: bool,
+    respect_robots: bool,
+    max_domains: Optional[int] = None,
+):
+    settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
+    registry = build_default_registry()
+    seed_urls = load_seed_urls(seed_file)
+    pipeline = ScraperPipeline(settings, adapter_registry=registry)
+    return pipeline.run(seed_urls, max_domains=max_domains)
+
+
+@app.command("scrape-url")
+def scrape_url(
+    url: str = typer.Argument(..., help="The funding page URL to scrape."),
+    max_pages: int = typer.Option(1, help="Maximum pages to crawl."),
+    depth_limit: int = typer.Option(0, help="Maximum link depth from the seed URL."),
+    output_path: Optional[Path] = typer.Option(None, help="Optional output directory override."),
+    headless: bool = typer.Option(True, "--headless/--no-headless"),
+    browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
+    respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+) -> None:
+    settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
+    pipeline = ScraperPipeline(settings)
+    summary = pipeline.run([url])
+    _print_summary(summary)
+
+
+@app.command("crawl-domain")
+def crawl_domain(
+    url: str = typer.Argument(..., help="The domain root or listing page to crawl."),
+    max_pages: int = typer.Option(50, help="Maximum pages to crawl."),
+    depth_limit: int = typer.Option(2, help="Maximum depth from the seed URL."),
+    output_path: Optional[Path] = typer.Option(None, help="Optional output directory override."),
+    headless: bool = typer.Option(True, "--headless/--no-headless"),
+    browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
+    respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+) -> None:
+    settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
+    pipeline = ScraperPipeline(settings)
+    summary = pipeline.run([url])
+    _print_summary(summary)
+
+
+@app.command("run-seeds")
+def run_seeds(
+    seed_file: Path = typer.Option(PACKAGE_ROOT / "seeds" / "seed_urls.json", help="Seed URL JSON file."),
+    max_pages: int = typer.Option(50, help="Maximum pages to crawl."),
+    depth_limit: int = typer.Option(2, help="Maximum crawl depth."),
+    output_path: Optional[Path] = typer.Option(None, help="Optional output directory override."),
+    headless: bool = typer.Option(True, "--headless/--no-headless"),
+    browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
+    respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+    max_domains: Optional[int] = typer.Option(None, help="Maximum domains to process in this run."),
+) -> None:
+    summary = _run_seed_pipeline(
+        seed_file=seed_file,
+        max_pages=max_pages,
+        depth_limit=depth_limit,
+        output_path=output_path,
+        headless=headless,
+        browser_fallback=browser_fallback,
+        respect_robots=respect_robots,
+        max_domains=max_domains,
+    )
+    _print_summary(summary)
+
+
+@app.command("run-next-seed")
+def run_next_seed(
+    seed_file: Path = typer.Option(PACKAGE_ROOT / "seeds" / "seed_urls.json", help="Seed URL JSON file."),
+    max_pages: int = typer.Option(50, help="Maximum pages to crawl."),
+    depth_limit: int = typer.Option(2, help="Maximum crawl depth."),
+    output_path: Optional[Path] = typer.Option(None, help="Optional output directory override."),
+    headless: bool = typer.Option(True, "--headless/--no-headless"),
+    browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
+    respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+) -> None:
+    summary = _run_seed_pipeline(
+        seed_file=seed_file,
+        max_pages=max_pages,
+        depth_limit=depth_limit,
+        output_path=output_path,
+        headless=headless,
+        browser_fallback=browser_fallback,
+        respect_robots=respect_robots,
+        max_domains=1,
+    )
+    _print_summary(summary)
+
+
+@app.command("export-csv")
+def export_csv(
+    output_path: Optional[Path] = typer.Option(None, help="Optional output directory override."),
+    csv_path: Optional[Path] = typer.Option(None, help="Optional explicit CSV target path."),
+) -> None:
+    settings = build_settings_from_options(output_path, None, None, None, None, None)
+    pipeline = ScraperPipeline(settings)
+    target = pipeline.export_csv(csv_path)
+    typer.echo("CSV exported to %s" % target)
+
+
+@app.command("push-supabase")
+def push_supabase(
+    normalized_json: Path = typer.Option(
+        PACKAGE_ROOT / "output" / "normalized" / "funding_programmes.json",
+        help="Normalized JSON file to upload.",
+    ),
+    run_summary: Path = typer.Option(
+        PACKAGE_ROOT / "output" / "logs" / "run_summary.json",
+        help="Run summary JSON file to upload alongside the records.",
+    ),
+) -> None:
+    try:
+        supabase_settings = SupabaseSettings.from_env()
+    except ValueError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1)
+
+    if not normalized_json.exists():
+        typer.echo("Normalized JSON not found: %s" % normalized_json)
+        raise typer.Exit(code=1)
+
+    uploader = SupabaseUploader(supabase_settings)
+    try:
+        result = uploader.upload_from_files(normalized_json, run_summary)
+    except Exception as exc:
+        typer.echo("Supabase upload failed: %s" % exc)
+        raise typer.Exit(code=1)
+
+    typer.echo("Supabase upload complete.")
+    typer.echo("Project URL: %s" % supabase_settings.url)
+    typer.echo("RPC: %s" % supabase_settings.rpc_name)
+    typer.echo("Result: %s" % result)
+
+
+if __name__ == "__main__":
+    app()

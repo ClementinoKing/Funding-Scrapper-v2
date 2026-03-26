@@ -1,0 +1,853 @@
+"""Normalization logic turning candidate blocks into canonical records."""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from scraper.classifiers.funding_type import classify_funding_type
+from scraper.classifiers.geography import classify_geography
+from scraper.classifiers.industries import classify_industries
+from scraper.classifiers.ownership_targets import classify_ownership_targets
+from scraper.classifiers.use_of_funds import classify_use_of_funds
+from scraper.config import ScraperSettings
+from scraper.parsers.extractor_rules import CandidateBlock, detect_archive_signals, find_section_values
+from scraper.schemas import (
+    ApplicationChannel,
+    DeadlineType,
+    FieldEvidence,
+    FundingProgrammeRecord,
+    InterestType,
+    RepaymentFrequency,
+    TriState,
+)
+from scraper.utils.dates import looks_expired, parse_deadline_info
+from scraper.utils.money import extract_budget_total, extract_money_range, infer_default_currency
+from scraper.utils.text import (
+    clean_text,
+    extract_emails,
+    extract_phone_numbers,
+    looks_like_support_title,
+    match_keyword_map,
+    sentence_chunks,
+    split_lines,
+    take_best_snippet,
+    unique_preserve_order,
+)
+from scraper.utils.urls import extract_domain
+
+
+STAGE_PATTERNS = {
+    "startup": ["startup", "start-up"],
+    "seed": ["seed stage", "seed"],
+    "early stage": ["early stage", "early-stage"],
+    "growth stage": ["growth stage", "scale-up", "growth-focused"],
+    "expansion": ["expansion", "expanding"],
+    "established business": ["established business", "existing business", "trading for"],
+}
+
+SECURITY_PATTERNS = {
+    TriState.YES: ["collateral required", "security required", "must provide security"],
+    TriState.NO: ["no collateral", "no security required", "unsecured"],
+    TriState.MAYBE: ["may require security", "security may be required", "subject to security"],
+}
+
+EQUITY_PATTERNS = {
+    TriState.YES: ["equity stake required", "equity participation", "dilution required"],
+    TriState.NO: ["loan only", "no dilution", "no equity required"],
+    TriState.MAYBE: ["case-by-case equity", "equity participation may apply"],
+}
+
+INTEREST_PATTERNS = {
+    InterestType.FIXED: ["fixed interest", "fixed rate"],
+    InterestType.PRIME_LINKED: ["linked to prime", "prime-linked", "prime plus", "prime less"],
+    InterestType.FACTOR_RATE: ["factor fee", "factor rate"],
+}
+
+REPAYMENT_PATTERNS = {
+    RepaymentFrequency.MONTHLY: ["monthly instalments", "monthly installments", "monthly repayments", "repay monthly"],
+    RepaymentFrequency.WEEKLY: ["weekly repayments", "repay weekly"],
+    RepaymentFrequency.VARIABLE: ["flexible schedule", "variable repayment", "case-by-case repayment"],
+}
+
+APPLICATION_TEXT_PATTERNS = {
+    ApplicationChannel.EMAIL: ["submit by email", "email your application", "send application to"],
+    ApplicationChannel.BRANCH: ["visit nearest branch", "apply at branch", "branch application"],
+    ApplicationChannel.PARTNER_REFERRAL: ["partner referral", "through incubator", "via incubator", "through partner"],
+    ApplicationChannel.ONLINE_FORM: ["apply online", "online application", "apply now", "complete the form online"],
+}
+
+PUBLICATION_PATH_TERMS = (
+    "press-release",
+    "press-releases",
+    "news",
+    "media",
+    "publication",
+    "publications",
+    "article",
+    "articles",
+    "blog",
+    "case-study",
+    "case-studies",
+    "success-story",
+    "success-stories",
+)
+
+PUBLICATION_TEXT_TERMS = (
+    "press release",
+    "media release",
+    "news article",
+    "publication",
+    "publications",
+    "article",
+    "success story",
+    "case study",
+)
+
+INDUSTRY_SECTION_HINTS = (
+    "industry",
+    "industries",
+    "sector",
+    "sectors",
+    "focus area",
+    "focus areas",
+    "target sector",
+    "target sectors",
+    "eligible sector",
+    "eligible sectors",
+    "who can apply",
+)
+
+USE_OF_FUNDS_SECTION_HINTS = (
+    "use of funds",
+    "funding line",
+    "funding lines",
+    "funding products",
+    "funding offer",
+    "funding facilities",
+    "funding options",
+    "products and services",
+    "product",
+    "products",
+    "facilities",
+    "what the funding can be used for",
+    "can be used for",
+)
+
+
+def _add_evidence(
+    field_name: str,
+    normalized_value: object,
+    snippet: Optional[str],
+    confidence: float,
+    source_url: str,
+    evidence_store: List[FieldEvidence],
+    raw_text_snippets: Dict[str, List[str]],
+    extraction_confidence: Dict[str, float],
+) -> None:
+    if snippet:
+        cleaned = clean_text(snippet)
+        raw_text_snippets.setdefault(field_name, [])
+        if cleaned and cleaned not in raw_text_snippets[field_name]:
+            raw_text_snippets[field_name].append(cleaned)
+        evidence_store.append(
+            FieldEvidence(
+                field_name=field_name,
+                snippet=cleaned,
+                source_url=source_url,
+                confidence=confidence,
+                normalized_value=normalized_value,
+            )
+        )
+    if confidence > extraction_confidence.get(field_name, 0.0):
+        extraction_confidence[field_name] = round(confidence, 4)
+
+
+def _first_matching_sentences(text: str, keywords: Sequence[str], limit: int = 4) -> List[str]:
+    matches = []
+    for sentence in sentence_chunks(text):
+        lowered = sentence.lower()
+        if any(keyword in lowered for keyword in keywords):
+            matches.append(sentence)
+        if len(matches) >= limit:
+            break
+    return unique_preserve_order(matches)
+
+
+def _extract_stage_eligibility(text: str) -> Tuple[List[str], List[str]]:
+    lowered = (text or "").lower()
+    stages: List[str] = []
+    evidence: List[str] = []
+    for label, phrases in STAGE_PATTERNS.items():
+        if any(phrase in lowered for phrase in phrases):
+            stages.append(label)
+            evidence.extend([phrase for phrase in phrases if phrase in lowered])
+    return unique_preserve_order(stages), unique_preserve_order(evidence)
+
+
+def _extract_numeric_range(text: str, unit_keywords: Sequence[str]) -> Tuple[Optional[float], Optional[float], Optional[str], float]:
+    candidates = _first_matching_sentences(text, unit_keywords, limit=4)
+    patterns = [
+        re.compile(r"(\d+(?:\.\d+)?)\s*(?:to|-)\s*(\d+(?:\.\d+)?)", re.I),
+        re.compile(r"(?:at least|minimum of|min\.?)\s*(\d+(?:\.\d+)?)", re.I),
+        re.compile(r"(?:up to|maximum of|max\.?)\s*(\d+(?:\.\d+)?)", re.I),
+    ]
+    for sentence in candidates:
+        for pattern in patterns:
+            match = pattern.search(sentence)
+            if not match:
+                continue
+            if len(match.groups()) == 2 and match.group(2):
+                return float(match.group(1)), float(match.group(2)), sentence, 0.8
+            if "up to" in sentence.lower() or "maximum" in sentence.lower() or "max" in sentence.lower():
+                return None, float(match.group(1)), sentence, 0.72
+            return float(match.group(1)), None, sentence, 0.72
+    return None, None, None, 0.0
+
+
+def _extract_month_range(text: str, keywords: Sequence[str]) -> Tuple[Optional[int], Optional[int], Optional[str], float]:
+    candidates = _first_matching_sentences(text, keywords, limit=4)
+    range_re = re.compile(r"(\d+)\s*(?:to|-)\s*(\d+)\s*(months?|years?)", re.I)
+    single_re = re.compile(r"(?:up to|maximum of|max(?:imum)?|minimum of|min(?:imum)?|at least)?\s*(\d+)\s*(months?|years?)", re.I)
+    for sentence in candidates:
+        range_match = range_re.search(sentence)
+        if range_match:
+            minimum = int(range_match.group(1))
+            maximum = int(range_match.group(2))
+            unit = range_match.group(3).lower()
+            multiplier = 12 if unit.startswith("year") else 1
+            return minimum * multiplier, maximum * multiplier, sentence, 0.84
+        single_match = single_re.search(sentence)
+        if single_match:
+            value = int(single_match.group(1))
+            unit = single_match.group(2).lower()
+            multiplier = 12 if unit.startswith("year") else 1
+            lowered = sentence.lower()
+            if any(term in lowered for term in ["up to", "maximum", "max"]):
+                return None, value * multiplier, sentence, 0.74
+            return value * multiplier, None, sentence, 0.74
+    return None, None, None, 0.0
+
+
+def _extract_day_range(text: str, keywords: Sequence[str]) -> Tuple[Optional[int], Optional[int], Optional[str], float]:
+    candidates = _first_matching_sentences(text, keywords, limit=4)
+    range_re = re.compile(r"(\d+)\s*(?:to|-)\s*(\d+)\s*(days?|weeks?)", re.I)
+    single_re = re.compile(r"within\s+(\d+)\s*(days?|weeks?)", re.I)
+    for sentence in candidates:
+        match = range_re.search(sentence)
+        if match:
+            minimum = int(match.group(1))
+            maximum = int(match.group(2))
+            unit = match.group(3).lower()
+            multiplier = 7 if unit.startswith("week") else 1
+            return minimum * multiplier, maximum * multiplier, sentence, 0.82
+        match = single_re.search(sentence)
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2).lower()
+            multiplier = 7 if unit.startswith("week") else 1
+            return value * multiplier, value * multiplier, sentence, 0.72
+    return None, None, None, 0.0
+
+
+def _normalize_ordered_pair(
+    minimum: Optional[float],
+    maximum: Optional[float],
+) -> Tuple[Optional[float], Optional[float], bool]:
+    if minimum is not None and maximum is not None and minimum > maximum:
+        return maximum, minimum, True
+    return minimum, maximum, False
+
+
+def _classify_tristate(text: str, mapping: Dict[TriState, Sequence[str]]) -> Tuple[TriState, Optional[str], float]:
+    lowered = (text or "").lower()
+    for value, phrases in mapping.items():
+        for phrase in phrases:
+            if phrase in lowered:
+                return value, phrase, 0.86
+    return TriState.UNKNOWN, None, 0.0
+
+
+def _classify_enum(text: str, mapping: Dict[object, Sequence[str]], unknown_value: object) -> Tuple[object, Optional[str], float]:
+    lowered = (text or "").lower()
+    for value, phrases in mapping.items():
+        for phrase in phrases:
+            if phrase in lowered:
+                return value, phrase, 0.84
+    return unknown_value, None, 0.0
+
+
+def _infer_program_name(block: CandidateBlock, page_title: Optional[str]) -> Optional[str]:
+    if block.heading and len(block.heading) > 3 and not looks_like_support_title(block.heading):
+        return block.heading
+    if page_title:
+        for separator in [" | ", " - ", " — ", " :: "]:
+            if separator in page_title:
+                fragments = [clean_text(part) for part in page_title.split(separator) if clean_text(part)]
+                for fragment in fragments:
+                    if not looks_like_support_title(fragment):
+                        return fragment
+        cleaned_title = clean_text(page_title)
+        if cleaned_title and not looks_like_support_title(cleaned_title):
+            return cleaned_title
+    return None
+
+
+def _infer_funder_name(page_title: Optional[str], text: str) -> Optional[str]:
+    patterns = [
+        re.compile(r"(?:offered|provided|managed|administered)\s+by\s+([A-Z][A-Za-z0-9&.,'\- ]{3,80})"),
+        re.compile(r"([A-Z][A-Za-z0-9&.,'\- ]{3,80})\s+(?:offers|provides|administers)"),
+    ]
+    for pattern in patterns:
+        match = pattern.search(text)
+        if match:
+            return clean_text(match.group(1))
+    if page_title:
+        for separator in [" | ", " - ", " — ", " :: "]:
+            if separator in page_title:
+                fragments = [clean_text(part) for part in page_title.split(separator) if clean_text(part)]
+                if fragments and looks_like_support_title(fragments[0]):
+                    continue
+                candidate = fragments[-1] if fragments else ""
+                if candidate and len(candidate.split()) <= 8:
+                    return candidate
+    return None
+
+
+def _extract_funding_lines(block: CandidateBlock, program_name: Optional[str]) -> List[str]:
+    lines: List[str] = []
+    for heading, values in block.section_map.items():
+        lowered = heading.lower()
+        if any(term in lowered for term in ["funding products", "products", "facilities", "lines", "offerings"]):
+            for value in values:
+                if 3 <= len(value) <= 80:
+                    lines.append(value)
+    for value in block.section_map.keys():
+        if any(term in value.lower() for term in ["loan", "grant", "finance", "facility"]) and len(value) <= 80:
+            lines.append(value)
+    if program_name:
+        lines = [line for line in lines if clean_text(line).casefold() != clean_text(program_name).casefold()]
+    return unique_preserve_order(lines)
+
+
+def _extract_eligibility_items(block: CandidateBlock) -> List[str]:
+    eligibility = find_section_values(block.section_map, "eligibility")
+    if eligibility:
+        return eligibility
+    items = []
+    for sentence in sentence_chunks(block.text):
+        lowered = sentence.lower()
+        if any(term in lowered for term in ["must", "eligible", "requirement", "applicants should", "enterprise must"]):
+            items.append(sentence)
+        if len(items) >= 10:
+            break
+    return unique_preserve_order(items)
+
+
+def _extract_required_documents(block: CandidateBlock) -> List[str]:
+    documents = find_section_values(block.section_map, "documents")
+    for document_link in block.document_links:
+        documents.append(document_link)
+    return unique_preserve_order(documents)
+
+
+def _extract_exclusions(block: CandidateBlock) -> List[str]:
+    exclusions = find_section_values(block.section_map, "exclusions")
+    if exclusions:
+        return exclusions
+    items = []
+    for sentence in sentence_chunks(block.text):
+        lowered = sentence.lower()
+        if any(term in lowered for term in ["not eligible", "does not fund", "excluded", "will not finance"]):
+            items.append(sentence)
+    return unique_preserve_order(items)
+
+
+def _pick_application_route(block: CandidateBlock, page_url: str, text: str) -> Tuple[ApplicationChannel, Optional[str], Optional[str], float]:
+    lowered = (text or "").lower()
+    if block.application_links:
+        return ApplicationChannel.ONLINE_FORM, block.application_links[0], block.application_links[0], 0.92
+    for channel, phrases in APPLICATION_TEXT_PATTERNS.items():
+        for phrase in phrases:
+            if phrase in lowered:
+                if channel == ApplicationChannel.ONLINE_FORM:
+                    fallback_url = page_url if any(token in page_url.lower() for token in ["apply", "application", "register"]) else None
+                    if fallback_url:
+                        return channel, fallback_url, phrase, 0.72
+                    return ApplicationChannel.UNKNOWN, None, phrase, 0.45
+                return channel, None, phrase, 0.72
+    return ApplicationChannel.UNKNOWN, None, None, 0.0
+
+
+def _extract_turnover_range(text: str, source_domain: str) -> Tuple[Optional[float], Optional[float], Optional[str], float]:
+    sentences = _first_matching_sentences(text, ["turnover", "revenue", "annual sales"], limit=3)
+    default_currency = infer_default_currency(text, source_domain)
+    for sentence in sentences:
+        minimum, maximum, _currency, snippet, confidence = extract_money_range(sentence, default_currency=default_currency)
+        if minimum is not None or maximum is not None:
+            return minimum, maximum, snippet, confidence
+    return None, None, None, 0.0
+
+
+def _extract_contact_details(text: str) -> Tuple[Optional[str], Optional[str]]:
+    emails = extract_emails(text)
+    phones = extract_phone_numbers(text)
+    return (emails[0] if emails else None, phones[0] if phones else None)
+
+
+def _publication_page_signals(page_url: str, page_title: Optional[str], text: str) -> List[str]:
+    signals: List[str] = []
+    lowered_url = (page_url or "").lower()
+    lowered_title = (page_title or "").lower()
+    lowered_text = (text or "").lower()
+    for term in PUBLICATION_PATH_TERMS:
+        if term in lowered_url:
+            signals.append(term)
+    for term in PUBLICATION_TEXT_TERMS:
+        if term in lowered_title or term in lowered_text:
+            signals.append(term)
+    return unique_preserve_order(signals)
+
+
+def _scoped_section_text(section_map: Dict[str, List[str]], heading_terms: Sequence[str]) -> str:
+    matches: List[str] = []
+    for heading, values in section_map.items():
+        lowered = heading.lower()
+        if any(term in lowered for term in heading_terms):
+            matches.extend(values)
+    return clean_text(" ".join(matches))
+
+
+def build_programme_record(
+    block: CandidateBlock,
+    page_url: str,
+    page_title: Optional[str],
+    settings: ScraperSettings,
+) -> Tuple[Optional[FundingProgrammeRecord], List[FieldEvidence]]:
+    combined_text = clean_text(" ".join([block.heading, block.text, page_title or ""]))
+    if not combined_text:
+        return None, []
+
+    source_domain = extract_domain(page_url)
+    default_currency = infer_default_currency(combined_text, source_domain)
+    raw_text_snippets: Dict[str, List[str]] = {}
+    extraction_confidence: Dict[str, float] = {}
+    evidence_store: List[FieldEvidence] = []
+    notes: List[str] = []
+
+    program_name = _infer_program_name(block, page_title)
+    if program_name:
+        _add_evidence("program_name", program_name, block.heading or page_title, 0.92 if block.heading else 0.65, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    funder_name = _infer_funder_name(page_title, combined_text)
+    if funder_name:
+        _add_evidence("funder_name", funder_name, page_title or combined_text, 0.68, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    funding_type, funding_type_confidence, funding_hits = classify_funding_type(combined_text)
+    if funding_hits:
+        _add_evidence("funding_type", funding_type.value, ", ".join(funding_hits), funding_type_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    funding_lines = _extract_funding_lines(block, program_name)
+    if funding_lines:
+        _add_evidence("funding_lines", funding_lines, take_best_snippet(funding_lines), 0.72, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    funding_text = " ".join(find_section_values(block.section_map, "funding")) or combined_text
+    ticket_min, ticket_max, currency, money_snippet, money_confidence = extract_money_range(
+        funding_text,
+        default_currency=default_currency,
+    )
+    if money_snippet:
+        _add_evidence(
+            "ticket_range",
+            {"ticket_min": ticket_min, "ticket_max": ticket_max, "currency": currency},
+            money_snippet,
+            money_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    budget_total, budget_currency, budget_snippet, budget_confidence = extract_budget_total(
+        combined_text,
+        default_currency=default_currency,
+    )
+    if budget_snippet:
+        _add_evidence(
+            "program_budget_total",
+            budget_total,
+            budget_snippet,
+            budget_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+    currency = currency or budget_currency
+
+    deadline_info = parse_deadline_info(" ".join(find_section_values(block.section_map, "timing")) or combined_text)
+    if deadline_info["snippet"]:
+        _add_evidence(
+            "deadline",
+            {"deadline_type": deadline_info["deadline_type"], "deadline_date": deadline_info["deadline_date"]},
+            str(deadline_info["snippet"]),
+            float(deadline_info["confidence"]),
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    funding_speed_days_min, funding_speed_days_max, speed_snippet, speed_confidence = _extract_day_range(
+        combined_text,
+        ["turnaround", "processing time", "funding within", "approval within"],
+    )
+    if speed_snippet:
+        _add_evidence(
+            "funding_speed",
+            {"min": funding_speed_days_min, "max": funding_speed_days_max},
+            speed_snippet,
+            speed_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    geography = classify_geography(combined_text, settings)
+    if geography["evidence"]:
+        _add_evidence(
+            "geography",
+            {
+                "scope": geography["geography_scope"].value,
+                "provinces": geography["provinces"],
+                "municipalities": geography["municipalities"],
+            },
+            ", ".join(geography["evidence"]),
+            0.76,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+    notes.extend(geography["notes"])
+
+    industries_text = _scoped_section_text(block.section_map, INDUSTRY_SECTION_HINTS) or combined_text
+    industries, industries_evidence = classify_industries(industries_text, settings)
+    if industries:
+        _add_evidence(
+            "industries",
+            industries,
+            ", ".join(sum(industries_evidence.values(), [])),
+            0.72,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    use_of_funds_text = _scoped_section_text(block.section_map, USE_OF_FUNDS_SECTION_HINTS) or combined_text
+    use_of_funds, use_of_funds_evidence = classify_use_of_funds(use_of_funds_text, settings)
+    if use_of_funds:
+        _add_evidence(
+            "use_of_funds",
+            use_of_funds,
+            ", ".join(sum(use_of_funds_evidence.values(), [])),
+            0.74,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    business_stage, business_stage_evidence = _extract_stage_eligibility(combined_text)
+    if business_stage:
+        _add_evidence(
+            "business_stage_eligibility",
+            business_stage,
+            ", ".join(business_stage_evidence),
+            0.68,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    ownership_targets, ownership_evidence = classify_ownership_targets(combined_text, settings)
+    if ownership_targets:
+        _add_evidence(
+            "ownership_targets",
+            ownership_targets,
+            ", ".join(sum(ownership_evidence.values(), [])),
+            0.76,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    entity_types_allowed, entity_type_evidence = match_keyword_map(combined_text, settings.entity_type_keywords)
+    if entity_types_allowed:
+        _add_evidence(
+            "entity_types_allowed",
+            entity_types_allowed,
+            ", ".join(sum(entity_type_evidence.values(), [])),
+            0.64,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    certifications_required, certification_evidence = match_keyword_map(combined_text, settings.certification_keywords)
+    if certifications_required:
+        _add_evidence(
+            "certifications_required",
+            certifications_required,
+            ", ".join(sum(certification_evidence.values(), [])),
+            0.66,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    turnover_min, turnover_max, turnover_snippet, turnover_confidence = _extract_turnover_range(combined_text, source_domain)
+    turnover_min, turnover_max, turnover_swapped = _normalize_ordered_pair(turnover_min, turnover_max)
+    if turnover_swapped:
+        notes.append("Turnover range values were inverted in source text and were normalized.")
+    if turnover_snippet:
+        _add_evidence(
+            "turnover",
+            {"min": turnover_min, "max": turnover_max},
+            turnover_snippet,
+            turnover_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    years_in_business_min, years_in_business_max, years_snippet, years_confidence = _extract_numeric_range(
+        combined_text,
+        ["years in business", "years operating", "trading for", "years of operation"],
+    )
+    years_in_business_min, years_in_business_max, years_swapped = _normalize_ordered_pair(
+        years_in_business_min,
+        years_in_business_max,
+    )
+    if years_swapped:
+        notes.append("Years-in-business range values were inverted in source text and were normalized.")
+    if years_snippet:
+        _add_evidence(
+            "years_in_business",
+            {"min": years_in_business_min, "max": years_in_business_max},
+            years_snippet,
+            years_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    employee_min_raw, employee_max_raw, employee_snippet, employee_confidence = _extract_numeric_range(
+        combined_text,
+        ["employees", "staff", "full-time employees", "headcount"],
+    )
+    employee_min = int(employee_min_raw) if employee_min_raw is not None else None
+    employee_max = int(employee_max_raw) if employee_max_raw is not None else None
+    employee_min, employee_max, employee_swapped = _normalize_ordered_pair(employee_min, employee_max)
+    if employee_swapped:
+        notes.append("Employee range values were inverted in source text and were normalized.")
+    if employee_snippet:
+        _add_evidence(
+            "employees",
+            {"min": employee_min, "max": employee_max},
+            employee_snippet,
+            employee_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    payback_months_min, payback_months_max, payback_snippet, payback_confidence = _extract_month_range(
+        combined_text,
+        ["repayment", "repayable", "loan term", "tenor", "repayment term"],
+    )
+    payback_months_min, payback_months_max, payback_swapped = _normalize_ordered_pair(payback_months_min, payback_months_max)
+    if payback_swapped:
+        notes.append("Payback range values were inverted in source text and were normalized.")
+    if payback_snippet:
+        _add_evidence(
+            "payback_months",
+            {"min": payback_months_min, "max": payback_months_max},
+            payback_snippet,
+            payback_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    security_required, security_snippet, security_confidence = _classify_tristate(combined_text, SECURITY_PATTERNS)
+    if security_snippet:
+        _add_evidence("security_required", security_required.value, security_snippet, security_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    equity_required, equity_snippet, equity_confidence = _classify_tristate(combined_text, EQUITY_PATTERNS)
+    if equity_snippet:
+        _add_evidence("equity_required", equity_required.value, equity_snippet, equity_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    interest_type, interest_snippet, interest_confidence = _classify_enum(combined_text, INTEREST_PATTERNS, InterestType.UNKNOWN)
+    if interest_snippet:
+        _add_evidence("interest_type", interest_type.value, interest_snippet, interest_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    repayment_frequency, repayment_snippet, repayment_confidence = _classify_enum(
+        combined_text,
+        REPAYMENT_PATTERNS,
+        RepaymentFrequency.UNKNOWN,
+    )
+    if repayment_snippet:
+        _add_evidence("repayment_frequency", repayment_frequency.value, repayment_snippet, repayment_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    raw_eligibility_data = _extract_eligibility_items(block)
+    if raw_eligibility_data:
+        _add_evidence("raw_eligibility_data", raw_eligibility_data, take_best_snippet(raw_eligibility_data), 0.8, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    exclusions = _extract_exclusions(block)
+    if exclusions:
+        _add_evidence("exclusions", exclusions, take_best_snippet(exclusions), 0.76, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    required_documents = _extract_required_documents(block)
+    if required_documents:
+        _add_evidence("required_documents", required_documents, take_best_snippet(required_documents), 0.74, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+
+    application_channel, application_url, application_snippet, application_confidence = _pick_application_route(
+        block,
+        page_url,
+        " ".join(find_section_values(block.section_map, "application")) or combined_text,
+    )
+    if application_snippet:
+        _add_evidence(
+            "application_route",
+            {"application_channel": application_channel.value, "application_url": application_url},
+            application_snippet,
+            application_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    related_documents = unique_preserve_order(block.document_links)
+    contact_email, contact_phone = _extract_contact_details(combined_text)
+
+    publication_signals = _publication_page_signals(page_url, page_title, combined_text)
+    if publication_signals:
+        notes.append("Page looks like an article/publication page: %s." % ", ".join(publication_signals))
+
+    if detect_archive_signals(combined_text):
+        notes.append("Page may describe an archived or closed funding programme.")
+    if looks_expired(combined_text, deadline_info["deadline_date"]):
+        notes.append("Programme may be closed or expired; verify before publishing.")
+    if not industries and any(term in combined_text.lower() for term in ["sector", "industry", "focus areas"]):
+        notes.append("Industry-specific wording detected but no taxonomy match was found.")
+
+    if not any([program_name, funding_lines, raw_eligibility_data, application_url, ticket_min, ticket_max, funding_type.value != "Unknown"]):
+        support_programme_hint = any(
+            term in combined_text.lower()
+            for term in [
+                "mentorship",
+                "market linkage",
+                "market linkages",
+                "business management training",
+                "voucher",
+                "thusano",
+                "sponsorship",
+                "business support",
+            ]
+        )
+        if not support_programme_hint:
+            return None, evidence_store
+
+    record = FundingProgrammeRecord(
+        program_name=program_name,
+        funder_name=funder_name,
+        source_url=page_url,
+        source_urls=[page_url],
+        source_domain=source_domain,
+        source_page_title=page_title,
+        scraped_at=datetime.now(timezone.utc),
+        raw_eligibility_data=raw_eligibility_data or None,
+        funding_type=funding_type,
+        funding_lines=funding_lines,
+        ticket_min=ticket_min,
+        ticket_max=ticket_max,
+        currency=currency,
+        program_budget_total=budget_total,
+        deadline_type=DeadlineType(str(deadline_info["deadline_type"])),
+        deadline_date=deadline_info["deadline_date"],
+        funding_speed_days_min=funding_speed_days_min,
+        funding_speed_days_max=funding_speed_days_max,
+        geography_scope=geography["geography_scope"],
+        provinces=geography["provinces"],
+        municipalities=geography["municipalities"],
+        postal_code_ranges=geography["postal_code_ranges"],
+        industries=industries,
+        use_of_funds=use_of_funds,
+        business_stage_eligibility=business_stage,
+        turnover_min=turnover_min,
+        turnover_max=turnover_max,
+        years_in_business_min=years_in_business_min,
+        years_in_business_max=years_in_business_max,
+        employee_min=employee_min,
+        employee_max=employee_max,
+        ownership_targets=ownership_targets,
+        entity_types_allowed=entity_types_allowed,
+        certifications_required=certifications_required,
+        security_required=security_required,
+        equity_required=equity_required,
+        payback_months_min=payback_months_min,
+        payback_months_max=payback_months_max,
+        interest_type=interest_type,
+        repayment_frequency=repayment_frequency,
+        exclusions=exclusions,
+        required_documents=required_documents,
+        application_channel=application_channel,
+        application_url=application_url,
+        contact_email=contact_email,
+        contact_phone=contact_phone,
+        raw_text_snippets=raw_text_snippets,
+        extraction_confidence=extraction_confidence,
+        related_documents=related_documents,
+        notes=unique_preserve_order(notes),
+    )
+    return record, evidence_store
+
+
+def classify_page_type(
+    record_count: int,
+    candidate_block_count: int,
+    internal_link_count: int,
+    detail_link_count: int,
+    application_link_count: int,
+    document_link_count: int,
+    text: str,
+) -> str:
+    lowered = (text or "").lower()
+    if record_count > 1:
+        return "listing"
+    if candidate_block_count > 1 and record_count > 1:
+        return "listing"
+    if candidate_block_count > 1:
+        return "mixed"
+    if application_link_count or document_link_count:
+        return "support" if record_count == 0 else "detail"
+    if detail_link_count > 0 and record_count <= 1:
+        return "listing" if detail_link_count > 2 else "detail"
+    if internal_link_count > 8 and record_count <= 1:
+        return "listing"
+    if any(term in lowered for term in ["eligibility", "apply", "application", "funding", "finance", "loan", "grant"]):
+        return "detail"
+    return "unknown"

@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "funding-programme-scraper"
+version = "0.1.0"
+description = "Local-first funding programme scraper for SME and business finance discovery."
+readme = "scraper/README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Codex" }
+]
+dependencies = [
+  "beautifulsoup4>=4.12.3",
+  "dateparser>=1.2.0",
+  "httpx>=0.27.2",
+  "playwright>=1.51.0",
+  "pydantic>=2.9.2",
+  "python-dateutil>=2.9.0",
+  "pypdf>=5.0.0",
+  "rapidfuzz>=3.10.1",
+  "selectolax>=0.3.23",
+  "structlog>=24.4.0",
+  "tenacity>=9.0.0",
+  "typer>=0.12.5"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.3"
+]
+
+[project.scripts]
+funding-scraper = "scraper.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scraper"]
+include = [
+  "/scraper/resources/*.json",
+  "/scraper/seeds/*.json"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["scraper/tests"]
+pythonpath = ["."]

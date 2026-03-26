@@ -1,0 +1,13 @@
+.env
+.env.local
+.env.scraper
+.venv/
+__pycache__/
+dist/
+node_modules/
+scraper/output/
+scraper/**/__pycache__/
+scraper/**/*.pyc
+supabase/.temp/
+*.tsbuildinfo
+scraper/output/raw/pages/*.json

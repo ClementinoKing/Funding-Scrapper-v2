@@ -1,0 +1,18 @@
+{
+  "Working capital": ["working capital", "cash flow", "operating expenses", "overheads"],
+  "Machinery and equipment": ["machinery", "equipment", "plant", "tools", "production equipment"],
+  "Asset finance": ["asset finance", "movable assets", "asset purchase"],
+  "Stock and inventory": ["stock", "inventory", "raw materials"],
+  "Expansion capital": ["expansion", "growth capital", "scale-up", "business growth"],
+  "Bridging finance": ["bridging finance", "bridge finance", "bridge loan"],
+  "Property acquisition": ["property acquisition", "commercial property", "premises"],
+  "Export development": ["export development", "export readiness", "market access"],
+  "Renovation and fit-out": ["renovation", "fit-out", "shopfitting", "refurbishment"],
+  "Research and development": ["research and development", "r&d", "innovation"],
+  "Technology development": ["technology development", "software build", "product development"],
+  "Franchise finance": ["franchise", "franchise fees"],
+  "Procurement finance": ["procurement finance", "purchase order", "contract fulfilment"],
+  "Trade finance": ["trade finance", "import", "letters of credit"],
+  "Acquisition finance": ["acquisition", "buyout", "equity acquisition"]
+}
+
