@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shutil
 from typing import Optional
 
 import typer
 
 from scraper.config import PACKAGE_ROOT, SupabaseSettings
 from scraper.adapters.registry import build_default_registry
-from scraper.pipeline import ScraperPipeline, build_settings_from_options, load_seed_urls
+from scraper.pipeline import ScraperPipeline, build_settings_from_options
+from scraper.storage.site_repository import SiteRepository
 from scraper.storage.supabase_store import SupabaseUploader
 
 
@@ -31,21 +33,40 @@ def _print_summary(summary) -> None:
         typer.echo("Errors: %s" % len(summary.errors))
 
 
+def _clear_local_scrape_output(output_root: Path) -> None:
+    for directory in (output_root / "logs", output_root / "normalized", output_root / "raw"):
+        if directory.exists():
+            shutil.rmtree(directory)
+
+
 def _run_seed_pipeline(
-    seed_file: Path,
     max_pages: int,
     depth_limit: int,
     output_path: Optional[Path],
     headless: bool,
     browser_fallback: bool,
     respect_robots: bool,
+    fresh: bool,
     max_domains: Optional[int] = None,
 ):
     settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
+    if fresh:
+        _clear_local_scrape_output(settings.output_path)
     registry = build_default_registry()
-    seed_urls = load_seed_urls(seed_file)
+    try:
+        supabase_settings = SupabaseSettings.from_env()
+    except ValueError:
+        supabase_settings = None
+    site_repository = SiteRepository(
+        settings=supabase_settings,
+        adapter_registry=registry,
+    )
+    sites = site_repository.load_sites()
+    if not sites:
+        typer.echo("No active sites were found in Supabase.")
+        raise typer.Exit(code=1)
     pipeline = ScraperPipeline(settings, adapter_registry=registry)
-    return pipeline.run(seed_urls, max_domains=max_domains)
+    return pipeline.run_sites(sites, max_sites=max_domains)
 
 
 @app.command("scrape-url")
@@ -59,7 +80,7 @@ def scrape_url(
     respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
 ) -> None:
     settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
-    pipeline = ScraperPipeline(settings)
+    pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     summary = pipeline.run([url])
     _print_summary(summary)
 
@@ -75,30 +96,34 @@ def crawl_domain(
     respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
 ) -> None:
     settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
-    pipeline = ScraperPipeline(settings)
+    pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     summary = pipeline.run([url])
     _print_summary(summary)
 
 
 @app.command("run-seeds")
 def run_seeds(
-    seed_file: Path = typer.Option(PACKAGE_ROOT / "seeds" / "seed_urls.json", help="Seed URL JSON file."),
     max_pages: int = typer.Option(50, help="Maximum pages to crawl."),
     depth_limit: int = typer.Option(2, help="Maximum crawl depth."),
     output_path: Optional[Path] = typer.Option(None, help="Optional output directory override."),
     headless: bool = typer.Option(True, "--headless/--no-headless"),
     browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
     respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+    fresh: bool = typer.Option(
+        True,
+        "--fresh/--resume",
+        help="Clear previous local scrape artifacts before running. Use --resume to keep crawl state and outputs.",
+    ),
     max_domains: Optional[int] = typer.Option(None, help="Maximum domains to process in this run."),
 ) -> None:
     summary = _run_seed_pipeline(
-        seed_file=seed_file,
         max_pages=max_pages,
         depth_limit=depth_limit,
         output_path=output_path,
         headless=headless,
         browser_fallback=browser_fallback,
         respect_robots=respect_robots,
+        fresh=fresh,
         max_domains=max_domains,
     )
     _print_summary(summary)
@@ -106,7 +131,6 @@ def run_seeds(
 
 @app.command("run-next-seed")
 def run_next_seed(
-    seed_file: Path = typer.Option(PACKAGE_ROOT / "seeds" / "seed_urls.json", help="Seed URL JSON file."),
     max_pages: int = typer.Option(50, help="Maximum pages to crawl."),
     depth_limit: int = typer.Option(2, help="Maximum crawl depth."),
     output_path: Optional[Path] = typer.Option(None, help="Optional output directory override."),
@@ -115,13 +139,13 @@ def run_next_seed(
     respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
 ) -> None:
     summary = _run_seed_pipeline(
-        seed_file=seed_file,
         max_pages=max_pages,
         depth_limit=depth_limit,
         output_path=output_path,
         headless=headless,
         browser_fallback=browser_fallback,
         respect_robots=respect_robots,
+        fresh=False,
         max_domains=1,
     )
     _print_summary(summary)
@@ -133,7 +157,7 @@ def export_csv(
     csv_path: Optional[Path] = typer.Option(None, help="Optional explicit CSV target path."),
 ) -> None:
     settings = build_settings_from_options(output_path, None, None, None, None, None)
-    pipeline = ScraperPipeline(settings)
+    pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     target = pipeline.export_csv(csv_path)
     typer.echo("CSV exported to %s" % target)
 
@@ -169,6 +193,16 @@ def push_supabase(
     typer.echo("Supabase upload complete.")
     typer.echo("Project URL: %s" % supabase_settings.url)
     typer.echo("RPC: %s" % supabase_settings.rpc_name)
+    upload_meta = result.pop("_upload_meta", None) if isinstance(result, dict) else None
+    if upload_meta:
+        typer.echo(
+            "Upload sanitizer: %s -> %s records (%s duplicate page groups collapsed)"
+            % (
+                upload_meta.get("input_records", 0),
+                upload_meta.get("sanitized_records", 0),
+                upload_meta.get("collapsed_source_url_groups", 0),
+            )
+        )
     typer.echo("Result: %s" % result)
 
 

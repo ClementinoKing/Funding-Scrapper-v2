@@ -21,6 +21,7 @@ from scraper.storage.interfaces import StorageBackend
 from scraper.utils.logging import get_logger
 from scraper.utils.text import unique_preserve_order
 from scraper.utils.urls import canonicalize_url, extract_domain, is_internal_url, looks_irrelevant_url, score_url_relevance
+from scraper.utils.quality import score_programme_quality
 
 
 class Crawler:
@@ -115,6 +116,63 @@ class Crawler:
         collect(urljoin(f"https://{domain}", "/sitemap_index.xml"))
         return list(dict.fromkeys(discovered))
 
+    def _score_candidate_url(
+        self,
+        url: str,
+        *,
+        depth: int,
+        source: str,
+        adapter: Optional[SiteAdapter] = None,
+        anchor_text: str = "",
+    ) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+        if looks_irrelevant_url(url, self.settings.irrelevant_url_patterns):
+            return None, "irrelevant-url", None
+        if adapter and not adapter.should_allow_url(url, anchor_text):
+            return None, "adapter-rule", None
+
+        score = float(
+            score_url_relevance(
+                url,
+                anchor_text,
+                self.settings.relevant_keywords,
+                self.settings.irrelevant_url_patterns,
+            )
+        )
+        if source == "sitemap":
+            # Sitemap discovery is a useful fallback, but it should not outrank
+            # explicit seed paths or page-linked discoveries by default.
+            score += 4
+        if url.endswith(".pdf"):
+            score += 6
+        if any(term in url.lower() for term in ["fund", "grant", "loan", "finance", "apply", "program", "programme"]):
+            score += 8
+        if source == "page-link" and depth == 0:
+            score += 3
+
+        adapter_reason = None
+        if adapter:
+            adapter_bonus, adapter_reason = adapter.queue_score_bonus(url, anchor_text)
+            score += adapter_bonus
+
+        return score, None, adapter_reason
+
+    def _effective_record_page_type(
+        self,
+        *,
+        adapter: Optional[SiteAdapter],
+        page: PageFetchResult,
+        extraction_page_type: str,
+        record: FundingProgrammeRecord,
+    ) -> str:
+        if not adapter or extraction_page_type != "support-document":
+            return extraction_page_type
+
+        quality_score, _quality_reasons, _quality_blockers = score_programme_quality(record)
+        if adapter.should_allow_url(page.canonical_url) and quality_score >= self.settings.programme_accept_threshold:
+            return "detail"
+
+        return extraction_page_type
+
     def crawl(
         self,
         seed_urls: Sequence[str],
@@ -149,19 +207,28 @@ class Crawler:
 
         for domain in allowed_domains:
             for sitemap_url in self._fetch_sitemap_urls(domain):
-                if sitemap_url not in queued and sitemap_url not in visited and is_internal_url(sitemap_url, allowed_domains):
-                    heapq.heappush(queue, (-25.0, next(order), sitemap_url, 0, "sitemap"))
-                    queued.add(sitemap_url)
-                    crawl_trace.append(
-                        self._trace(
-                            event="queued",
-                            url=sitemap_url,
-                            adapter_name=adapter.key if adapter else None,
-                            depth=0,
-                            score=25.0,
-                            reason="sitemap",
-                        )
+                if sitemap_url in queued or sitemap_url in visited or not is_internal_url(sitemap_url, allowed_domains):
+                    continue
+                score, skip_reason, adapter_reason = self._score_candidate_url(
+                    sitemap_url,
+                    depth=0,
+                    source="sitemap",
+                    adapter=adapter,
+                )
+                if score is None:
+                    continue
+                heapq.heappush(queue, (-score, next(order), sitemap_url, 0, "sitemap"))
+                queued.add(sitemap_url)
+                crawl_trace.append(
+                    self._trace(
+                        event="queued",
+                        url=sitemap_url,
+                        adapter_name=adapter.key if adapter else None,
+                        depth=0,
+                        score=score,
+                        reason=adapter_reason or skip_reason or "sitemap",
                     )
+                )
 
         unlimited_pages = self.settings.max_pages <= 0
         while queue and (unlimited_pages or len(visited) < self.settings.max_pages):
@@ -240,17 +307,7 @@ class Crawler:
             pages_fetched_successfully += 1
             self.storage.save_page_snapshot(page)
             extraction = self.parser.parse(page, allowed_domains=allowed_domains, adapter=adapter)
-            page_role = adapter.page_role(
-                page_url=page.canonical_url,
-                page_title=page.title,
-                text=" ".join(record.program_name or "" for record in extraction.records) or (page.html or ""),
-                record_count=len(extraction.records),
-                candidate_block_count=len(extraction.records),
-                internal_link_count=len(extraction.internal_links),
-                detail_link_count=len(extraction.discovered_links),
-                application_link_count=len(extraction.application_links),
-                document_link_count=len(extraction.document_links),
-            ) if adapter else extraction.page_type
+            page_role = extraction.page_type
             self.storage.append_crawl_trace(
                 self._trace(
                     event="parsed",
@@ -283,14 +340,20 @@ class Crawler:
                     if adapter
                     else record
                 )
-                if adapter and not adapter.should_promote_record(normalized_record, extraction.page_type):
+                record_page_type = self._effective_record_page_type(
+                    adapter=adapter,
+                    page=page,
+                    extraction_page_type=extraction.page_type,
+                    record=normalized_record,
+                )
+                if adapter and not adapter.should_promote_record(normalized_record, record_page_type):
                     continue
                 enriched_payload = normalized_record.model_dump(mode="python", exclude={"site_adapter", "page_type"})
                 enriched_record = record.model_copy(update=enriched_payload)
                 enriched_record = enriched_record.model_copy(
                     update={
                         "site_adapter": adapter.key if adapter else record.site_adapter,
-                        "page_type": extraction.page_type,
+                        "page_type": record_page_type,
                     }
                 )
                 records.append(enriched_record)
@@ -303,8 +366,8 @@ class Crawler:
                         canonical_url=page.canonical_url,
                         depth=depth,
                         reason=enriched_record.program_name or enriched_record.funder_name,
-                        page_type=extraction.page_type,
-                        page_role=page_role,
+                        page_type=record_page_type,
+                        page_role=record_page_type,
                         records_found=1,
                         document_links=len(enriched_record.related_documents),
                         notes=enriched_record.notes,
@@ -323,36 +386,25 @@ class Crawler:
                     continue
                 if not is_internal_url(normalized, allowed_domains):
                     continue
-                if adapter and not adapter.should_allow_url(normalized):
+                score, skip_reason, adapter_reason = self._score_candidate_url(
+                    normalized,
+                    depth=depth,
+                    source="page-link",
+                    adapter=adapter,
+                )
+                if score is None:
                     crawl_trace.append(
                         self._trace(
                             event="skipped",
                             url=normalized,
-                            adapter_name=adapter.key,
+                            adapter_name=adapter.key if adapter else None,
                             source_url=current_url,
                             depth=depth + 1,
-                            reason="adapter-rule",
+                            reason=skip_reason or "filtered",
                         )
                     )
                     continue
-                score = score_url_relevance(
-                    normalized,
-                    "",
-                    self.settings.relevant_keywords,
-                    self.settings.irrelevant_url_patterns,
-                )
-                if normalized.endswith(".pdf"):
-                    score += 6
-                if any(term in normalized.lower() for term in ["fund", "grant", "loan", "finance", "apply", "program", "programme"]):
-                    score += 8
-                if depth == 0:
-                    score += 3
-                if adapter:
-                    adapter_bonus, adapter_reason = adapter.queue_score_bonus(normalized)
-                    score += adapter_bonus
-                else:
-                    adapter_reason = None
-                heapq.heappush(queue, (-float(score), next(order), normalized, depth + 1, "page-link"))
+                heapq.heappush(queue, (-score, next(order), normalized, depth + 1, "page-link"))
                 queued.add(normalized)
                 crawl_trace.append(
                     self._trace(
@@ -361,7 +413,7 @@ class Crawler:
                         adapter_name=adapter.key if adapter else None,
                         source_url=current_url,
                         depth=depth + 1,
-                        score=float(score),
+                        score=score,
                         reason=adapter_reason or extraction.page_type,
                     )
                 )

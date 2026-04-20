@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from uuid import NAMESPACE_URL, uuid5
 from typing import Dict, List, Optional, Tuple
 
 from rapidfuzz import fuzz
 
 from scraper.adapters.base import SiteAdapter
 from scraper.schemas import FundingProgrammeRecord, FundingType, ProgrammeNature
-from scraper.utils.text import completeness_score, generate_program_id, unique_preserve_order
+from scraper.utils.text import completeness_score, generate_program_id, slugify, unique_preserve_order
 from scraper.utils.urls import canonicalize_url
 
 
@@ -131,6 +132,9 @@ def _merge_record_pair(
         merged.program_name = adapter.program_name_for_merge(merged.program_name)
         merged.funder_name = adapter.funder_name_for_merge(merged.funder_name)
     merged.program_id = generate_program_id(merged.source_domain, merged.funder_name, merged.program_name)
+    merged.id = str(uuid5(NAMESPACE_URL, f"{merged.source_domain}:{merged.program_id}"))
+    merged.program_slug = slugify(merged.program_name or merged.program_id, max_length=80)
+    merged.funder_slug = slugify(merged.funder_name or merged.source_domain, max_length=80)
     return FundingProgrammeRecord.model_validate(merged.model_dump(mode="python"))
 
 

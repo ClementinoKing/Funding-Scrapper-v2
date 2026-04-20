@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from scraper.crawler import Crawler
 from scraper.parsers.generic_parser import GenericFundingParser
 from scraper.pipeline import ScraperPipeline
 from scraper.schemas import PageFetchResult
 from scraper.storage.json_store import LocalJsonStore
+from scraper.storage.site_repository import SiteDefinition
 
 
 class FixtureFetcher:
@@ -211,3 +213,148 @@ def test_crawler_uses_browser_fallback_on_forbidden_response(settings, tmp_path:
     assert pipeline.browser_fetcher.calls == ["https://example.org/programmes/youth-growth-loan"]
     trace = (settings.output_path / "logs" / "crawl_trace.jsonl").read_text(encoding="utf-8")
     assert '"event":"parsed"' in trace
+
+
+def test_crawler_filters_noisy_sitemap_urls_with_site_rules(settings, monkeypatch) -> None:
+    monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
+
+    settings.max_pages = 2
+    settings.depth_limit = 1
+
+    home_html = """
+    <html><head><title>NEF Home</title></head>
+    <body>
+      <main>
+        <p>Welcome to the National Empowerment Fund.</p>
+      </main>
+    </body></html>
+    """
+    women_html = """
+    <html><head><title>Women Empowerment Fund (WEF) - National Empowerment Fund</title></head>
+    <body>
+      <main><article>
+        <h1>Women Empowerment Fund (WEF)</h1>
+        <p>The NEF Women Empowerment Fund is aimed at accelerating funding to businesses owned by black women.</p>
+        <p>Minimum of 51% black female ownership is required.</p>
+        <p>The fund provides debt, equity, and hybrid funding options.</p>
+      </article></main>
+    </body></html>
+    """
+    news_html = """
+    <html><head><title>Latest Update</title></head>
+    <body><main><article><h1>Latest Update</h1><p>This is a news article.</p></article></main></body></html>
+    """
+
+    pages = {
+        "https://www.nefcorp.co.za/": _page("https://www.nefcorp.co.za/", home_html, "NEF Home"),
+        "https://www.nefcorp.co.za/products-services/women-empowerment-fund": _page(
+            "https://www.nefcorp.co.za/products-services/women-empowerment-fund",
+            women_html,
+            "Women Empowerment Fund (WEF) - National Empowerment Fund",
+        ),
+        "https://www.nefcorp.co.za/news/latest-update": _page(
+            "https://www.nefcorp.co.za/news/latest-update",
+            news_html,
+            "Latest Update",
+        ),
+    }
+
+    monkeypatch.setattr(
+        Crawler,
+        "_fetch_sitemap_urls",
+        lambda self, domain: [
+            "https://www.nefcorp.co.za/news/latest-update",
+            "https://www.nefcorp.co.za/products-services/women-empowerment-fund",
+        ],
+    )
+
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=FixtureFetcher(pages),
+        browser_fetcher=None,
+    )
+
+    summary = pipeline.run_sites(
+        [
+            SiteDefinition(
+                site_key="nefcorp",
+                display_name="NEF",
+                primary_domain="nefcorp.co.za",
+                adapter_key="nefcorp",
+                seed_urls=("https://www.nefcorp.co.za/",),
+                adapter_config={
+                    "allowed_path_prefixes": ["/products-services/"],
+                    "strict_path_prefixes": True,
+                    "exclude_url_terms": ["/news/"],
+                },
+            )
+        ]
+    )
+
+    assert summary.total_urls_crawled == 2
+    assert summary.programmes_after_dedupe == 1
+    trace = (settings.output_path / "logs" / "crawl_trace.jsonl").read_text(encoding="utf-8")
+    assert "products-services/women-empowerment-fund" in trace
+    assert "news/latest-update" not in trace
+
+
+def test_crawler_promotes_strong_programme_records_even_if_page_is_tagged_support_document(settings, monkeypatch) -> None:
+    monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
+
+    women_html = """
+    <html><head><title>Women Empowerment Fund (WEF) - National Empowerment Fund</title></head>
+    <body>
+      <main><article>
+        <h1>Women Empowerment Fund (WEF)</h1>
+        <p>The NEF Women Empowerment Fund is aimed at accelerating the provision of funding to businesses owned by black women.</p>
+        <p>The funding starts from R250 000 to R75 million.</p>
+        <p>Funding requirements: Minimum of 51% black female ownership.</p>
+        <p>Apply online through the NEF application process.</p>
+        <a href="https://example.org/apply/wef">Apply online</a>
+      </article></main>
+    </body></html>
+    """
+
+    pages = {
+        "https://www.nefcorp.co.za/products-services/women-empowerment-fund": _page(
+            "https://www.nefcorp.co.za/products-services/women-empowerment-fund",
+            women_html,
+            "Women Empowerment Fund (WEF) - National Empowerment Fund",
+        ),
+    }
+
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=FixtureFetcher(pages),
+        browser_fetcher=None,
+    )
+
+    summary = pipeline.run_sites(
+        [
+            SiteDefinition(
+                site_key="nefcorp",
+                display_name="NEF",
+                primary_domain="nefcorp.co.za",
+                adapter_key="nefcorp",
+                seed_urls=("https://www.nefcorp.co.za/products-services/women-empowerment-fund",),
+                adapter_config={
+                    "allowed_path_prefixes": ["/products-services/"],
+                    "strict_path_prefixes": True,
+                    "support_page_terms": ["funding requirements"],
+                },
+            )
+        ]
+    )
+
+    assert summary.programmes_after_dedupe == 1
+    payload = (settings.output_path / "normalized" / "funding_programmes.json").read_text(encoding="utf-8")
+    assert "Women Empowerment Fund" in payload
+    trace = (settings.output_path / "logs" / "crawl_trace.jsonl").read_text(encoding="utf-8")
+    assert '"event":"parsed"' in trace
+    assert '"reason":"support-document"' in trace
+    assert '"event":"extracted"' in trace
+    assert '"page_type":"detail"' in trace

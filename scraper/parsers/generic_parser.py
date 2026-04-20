@@ -16,6 +16,7 @@ from scraper.config import ScraperSettings
 from scraper.adapters.base import SiteAdapter
 from scraper.parsers.extractor_rules import (
     CandidateBlock,
+    build_scoped_soup,
     collect_anchor_candidates,
     collect_internal_anchor_candidates,
     extract_application_links,
@@ -51,16 +52,14 @@ class GenericFundingParser:
 
         tree = HTMLParser(page.html)
         soup = BeautifulSoup(page.html, "html.parser")
+        profile = adapter.extraction_profile() if adapter else None
         page_title = page.title or (clean_text(tree.css_first("title").text()) if tree.css_first("title") else None)
-        page_text = clean_text(soup.get_text(" ", strip=True))
-        if adapter and adapter.content_selectors:
-            scoped_text_parts = []
-            for selector in adapter.content_selectors:
-                for node in soup.select(selector):
-                    scoped_text_parts.append(clean_text(node.get_text(" ", strip=True)))
-            scoped_text = clean_text(" ".join(scoped_text_parts))
-            if scoped_text:
-                page_text = scoped_text
+        scoped_soup = build_scoped_soup(
+            soup,
+            include_selectors=profile.content_scope_selectors if profile else (),
+            exclude_selectors=profile.content_exclude_selectors if profile else (),
+        )
+        page_text = clean_text(scoped_soup.get_text(" ", strip=True)) or clean_text(soup.get_text(" ", strip=True))
 
         all_links = collect_anchor_candidates(soup, page.canonical_url)
         internal_links = collect_internal_anchor_candidates(soup, page.canonical_url, allowed_domains)
@@ -71,17 +70,19 @@ class GenericFundingParser:
             relevant_keywords=self.settings.relevant_keywords,
             irrelevant_patterns=self.settings.irrelevant_url_patterns,
         )
-        document_links = extract_document_links(soup, page.canonical_url)
+        document_links = extract_document_links(scoped_soup, page.canonical_url)
         page_application_links = [
-            link for link in extract_application_links(soup, page.canonical_url) if link not in document_links
+            link for link in extract_application_links(scoped_soup, page.canonical_url) if link not in document_links
         ]
         discovered_links = [link for link in discovered_links if link not in page_application_links]
 
         candidate_blocks = extract_candidate_blocks(
-            soup,
+            scoped_soup,
             page.canonical_url,
             self.settings.relevant_keywords,
-            candidate_selectors=adapter.candidate_selectors if adapter else (),
+            candidate_selectors=profile.candidate_selectors if profile else (),
+            section_heading_selectors=profile.section_heading_selectors if profile else (),
+            section_aliases=profile.section_aliases if profile else None,
         )
         notes: List[str] = []
         warnings: List[str] = []
@@ -106,7 +107,11 @@ class GenericFundingParser:
                     heading=page_title or "",
                     text=page_text,
                     source_url=page.canonical_url,
-                    section_map=group_sections_from_soup(soup),
+                    section_map=group_sections_from_soup(
+                        scoped_soup,
+                        heading_selectors=profile.section_heading_selectors if profile else (),
+                    ),
+                    section_aliases=dict(profile.section_aliases) if profile else {},
                     detail_links=[],
                     application_links=page_application_links,
                     document_links=document_links,

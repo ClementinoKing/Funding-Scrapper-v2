@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from enum import Enum
+from uuid import NAMESPACE_URL, uuid5
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from scraper.config import load_json_resource
-from scraper.utils.text import generate_program_id, unique_preserve_order
+from scraper import __version__ as SCRAPER_VERSION
+from scraper.utils.text import generate_program_id, slugify, unique_preserve_order
 
 
 APPROVED_PROVINCES = set(load_json_resource("provinces.json"))
@@ -69,7 +71,16 @@ class ApplicationChannel(str, Enum):
     EMAIL = "Email"
     BRANCH = "Branch"
     PARTNER_REFERRAL = "Partner referral"
+    MANUAL_CONTACT_FIRST = "Manual / Contact first"
     UNKNOWN = "Unknown"
+
+
+class ProgrammeStatus(str, Enum):
+    ACTIVE = "active"
+    CLOSED = "closed"
+    OPENING_SOON = "opening_soon"
+    SUSPENDED = "suspended"
+    UNKNOWN = "unknown"
 
 
 class ProgrammeNature(str, Enum):
@@ -154,9 +165,14 @@ class PageFetchResult(BaseModel):
 class FundingProgrammeRecord(BaseModel):
     """Canonical normalized funding programme record."""
 
+    id: str = ""
     program_id: str = ""
     program_name: Optional[str] = None
+    program_slug: Optional[str] = None
     funder_name: Optional[str] = None
+    funder_slug: Optional[str] = None
+    country_code: str = "ZA"
+    status: ProgrammeStatus = ProgrammeStatus.UNKNOWN
     site_adapter: Optional[str] = None
     page_type: Optional[str] = None
     parent_programme_name: Optional[str] = None
@@ -168,8 +184,15 @@ class FundingProgrammeRecord(BaseModel):
     source_domain: str
     source_page_title: Optional[str] = None
     scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_verified_at: Optional[date] = None
     raw_eligibility_data: Optional[List[str]] = None
+    raw_funding_offer_data: List[str] = Field(default_factory=list)
+    raw_terms_data: List[str] = Field(default_factory=list)
+    raw_documents_data: List[str] = Field(default_factory=list)
+    raw_application_data: List[str] = Field(default_factory=list)
     evidence_by_field: Dict[str, List[str]] = Field(default_factory=dict)
+    field_confidence: Dict[str, float] = Field(default_factory=dict)
     extraction_confidence_by_field: Dict[str, float] = Field(default_factory=dict)
 
     funding_type: FundingType = FundingType.UNKNOWN
@@ -220,6 +243,10 @@ class FundingProgrammeRecord(BaseModel):
     raw_text_snippets: Dict[str, List[str]] = Field(default_factory=dict)
     extraction_confidence: Dict[str, float] = Field(default_factory=dict)
     related_documents: List[str] = Field(default_factory=list)
+    parser_version: str = SCRAPER_VERSION
+    needs_review: bool = False
+    validation_errors: List[str] = Field(default_factory=list)
+    deleted_at: Optional[datetime] = None
     notes: List[str] = Field(default_factory=list)
 
     @field_validator(
@@ -236,6 +263,11 @@ class FundingProgrammeRecord(BaseModel):
         "exclusions",
         "required_documents",
         "related_documents",
+        "raw_funding_offer_data",
+        "raw_terms_data",
+        "raw_documents_data",
+        "raw_application_data",
+        "validation_errors",
         "notes",
         mode="before",
     )
@@ -324,6 +356,11 @@ class FundingProgrammeRecord(BaseModel):
                 continue
         return normalized
 
+    @field_validator("field_confidence", mode="before")
+    @classmethod
+    def _normalize_field_confidence(cls, value: Any) -> Dict[str, float]:
+        return cls._normalize_confidence(value)
+
     @field_validator("source_url", "application_url")
     @classmethod
     def _validate_urls(cls, value: Optional[str]) -> Optional[str]:
@@ -374,8 +411,6 @@ class FundingProgrammeRecord(BaseModel):
             self.funding_speed_days_min,
             self.funding_speed_days_max,
         )
-        if self.application_channel == ApplicationChannel.ONLINE_FORM and not self.application_url:
-            raise ValueError("application_url is required when application_channel is Online form")
         if not self.source_urls:
             self.source_urls = [self.source_url]
         elif self.source_url not in self.source_urls:
@@ -390,6 +425,41 @@ class FundingProgrammeRecord(BaseModel):
             self.extraction_confidence = dict(self.extraction_confidence_by_field)
         if not self.program_id:
             self.program_id = generate_program_id(self.source_domain, self.funder_name, self.program_name)
+        if not self.id:
+            self.id = str(uuid5(NAMESPACE_URL, f"{self.source_domain}:{self.program_id}"))
+        if not self.program_slug:
+            self.program_slug = slugify(self.program_name or self.program_id, max_length=80)
+        if not self.funder_slug:
+            self.funder_slug = slugify(self.funder_name or self.source_domain, max_length=80)
+        if not self.last_scraped_at:
+            self.last_scraped_at = self.scraped_at
+        if not self.evidence_by_field and self.raw_text_snippets:
+            self.evidence_by_field = dict(self.raw_text_snippets)
+        if not self.raw_text_snippets and self.evidence_by_field:
+            self.raw_text_snippets = dict(self.evidence_by_field)
+        if not self.extraction_confidence_by_field and self.extraction_confidence:
+            self.extraction_confidence_by_field = dict(self.extraction_confidence)
+        if not self.extraction_confidence and self.extraction_confidence_by_field:
+            self.extraction_confidence = dict(self.extraction_confidence_by_field)
+        if not self.field_confidence and self.extraction_confidence:
+            self.field_confidence = dict(self.extraction_confidence)
+        if not self.extraction_confidence and self.field_confidence:
+            self.extraction_confidence = dict(self.field_confidence)
+        self.validation_errors = unique_preserve_order(
+            [cleaned for cleaned in (" ".join(item.split()).strip() for item in self.validation_errors) if cleaned]
+        )
+        if self.deadline_type == DeadlineType.FIXED_DATE and self.deadline_date is None:
+            self.validation_errors = unique_preserve_order(
+                [*self.validation_errors, "missing deadline date for fixed-date programme"]
+            )
+        if not self.program_name:
+            self.validation_errors = unique_preserve_order([*self.validation_errors, "missing program_name"])
+        if not self.funder_name:
+            self.validation_errors = unique_preserve_order([*self.validation_errors, "missing funder_name"])
+        if self.application_channel == ApplicationChannel.ONLINE_FORM and not self.application_url:
+            self.validation_errors = unique_preserve_order([*self.validation_errors, "missing application_url"])
+        self.status = self._derive_status()
+        self.needs_review = self.needs_review or bool(self.validation_errors)
         return self
 
     @staticmethod
@@ -405,6 +475,16 @@ class FundingProgrammeRecord(BaseModel):
         if not self.extraction_confidence:
             return 0.0
         return round(sum(self.extraction_confidence.values()) / len(self.extraction_confidence), 4)
+
+    def _derive_status(self) -> ProgrammeStatus:
+        notes_lower = " ".join(self.notes).lower()
+        if any(term in notes_lower for term in ["archived", "expired", "closed funding programme"]):
+            return ProgrammeStatus.CLOSED
+        if self.deadline_type in {DeadlineType.OPEN, DeadlineType.ROLLING}:
+            return ProgrammeStatus.ACTIVE
+        if self.deadline_type == DeadlineType.FIXED_DATE and self.deadline_date:
+            return ProgrammeStatus.CLOSED if self.deadline_date < date.today() else ProgrammeStatus.ACTIVE
+        return self.status if self.status != ProgrammeStatus.UNKNOWN else ProgrammeStatus.UNKNOWN
 
 
 class ExtractionResult(BaseModel):

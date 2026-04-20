@@ -1,8 +1,13 @@
 import type { ApplicantProfile, FundingProgram } from "@/types/domain";
 
 export type ScrapedFundingProgramme = FundingProgram & {
+  id?: string;
   program_name?: string | null;
+  program_slug?: string | null;
+  parent_programme_name?: string | null;
   funder_name?: string | null;
+  funder_slug?: string | null;
+  country_code?: string | null;
   site_adapter?: string | null;
   page_type?: string | null;
   source_url?: string;
@@ -12,6 +17,8 @@ export type ScrapedFundingProgramme = FundingProgram & {
   source_page_title?: string | null;
   source_domain?: string | null;
   scraped_at?: string;
+  last_scraped_at?: string;
+  last_verified_at?: string | null;
   fundingLines?: string[];
   funding_lines?: string[];
   funding_type?: string | null;
@@ -74,6 +81,16 @@ export type ScrapedFundingProgramme = FundingProgram & {
   contact_phone?: string | null;
   rawEligibilityData?: string | string[] | null;
   raw_eligibility_data?: string | string[] | null;
+  raw_funding_offer_data?: string[] | Record<string, unknown> | null;
+  raw_terms_data?: string[] | Record<string, unknown> | null;
+  raw_documents_data?: string[] | Record<string, unknown> | null;
+  raw_application_data?: string[] | Record<string, unknown> | null;
+  evidence_by_field?: Record<string, unknown>;
+  field_confidence?: Record<string, number>;
+  parser_version?: string | null;
+  needs_review?: boolean | null;
+  validation_errors?: string[] | Record<string, unknown> | null;
+  deleted_at?: string | null;
   relatedDocuments?: string[];
   related_documents?: string[];
   notes?: string[];

@@ -12,10 +12,15 @@ import { ProgramDetailPage } from "@/pages/applicant/program-detail-page";
 import { MatchesPage } from "@/pages/applicant/matches-page";
 import { NotificationsPage } from "@/pages/applicant/notifications-page";
 import { AdminDashboardPage } from "@/pages/admin/admin-dashboard-page";
+import { FinalProgrammesPage } from "@/pages/admin/final-programmes-page";
 import { ProgramReviewPage } from "@/pages/admin/program-review-page";
+import { WebsitesPage } from "@/pages/admin/websites-page";
+import { WebsiteDetailPage } from "@/pages/admin/website-detail-page";
 import { ScraperRunsPage } from "@/pages/admin/scraper-runs-page";
+import { ScrapeRunDetailPage } from "@/pages/admin/scrape-run-detail-page";
 import { MatchingRulesPage } from "@/pages/admin/matching-rules-page";
 import { InterventionsPage } from "@/pages/admin/interventions-page";
+import { ChangeLogPage } from "@/pages/admin/change-log-page";
 import { NotFoundPage } from "@/pages/not-found-page";
 
 function ProtectedRoute({ role }: { role?: Role }) {
@@ -57,10 +62,20 @@ export const router = createBrowserRouter([
             element: <ProtectedRoute role="admin" />,
             children: [
               { path: "/admin/dashboard", element: <AdminDashboardPage /> },
+              { path: "/admin/final-programmes", element: <FinalProgrammesPage /> },
               { path: "/admin/programs", element: <ProgramReviewPage /> },
               { path: "/admin/programs/:programId", element: <ProgramDetailPage /> },
-              { path: "/admin/scraper-runs", element: <ScraperRunsPage /> },
+              { path: "/admin/websites", element: <WebsitesPage /> },
+              { path: "/admin/websites/:siteKey", element: <WebsiteDetailPage /> },
+              {
+                path: "/admin/scraper-runs",
+                children: [
+                  { index: true, element: <ScraperRunsPage /> },
+                  { path: ":runId", element: <ScrapeRunDetailPage /> }
+                ]
+              },
               { path: "/admin/matching-rules", element: <MatchingRulesPage /> },
+              { path: "/admin/change-log", element: <ChangeLogPage /> },
               { path: "/admin/interventions", element: <InterventionsPage /> }
             ]
           }

@@ -69,12 +69,13 @@ scraper/output/
 - Records preserve raw text evidence and source provenance.
 - Unknown values stay `null`, `Unknown`, or empty lists rather than guessed.
 - The storage layer is interface-based so Supabase can be added later without rewriting the crawler or parser.
+- Seeded crawl targets now come from the `sites` table in Supabase when credentials are configured.
 
 ## Supabase Push
 
 The repo supports Supabase credentials from `.env.local` at the project root. `.env.scraper` is still supported as a fallback for scraper-specific setups.
 
-Apply the SQL migration in [supabase/migrations/20260325190000_create_scraper_ingest.sql](../supabase/migrations/20260325190000_create_scraper_ingest.sql), then push the latest normalized scraper output with:
+Apply the SQL migrations in [supabase/migrations/20260325190000_create_scraper_ingest.sql](../supabase/migrations/20260325190000_create_scraper_ingest.sql) and [supabase/migrations/20260326170000_create_sites.sql](../supabase/migrations/20260326170000_create_sites.sql), then push the latest normalized scraper output with:
 
 ```bash
 python -m scraper.main push-supabase

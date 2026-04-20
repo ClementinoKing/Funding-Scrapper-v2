@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from scraper.classifiers.funding_type import classify_funding_type
@@ -19,6 +19,7 @@ from scraper.schemas import (
     FieldEvidence,
     FundingProgrammeRecord,
     InterestType,
+    ProgrammeStatus,
     RepaymentFrequency,
     TriState,
 )
@@ -35,7 +36,7 @@ from scraper.utils.text import (
     take_best_snippet,
     unique_preserve_order,
 )
-from scraper.utils.urls import extract_domain
+from scraper.utils.urls import extract_domain, is_probably_document_url
 
 
 STAGE_PATTERNS = {
@@ -77,6 +78,25 @@ APPLICATION_TEXT_PATTERNS = {
     ApplicationChannel.PARTNER_REFERRAL: ["partner referral", "through incubator", "via incubator", "through partner"],
     ApplicationChannel.ONLINE_FORM: ["apply online", "online application", "apply now", "complete the form online"],
 }
+
+APPLICATION_LINK_POSITIVE_TERMS = (
+    "portal",
+    "apply",
+    "application",
+    "register",
+    "submit",
+    "online",
+    "form",
+)
+
+APPLICATION_LINK_NEGATIVE_TERMS = (
+    "brochure",
+    "checklist",
+    "guidelines",
+    "download",
+    "template",
+    "sample",
+)
 
 PUBLICATION_PATH_TERMS = (
     "press-release",
@@ -133,6 +153,24 @@ USE_OF_FUNDS_SECTION_HINTS = (
     "facilities",
     "what the funding can be used for",
     "can be used for",
+)
+
+TERMS_SECTION_HINTS = (
+    "terms",
+    "repayment",
+    "interest",
+    "security",
+    "collateral",
+    "pricing",
+    "tenor",
+)
+
+APPLICATION_SECTION_HINTS = (
+    "application",
+    "apply",
+    "how to apply",
+    "submission",
+    "contact",
 )
 
 
@@ -332,7 +370,7 @@ def _extract_funding_lines(block: CandidateBlock, program_name: Optional[str]) -
 
 
 def _extract_eligibility_items(block: CandidateBlock) -> List[str]:
-    eligibility = find_section_values(block.section_map, "eligibility")
+    eligibility = find_section_values(block.section_map, "eligibility", block.section_aliases)
     if eligibility:
         return eligibility
     items = []
@@ -346,14 +384,65 @@ def _extract_eligibility_items(block: CandidateBlock) -> List[str]:
 
 
 def _extract_required_documents(block: CandidateBlock) -> List[str]:
-    documents = find_section_values(block.section_map, "documents")
+    documents = find_section_values(block.section_map, "documents", block.section_aliases)
     for document_link in block.document_links:
         documents.append(document_link)
     return unique_preserve_order(documents)
 
 
+def _extract_raw_funding_offer_data(block: CandidateBlock, combined_text: str) -> List[str]:
+    section_values = find_section_values(block.section_map, "funding", block.section_aliases)
+    if section_values:
+        return unique_preserve_order(section_values)
+    funding_scope = _scoped_section_text(block.section_map, USE_OF_FUNDS_SECTION_HINTS)
+    if funding_scope:
+        return _first_matching_sentences(funding_scope, ["fund", "finance", "grant", "loan", "equity"], limit=6)
+    return _first_matching_sentences(combined_text, ["fund", "finance", "grant", "loan", "equity"], limit=6)
+
+
+def _extract_raw_terms_data(block: CandidateBlock, combined_text: str) -> List[str]:
+    terms_scope = _scoped_section_text(block.section_map, TERMS_SECTION_HINTS) or combined_text
+    return _first_matching_sentences(
+        terms_scope,
+        ["repayment", "interest", "prime", "collateral", "security", "equity", "tenor"],
+        limit=6,
+    )
+
+
+def _extract_raw_application_data(block: CandidateBlock, combined_text: str) -> List[str]:
+    application_scope = _scoped_section_text(block.section_map, APPLICATION_SECTION_HINTS, block.section_aliases.get("application", ()))
+    if application_scope:
+        return unique_preserve_order(split_lines(application_scope)[:8] or sentence_chunks(application_scope)[:8])
+    return _first_matching_sentences(
+        combined_text,
+        ["apply", "application", "submit", "email", "contact", "branch", "referral"],
+        limit=6,
+    )
+
+
+def _derive_programme_status(
+    combined_text: str,
+    notes: Sequence[str],
+    deadline_type: DeadlineType,
+    deadline_date: Optional[date],
+) -> ProgrammeStatus:
+    lowered = (combined_text or "").lower()
+    notes_lower = " ".join(notes).lower()
+    if any(term in lowered or term in notes_lower for term in ["opening soon", "opens soon", "launching soon"]):
+        return ProgrammeStatus.OPENING_SOON
+    if any(term in lowered or term in notes_lower for term in ["suspended", "temporarily unavailable", "paused"]):
+        return ProgrammeStatus.SUSPENDED
+    if any(term in lowered or term in notes_lower for term in ["closed", "now closed", "applications closed", "expired", "archived"]):
+        return ProgrammeStatus.CLOSED
+    if deadline_type in {DeadlineType.OPEN, DeadlineType.ROLLING}:
+        return ProgrammeStatus.ACTIVE
+    if deadline_type == DeadlineType.FIXED_DATE and deadline_date is not None:
+        return ProgrammeStatus.CLOSED if deadline_date < datetime.now(timezone.utc).date() else ProgrammeStatus.ACTIVE
+    return ProgrammeStatus.UNKNOWN
+
+
 def _extract_exclusions(block: CandidateBlock) -> List[str]:
-    exclusions = find_section_values(block.section_map, "exclusions")
+    exclusions = find_section_values(block.section_map, "exclusions", block.section_aliases)
     if exclusions:
         return exclusions
     items = []
@@ -367,7 +456,41 @@ def _extract_exclusions(block: CandidateBlock) -> List[str]:
 def _pick_application_route(block: CandidateBlock, page_url: str, text: str) -> Tuple[ApplicationChannel, Optional[str], Optional[str], float]:
     lowered = (text or "").lower()
     if block.application_links:
-        return ApplicationChannel.ONLINE_FORM, block.application_links[0], block.application_links[0], 0.92
+        page_domain = extract_domain(page_url)
+
+        def score_candidate(url: str) -> float:
+            lowered_url = url.lower()
+            if not lowered_url:
+                return -100.0
+            if is_probably_document_url(url):
+                return -100.0
+
+            score = 0.0
+            if any(term in lowered_url for term in APPLICATION_LINK_POSITIVE_TERMS):
+                score += 18.0
+            if "online." in lowered_url or "portal" in lowered_url:
+                score += 10.0
+            if "application portal" in lowered and ("online." in lowered_url or "portal" in lowered_url):
+                score += 10.0
+            if any(term in lowered_url for term in APPLICATION_LINK_NEGATIVE_TERMS):
+                score -= 18.0
+            if "/wp-content/uploads/" in lowered_url:
+                score -= 24.0
+            if extract_domain(url) and extract_domain(url) != page_domain:
+                score += 6.0 if any(term in lowered_url for term in ["portal", "apply", "application", "online"]) else -2.0
+            if lowered_url.rstrip("/") == page_url.lower().rstrip("/"):
+                score -= 6.0
+            return score
+
+        ranked_links = sorted(
+            unique_preserve_order(block.application_links),
+            key=score_candidate,
+            reverse=True,
+        )
+        best_link = ranked_links[0] if ranked_links else None
+        if best_link and score_candidate(best_link) >= 8:
+            confidence = 0.92 if "portal" in best_link.lower() or "online." in best_link.lower() else 0.84
+            return ApplicationChannel.ONLINE_FORM, best_link, best_link, confidence
     for channel, phrases in APPLICATION_TEXT_PATTERNS.items():
         for phrase in phrases:
             if phrase in lowered:
@@ -410,11 +533,17 @@ def _publication_page_signals(page_url: str, page_title: Optional[str], text: st
     return unique_preserve_order(signals)
 
 
-def _scoped_section_text(section_map: Dict[str, List[str]], heading_terms: Sequence[str]) -> str:
+def _scoped_section_text(
+    section_map: Dict[str, List[str]],
+    heading_terms: Sequence[str],
+    extra_heading_terms: Sequence[str] = (),
+) -> str:
     matches: List[str] = []
+    expected_terms = [term.lower() for term in heading_terms]
+    expected_terms.extend([term.lower() for term in extra_heading_terms])
     for heading, values in section_map.items():
         lowered = heading.lower()
-        if any(term in lowered for term in heading_terms):
+        if any(term in lowered for term in expected_terms):
             matches.extend(values)
     return clean_text(" ".join(matches))
 
@@ -452,11 +581,29 @@ def build_programme_record(
     if funding_lines:
         _add_evidence("funding_lines", funding_lines, take_best_snippet(funding_lines), 0.72, page_url, evidence_store, raw_text_snippets, extraction_confidence)
 
-    funding_text = " ".join(find_section_values(block.section_map, "funding")) or combined_text
+    raw_funding_offer_data = _extract_raw_funding_offer_data(block, combined_text)
+    if raw_funding_offer_data:
+        _add_evidence(
+            "raw_funding_offer_data",
+            raw_funding_offer_data,
+            take_best_snippet(raw_funding_offer_data),
+            0.72,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
+    funding_text = " ".join(find_section_values(block.section_map, "funding", block.section_aliases))
     ticket_min, ticket_max, currency, money_snippet, money_confidence = extract_money_range(
-        funding_text,
+        funding_text or combined_text,
         default_currency=default_currency,
     )
+    if money_snippet is None and funding_text:
+        ticket_min, ticket_max, currency, money_snippet, money_confidence = extract_money_range(
+            combined_text,
+            default_currency=default_currency,
+        )
     if money_snippet:
         _add_evidence(
             "ticket_range",
@@ -486,7 +633,9 @@ def build_programme_record(
         )
     currency = currency or budget_currency
 
-    deadline_info = parse_deadline_info(" ".join(find_section_values(block.section_map, "timing")) or combined_text)
+    deadline_info = parse_deadline_info(
+        " ".join(find_section_values(block.section_map, "timing", block.section_aliases)) or combined_text
+    )
     if deadline_info["snippet"]:
         _add_evidence(
             "deadline",
@@ -533,7 +682,11 @@ def build_programme_record(
         )
     notes.extend(geography["notes"])
 
-    industries_text = _scoped_section_text(block.section_map, INDUSTRY_SECTION_HINTS) or combined_text
+    industries_text = _scoped_section_text(
+        block.section_map,
+        INDUSTRY_SECTION_HINTS,
+        block.section_aliases.get("industries", ()),
+    ) or combined_text
     industries, industries_evidence = classify_industries(industries_text, settings)
     if industries:
         _add_evidence(
@@ -547,7 +700,11 @@ def build_programme_record(
             extraction_confidence,
         )
 
-    use_of_funds_text = _scoped_section_text(block.section_map, USE_OF_FUNDS_SECTION_HINTS) or combined_text
+    use_of_funds_text = _scoped_section_text(
+        block.section_map,
+        USE_OF_FUNDS_SECTION_HINTS,
+        block.section_aliases.get("funding", ()) + block.section_aliases.get("use_of_funds", ()),
+    ) or combined_text
     use_of_funds, use_of_funds_evidence = classify_use_of_funds(use_of_funds_text, settings)
     if use_of_funds:
         _add_evidence(
@@ -691,6 +848,19 @@ def build_programme_record(
             extraction_confidence,
         )
 
+    raw_terms_data = _extract_raw_terms_data(block, combined_text)
+    if raw_terms_data:
+        _add_evidence(
+            "raw_terms_data",
+            raw_terms_data,
+            take_best_snippet(raw_terms_data),
+            0.7,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
     security_required, security_snippet, security_confidence = _classify_tristate(combined_text, SECURITY_PATTERNS)
     if security_snippet:
         _add_evidence("security_required", security_required.value, security_snippet, security_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
@@ -723,10 +893,23 @@ def build_programme_record(
     if required_documents:
         _add_evidence("required_documents", required_documents, take_best_snippet(required_documents), 0.74, page_url, evidence_store, raw_text_snippets, extraction_confidence)
 
+    raw_documents_data = unique_preserve_order(required_documents)
+    if raw_documents_data:
+        _add_evidence(
+            "raw_documents_data",
+            raw_documents_data,
+            take_best_snippet(raw_documents_data),
+            0.72,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+
     application_channel, application_url, application_snippet, application_confidence = _pick_application_route(
         block,
         page_url,
-        " ".join(find_section_values(block.section_map, "application")) or combined_text,
+        " ".join(find_section_values(block.section_map, "application", block.section_aliases)) or combined_text,
     )
     if application_snippet:
         _add_evidence(
@@ -742,6 +925,37 @@ def build_programme_record(
 
     related_documents = unique_preserve_order(block.document_links)
     contact_email, contact_phone = _extract_contact_details(combined_text)
+    raw_application_data = _extract_raw_application_data(block, combined_text)
+    if raw_application_data:
+        _add_evidence(
+            "raw_application_data",
+            raw_application_data,
+            take_best_snippet(raw_application_data),
+            0.74,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+        )
+    if (
+        application_channel == ApplicationChannel.UNKNOWN
+        and not application_url
+        and (contact_email or contact_phone or raw_application_data)
+    ):
+        application_channel = ApplicationChannel.MANUAL_CONTACT_FIRST
+        application_snippet = application_snippet or take_best_snippet(raw_application_data, default=contact_email or contact_phone or "")
+        application_confidence = max(application_confidence, 0.62)
+        if application_snippet:
+            _add_evidence(
+                "application_route",
+                {"application_channel": application_channel.value, "application_url": application_url},
+                application_snippet,
+                application_confidence,
+                page_url,
+                evidence_store,
+                raw_text_snippets,
+                extraction_confidence,
+            )
 
     publication_signals = _publication_page_signals(page_url, page_title, combined_text)
     if publication_signals:
@@ -771,6 +985,13 @@ def build_programme_record(
         if not support_programme_hint:
             return None, evidence_store
 
+    derived_status = _derive_programme_status(
+        combined_text=combined_text,
+        notes=notes,
+        deadline_type=DeadlineType(str(deadline_info["deadline_type"])),
+        deadline_date=deadline_info["deadline_date"],
+    )
+
     record = FundingProgrammeRecord(
         program_name=program_name,
         funder_name=funder_name,
@@ -779,7 +1000,14 @@ def build_programme_record(
         source_domain=source_domain,
         source_page_title=page_title,
         scraped_at=datetime.now(timezone.utc),
+        last_scraped_at=datetime.now(timezone.utc),
         raw_eligibility_data=raw_eligibility_data or None,
+        raw_funding_offer_data=raw_funding_offer_data,
+        raw_terms_data=raw_terms_data,
+        raw_documents_data=raw_documents_data,
+        raw_application_data=raw_application_data,
+        evidence_by_field=raw_text_snippets,
+        field_confidence=extraction_confidence,
         funding_type=funding_type,
         funding_lines=funding_lines,
         ticket_min=ticket_min,
@@ -788,6 +1016,7 @@ def build_programme_record(
         program_budget_total=budget_total,
         deadline_type=DeadlineType(str(deadline_info["deadline_type"])),
         deadline_date=deadline_info["deadline_date"],
+        status=derived_status,
         funding_speed_days_min=funding_speed_days_min,
         funding_speed_days_max=funding_speed_days_max,
         geography_scope=geography["geography_scope"],

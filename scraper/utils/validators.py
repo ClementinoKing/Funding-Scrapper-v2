@@ -51,4 +51,7 @@ def add_application_verification_note(
     verified, note = verify_application_url(record.application_url, timeout_seconds=timeout_seconds)
     if not verified and note and note not in record.notes:
         record.notes.append(note)
+        if note not in record.validation_errors:
+            record.validation_errors.append(note)
+        record.needs_review = True
     return record

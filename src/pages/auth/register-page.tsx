@@ -18,7 +18,7 @@ export function RegisterPage() {
     <div className="flex min-h-screen items-center justify-center p-4">
       <Card className="w-full max-w-xl">
         <CardHeader>
-          <CardTitle>Create your FundMatch account</CardTitle>
+          <CardTitle>Create your Liquid + account</CardTitle>
           <CardDescription>
             Start with core details. You will complete a full matching profile next.
           </CardDescription>

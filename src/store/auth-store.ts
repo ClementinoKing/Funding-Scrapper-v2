@@ -11,6 +11,7 @@ interface SessionUser {
 interface AuthState {
   user: SessionUser | null;
   accessToken: string | null;
+  refreshToken: string | null;
   isAuthenticated: boolean;
   setSession: (session: { user: SessionUser; accessToken: string; refreshToken?: string | null }) => void;
   loginAs: (role: Role) => void;
@@ -19,7 +20,7 @@ interface AuthState {
 
 const STORAGE_KEY = "fundmatch.session";
 
-const loadStoredSession = (): { user: SessionUser; accessToken: string } | null => {
+const loadStoredSession = (): { user: SessionUser; accessToken: string; refreshToken?: string | null } | null => {
   if (typeof window === "undefined") {
     return null;
   }
@@ -28,17 +29,17 @@ const loadStoredSession = (): { user: SessionUser; accessToken: string } | null 
     if (!raw) {
       return null;
     }
-    const parsed = JSON.parse(raw) as { user?: SessionUser; accessToken?: string };
+    const parsed = JSON.parse(raw) as { user?: SessionUser; accessToken?: string; refreshToken?: string | null };
     if (!parsed.user || !parsed.accessToken) {
       return null;
     }
-    return { user: parsed.user, accessToken: parsed.accessToken };
+    return { user: parsed.user, accessToken: parsed.accessToken, refreshToken: parsed.refreshToken ?? null };
   } catch {
     return null;
   }
 };
 
-const persistSession = (session: { user: SessionUser; accessToken: string } | null) => {
+const persistSession = (session: { user: SessionUser; accessToken: string; refreshToken?: string | null } | null) => {
   if (typeof window === "undefined") {
     return;
   }
@@ -54,12 +55,14 @@ const initialSession = loadStoredSession();
 export const useAuthStore = create<AuthState>((set) => ({
   user: initialSession?.user ?? null,
   accessToken: initialSession?.accessToken ?? null,
+  refreshToken: initialSession?.refreshToken ?? null,
   isAuthenticated: Boolean(initialSession?.user),
-  setSession: ({ user, accessToken }) => {
-    persistSession({ user, accessToken });
+  setSession: ({ user, accessToken, refreshToken }) => {
+    persistSession({ user, accessToken, refreshToken });
     set({
       user,
       accessToken,
+      refreshToken: refreshToken ?? null,
       isAuthenticated: true
     });
   },
@@ -70,15 +73,16 @@ export const useAuthStore = create<AuthState>((set) => ({
       email: role === "admin" ? "admin@fundmatch.io" : "clementino@example.com",
       role
     };
-    persistSession({ user, accessToken: "local-dev-token" });
+    persistSession({ user, accessToken: "local-dev-token", refreshToken: null });
     set({
       user,
       accessToken: "local-dev-token",
+      refreshToken: null,
       isAuthenticated: true
     });
   },
   logout: () => {
     persistSession(null);
-    set({ user: null, accessToken: null, isAuthenticated: false });
+    set({ user: null, accessToken: null, refreshToken: null, isAuthenticated: false });
   }
 }));

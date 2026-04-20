@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from scraper.config import RuntimeOptions, ScraperSettings
 from scraper.adapters.registry import SiteAdapterRegistry, build_default_registry
@@ -14,6 +15,7 @@ from scraper.crawler import Crawler
 from scraper.fetchers.browser_fetcher import BrowserFetcher
 from scraper.fetchers.http_fetcher import HttpFetcher
 from scraper.parsers.generic_parser import GenericFundingParser
+from scraper.storage.site_repository import SiteDefinition
 from scraper.schemas import ApplicationChannel, CrawlState, FundingProgrammeRecord, FundingType, RunSummary
 from scraper.storage.csv_store import CSVStore
 from scraper.storage.interfaces import StorageBackend
@@ -30,6 +32,18 @@ def build_run_id(seed_urls: Sequence[str]) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     digest = hashlib.blake2b("|".join(seed_urls).encode("utf-8"), digest_size=4).hexdigest()
     return "run_%s_%s" % (timestamp, digest)
+
+
+@dataclass(frozen=True)
+class CrawlTarget:
+    """One crawl unit, either from a direct URL or a DB site row."""
+
+    key: str
+    label: str
+    primary_domain: str
+    adapter_key: str
+    adapter_config: Dict[str, Any]
+    seed_urls: tuple[str, ...]
 
 
 class ScraperPipeline:
@@ -73,11 +87,63 @@ class ScraperPipeline:
             grouped.append((domain, canonical))
         return grouped
 
+    def _build_targets_from_seed_urls(self, seed_urls: Sequence[str]) -> List[CrawlTarget]:
+        targets: List[CrawlTarget] = []
+        for domain, domain_seed_url in self._group_seed_urls_by_domain(seed_urls):
+            targets.append(
+                CrawlTarget(
+                    key=domain,
+                    label=domain,
+                    primary_domain=domain,
+                    adapter_key=self.adapter_registry.generic_adapter.key,
+                    adapter_config={},
+                    seed_urls=(domain_seed_url,),
+                )
+            )
+        return targets
+
     def run(self, seed_urls: Sequence[str], max_domains: Optional[int] = None) -> RunSummary:
-        run_id = build_run_id(seed_urls)
+        return self._run_targets(
+            targets=self._build_targets_from_seed_urls(seed_urls),
+            run_seed_urls=seed_urls,
+            max_domains=max_domains,
+        )
+
+    def run_sites(self, sites: Sequence[SiteDefinition], max_sites: Optional[int] = None) -> RunSummary:
+        targets: List[CrawlTarget] = []
+        run_seed_urls: List[str] = []
+        for site in sites:
+            seed_urls = unique_preserve_order(
+                [canonicalize_url(seed_url) for seed_url in site.seed_urls if canonicalize_url(seed_url)]
+            )
+            if not seed_urls:
+                continue
+            primary_domain = site.primary_domain or (extract_domain(seed_urls[0]) if seed_urls else "")
+            target_key = site.site_key or primary_domain or self.adapter_registry.generic_adapter.key
+            targets.append(
+                CrawlTarget(
+                    key=target_key,
+                    label=site.display_name or target_key,
+                    primary_domain=primary_domain or target_key,
+                    adapter_key=site.adapter_key or self.adapter_registry.generic_adapter.key,
+                    adapter_config=site.adapter_config,
+                    seed_urls=tuple(seed_urls),
+                )
+            )
+            run_seed_urls.extend(seed_urls)
+        return self._run_targets(targets=targets, run_seed_urls=run_seed_urls, max_domains=max_sites)
+
+    def _run_targets(
+        self,
+        *,
+        targets: Sequence[CrawlTarget],
+        run_seed_urls: Sequence[str],
+        max_domains: Optional[int] = None,
+    ) -> RunSummary:
+        run_id = build_run_id(run_seed_urls)
         self.storage.initialize_run(run_id)
         started_at = datetime.now(timezone.utc)
-        self.logger.info("pipeline_started", run_id=run_id, seeds=list(seed_urls))
+        self.logger.info("pipeline_started", run_id=run_id, seeds=list(run_seed_urls))
 
         crawler = Crawler(
             settings=self.settings,
@@ -93,8 +159,7 @@ class ScraperPipeline:
             failed_domains = set(crawl_state.failed_domains)
             persisted_records = self.storage.load_normalized_records()
             review_records = self.storage.load_borderline_review_records()
-            seed_groups = self._group_seed_urls_by_domain(seed_urls)
-            total_domains = len(seed_groups)
+            total_domains = len(targets)
 
             aggregate_total_urls_crawled = 0
             aggregate_pages_fetched_successfully = 0
@@ -107,21 +172,22 @@ class ScraperPipeline:
             rejected_count = 0
             attempted_domains = 0
 
-            for index, (domain, domain_seed_url) in enumerate(seed_groups, start=1):
-                if domain in completed_domains:
+            for index, target in enumerate(targets, start=1):
+                target_key = target.key or target.primary_domain
+                if target_key in completed_domains:
                     self.logger.info(
                         "domain_skipped",
-                        message=f"[{index}/{total_domains}] Skipping completed domain: {domain}",
-                        domain=domain,
+                        message=f"[{index}/{total_domains}] Skipping completed domain: {target.label}",
+                        domain=target.primary_domain,
                         progress="%d/%d" % (index, total_domains),
                     )
                     continue
 
                 self.logger.info(
                     "domain_started",
-                    message=f"[{index}/{total_domains}] Processing domain: {domain}",
-                    domain=domain,
-                    seed_url=domain_seed_url,
+                    message=f"[{index}/{total_domains}] Processing domain: {target.label}",
+                    domain=target.primary_domain,
+                    seed_url=target.seed_urls[0] if target.seed_urls else None,
                     progress="%d/%d" % (index, total_domains),
                 )
 
@@ -130,11 +196,15 @@ class ScraperPipeline:
                 domain_raw_records: List[FundingProgrammeRecord] = []
                 domain_validated_records: List[FundingProgrammeRecord] = []
                 domain_summary_records: List[FundingProgrammeRecord] = []
-                adapter = self.adapter_registry.resolve(domain)
+                adapter = self.adapter_registry.build_for_site(
+                    adapter_key=target.adapter_key,
+                    primary_domain=target.primary_domain,
+                    config=target.adapter_config,
+                )
                 domain_seed_urls = unique_preserve_order(
                     [
-                        domain_seed_url,
-                        *adapter.default_seed_urls_for_domain(domain),
+                        *target.seed_urls,
+                        *adapter.default_seed_urls_for_domain(target.primary_domain),
                     ]
                 )
 
@@ -166,6 +236,14 @@ class ScraperPipeline:
                     borderline_records = []
                     for record in deduped_records:
                         quality_score, quality_reasons, quality_blockers = score_programme_quality(record)
+                        if is_low_confidence(record, self.settings.low_confidence_threshold):
+                            record.needs_review = True
+                            record.validation_errors = unique_preserve_order(
+                                [
+                                    *record.validation_errors,
+                                    "low overall extraction confidence (< %.2f)." % self.settings.low_confidence_threshold,
+                                ]
+                            )
                         if is_real_programme_record(record, self.settings.programme_accept_threshold):
                             accepted_records.append(record)
                             continue
@@ -183,13 +261,20 @@ class ScraperPipeline:
                                     "Blockers: %s" % ", ".join(quality_blockers) if quality_blockers else "Blockers: none",
                                 ]
                             )
+                            review_record.needs_review = True
+                            review_record.validation_errors = unique_preserve_order(
+                                [
+                                    *review_record.validation_errors,
+                                    "borderline quality score requiring manual review",
+                                ]
+                            )
                             borderline_records.append(review_record)
                             continue
                         rejected_count += 1
 
-                    persisted_records = [record for record in persisted_records if record.source_domain != domain]
+                    persisted_records = [record for record in persisted_records if record.source_domain != target.primary_domain]
                     persisted_records.extend(accepted_records)
-                    review_records = [record for record in review_records if record.source_domain != domain]
+                    review_records = [record for record in review_records if record.source_domain != target.primary_domain]
                     review_records.extend(borderline_records)
                     borderline_count += len(borderline_records)
                     domain_summary_records = accepted_records
@@ -198,28 +283,28 @@ class ScraperPipeline:
                     self.storage.write_borderline_review(review_records)
                     self.storage.write_merge_trace(domain_merge_traces)
 
-                    completed_domains.add(domain)
-                    failed_domains.discard(domain)
+                    completed_domains.add(target_key)
+                    failed_domains.discard(target_key)
                     crawl_state = CrawlState(
                         run_id=run_id,
                         completed_domains=sorted(completed_domains),
                         failed_domains=sorted(failed_domains),
-                        last_processed_domain=domain,
+                        last_processed_domain=target.primary_domain,
                     )
                     self.storage.write_crawl_state(crawl_state)
 
                 except Exception as exc:
-                    domain_errors.append("Domain failed for %s: %s" % (domain, exc))
+                    domain_errors.append("Domain failed for %s: %s" % (target.label, exc))
                     aggregate_errors.extend(domain_errors)
-                    failed_domains.add(domain)
+                    failed_domains.add(target_key)
                     crawl_state = CrawlState(
                         run_id=run_id,
                         completed_domains=sorted(completed_domains),
                         failed_domains=sorted(failed_domains),
-                        last_processed_domain=domain,
+                        last_processed_domain=target.primary_domain,
                     )
                     self.storage.write_crawl_state(crawl_state)
-                    self.logger.exception("domain_failed", domain=domain)
+                    self.logger.exception("domain_failed", domain=target.primary_domain)
                     attempted_domains += 1
                     if max_domains is not None and attempted_domains >= max_domains:
                         break
@@ -232,8 +317,8 @@ class ScraperPipeline:
 
                 self.logger.info(
                     "domain_completed",
-                    message=f"[{index}/{total_domains}] Completed domain: {domain}",
-                    domain=domain,
+                    message=f"[{index}/{total_domains}] Completed domain: {target.label}",
+                    domain=target.primary_domain,
                     records=len(domain_summary_records),
                     extracted=len(domain_raw_records),
                     adapter=adapter.key,
@@ -258,7 +343,7 @@ class ScraperPipeline:
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
                 status=status,
-                seed_urls=list(seed_urls),
+                seed_urls=list(run_seed_urls),
                 total_urls_crawled=aggregate_total_urls_crawled,
                 pages_fetched_successfully=aggregate_pages_fetched_successfully,
                 pages_failed=aggregate_pages_failed,

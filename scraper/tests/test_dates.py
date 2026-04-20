@@ -21,3 +21,8 @@ def test_parse_open_deadline() -> None:
     assert result["deadline_type"] == "Open"
     assert result["deadline_date"] is None
 
+
+def test_parse_deadline_ignores_percentages_in_eligibility_text() -> None:
+    result = parse_deadline_info("Funding requirements: Minimum of 51% black female ownership.")
+    assert result["deadline_type"] == "Unknown"
+    assert result["deadline_date"] is None

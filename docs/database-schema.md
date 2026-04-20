@@ -18,18 +18,56 @@
 - `profile_completeness`
 - `updated_at`
 
-## funding_programs
-- `id (uuid, pk)`
-- `title`, `provider_name`, `source_name`, `source_url`
-- `geography (jsonb)`, `sectors (jsonb)`
-- `eligibility_summary`
-- `funding_type`
-- `amount_min`, `amount_max`
-- `deadline_at`
-- `status (active, closing_soon, closed, draft)`
-- `scrape_confidence`
+## funding_programmes
+- `id (uuid, unique technical id)`
+- `program_id (text, pk)`
+- `program_name`, `program_slug`
+- `funder_name`, `funder_slug`
+- `country_code`
+- `status (active, closed, opening_soon, suspended, unknown)`
+- `source_url`, `source_urls (jsonb)`, `source_domain`, `source_page_title`
+- `scraped_at`, `last_scraped_at`, `last_verified_at`
+- `raw_eligibility_data`, `raw_funding_offer_data`, `raw_terms_data`, `raw_documents_data`, `raw_application_data`
+- `funding_type`, `funding_lines`
+- `ticket_min`, `ticket_max`, `currency`, `program_budget_total`
+- `deadline_type`, `deadline_date`
+- `funding_speed_days_min`, `funding_speed_days_max`
+- `geography_scope`, `provinces (jsonb)`, `municipalities (jsonb)`, `postal_code_ranges (jsonb)`
+- `industries (jsonb)`, `use_of_funds (jsonb)`, `business_stage_eligibility (jsonb)`
+- `turnover_min`, `turnover_max`
+- `years_in_business_min`, `years_in_business_max`
+- `employee_min`, `employee_max`
+- `ownership_targets (jsonb)`, `entity_types_allowed (jsonb)`, `certifications_required (jsonb)`
+- `security_required`, `equity_required`
+- `payback_months_min`, `payback_months_max`
+- `interest_type`, `repayment_frequency`
+- `exclusions (jsonb)`, `required_documents (jsonb)`
+- `application_channel`, `application_url`, `contact_email`, `contact_phone`
+- `raw_text_snippets (jsonb)`, `evidence_by_field (jsonb)`
+- `extraction_confidence (jsonb)`, `field_confidence (jsonb)`
+- `related_documents (jsonb)`, `notes (jsonb)`
+- `site_adapter`, `page_type`, `parent_programme_name`
+- `parser_version`, `needs_review`, `validation_errors (jsonb)`
 - `approval_status (pending, approved, rejected)`
-- `created_at`, `updated_at`, `last_scraped_at`
+- `created_at`, `updated_at`, `deleted_at`
+
+## final_funding_programmes
+- Mirrors `funding_programmes` for applicant-facing published records
+- Includes the same programme columns as `funding_programmes`
+- Additional published-record fields:
+- `source_program_id (text, unique, fk -> funding_programmes.program_id)`
+- `published_at`
+- `source_approval_status (pending, approved, rejected)`
+
+## sites
+- `site_key (text, pk)`
+- `display_name`
+- `primary_domain (unique)`
+- `adapter_key`
+- `seed_urls (jsonb)`
+- `active`
+- `notes (jsonb)`
+- `created_at`, `updated_at`
 
 ## scrape_runs
 - `id (uuid, pk)`

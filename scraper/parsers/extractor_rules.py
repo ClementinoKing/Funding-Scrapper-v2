@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
@@ -70,6 +70,7 @@ class CandidateBlock:
     text: str
     source_url: str
     section_map: Dict[str, List[str]] = field(default_factory=dict)
+    section_aliases: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     detail_links: List[str] = field(default_factory=list)
     application_links: List[str] = field(default_factory=list)
     document_links: List[str] = field(default_factory=list)
@@ -152,7 +153,14 @@ def extract_application_links(soup: BeautifulSoup, base_url: str) -> List[str]:
     for anchor in soup.find_all("a", href=True):
         label = clean_text(anchor.get_text(" ", strip=True)).lower()
         href = canonicalize_url(anchor["href"], base_url=base_url)
-        if any(keyword in label for keyword in APPLICATION_HINTS) or any(keyword in href.lower() for keyword in APPLICATION_HINTS):
+        if not href:
+            continue
+        lowered_href = href.lower()
+        if is_probably_document_url(href):
+            continue
+        if any(term in label for term in ["brochure", "checklist", "guidelines", "download"]):
+            continue
+        if any(keyword in label for keyword in APPLICATION_HINTS) or any(keyword in lowered_href for keyword in APPLICATION_HINTS):
             links.append(href)
     return unique_preserve_order(links)
 
@@ -170,9 +178,60 @@ def _extract_text_items(node: Tag, limit: int = 18) -> List[str]:
     return unique_preserve_order(items[:limit])
 
 
-def group_sections_from_soup(soup: BeautifulSoup) -> Dict[str, List[str]]:
+def build_scoped_soup(
+    soup: BeautifulSoup,
+    *,
+    include_selectors: Sequence[str] = (),
+    exclude_selectors: Sequence[str] = (),
+) -> BeautifulSoup:
+    scoped_root = BeautifulSoup("<div></div>", "html.parser")
+    root = scoped_root.div
+    if root is None:
+        return BeautifulSoup("", "html.parser")
+
+    selected_nodes = []
+    if include_selectors:
+        for selector in include_selectors:
+            selected_nodes.extend(soup.select(selector))
+    else:
+        selected_nodes = [soup]
+
+    if not selected_nodes and include_selectors:
+        selected_nodes = [soup]
+
+    seen_signatures = set()
+    for node in selected_nodes:
+        fragment = BeautifulSoup(str(node), "html.parser")
+        for selector in exclude_selectors:
+            for excluded in fragment.select(selector):
+                excluded.decompose()
+        html = fragment.decode().strip()
+        if not html or html in seen_signatures:
+            continue
+        seen_signatures.add(html)
+        child_fragment = BeautifulSoup(html, "html.parser")
+        for child in list(child_fragment.contents):
+            root.append(child)
+
+    return scoped_root
+
+
+def group_sections_from_soup(
+    soup: BeautifulSoup,
+    *,
+    heading_selectors: Sequence[str] = (),
+) -> Dict[str, List[str]]:
     sections: Dict[str, List[str]] = {}
-    headings = soup.find_all(re.compile(r"^h[1-4]$"))
+    if heading_selectors:
+        headings: List[Tag] = []
+        seen_ids = set()
+        for selector in heading_selectors:
+            for node in soup.select(selector):
+                if isinstance(node, Tag) and id(node) not in seen_ids:
+                    seen_ids.add(id(node))
+                    headings.append(node)
+    else:
+        headings = list(soup.find_all(re.compile(r"^h[1-4]$")))
     for heading in headings:
         title = clean_text(heading.get_text(" ", strip=True))
         if not title:
@@ -195,6 +254,8 @@ def extract_candidate_blocks(
     base_url: str,
     relevant_keywords: Sequence[str],
     candidate_selectors: Sequence[str] = (),
+    section_heading_selectors: Sequence[str] = (),
+    section_aliases: Optional[Dict[str, Tuple[str, ...]]] = None,
 ) -> List[CandidateBlock]:
     candidates: List[CandidateBlock] = []
     seen = set()
@@ -239,6 +300,9 @@ def extract_candidate_blocks(
         detail_links = []
         application_links = []
         for href, label in collect_anchor_candidates(node_soup, base_url):
+            if is_probably_document_url(href):
+                detail_links.append(href)
+                continue
             if any(term in label.lower() for term in APPLICATION_HINTS):
                 application_links.append(href)
             else:
@@ -249,7 +313,8 @@ def extract_candidate_blocks(
                 heading=heading,
                 text=text,
                 source_url=base_url,
-                section_map=group_sections_from_soup(node_soup),
+                section_map=group_sections_from_soup(node_soup, heading_selectors=section_heading_selectors),
+                section_aliases=dict(section_aliases or {}),
                 detail_links=unique_preserve_order(detail_links),
                 application_links=extract_application_links(node_soup, base_url) or unique_preserve_order(application_links),
                 document_links=extract_document_links(node_soup, base_url),
@@ -258,8 +323,14 @@ def extract_candidate_blocks(
     return candidates
 
 
-def find_section_values(section_map: Dict[str, List[str]], section_name: str) -> List[str]:
-    keywords = SECTION_KEYWORDS.get(section_name, [])
+def find_section_values(
+    section_map: Dict[str, List[str]],
+    section_name: str,
+    section_aliases: Optional[Dict[str, Sequence[str]]] = None,
+) -> List[str]:
+    keywords = list(SECTION_KEYWORDS.get(section_name, []))
+    if section_aliases and section_name in section_aliases:
+        keywords.extend([clean_text(keyword).lower() for keyword in section_aliases[section_name] if clean_text(keyword)])
     matches: List[str] = []
     for heading, values in section_map.items():
         lowered = heading.lower()

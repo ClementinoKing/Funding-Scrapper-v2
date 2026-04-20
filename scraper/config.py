@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parent
 RESOURCE_DIR = PACKAGE_ROOT / "resources"
-SEED_DIR = PACKAGE_ROOT / "seeds"
 DEFAULT_OUTPUT_DIR = PACKAGE_ROOT / "output"
 
 DEFAULT_USER_AGENTS = [
@@ -74,11 +73,6 @@ def _env_int(name: str, default: int) -> int:
 
 def load_json_resource(filename: str) -> Any:
     path = RESOURCE_DIR / filename
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def load_seed_file(filename: str = "seed_urls.json") -> Any:
-    path = SEED_DIR / filename
     return json.loads(path.read_text(encoding="utf-8"))
 
 

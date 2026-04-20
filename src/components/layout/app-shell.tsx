@@ -28,13 +28,13 @@ export function AppShell() {
       <div className="flex min-h-screen w-full">
         <aside
           className={cn(
-            "fixed inset-y-0 left-0 z-40 w-72 border-r border-emerald-900/20 bg-[#0e1412] text-zinc-100 transition-transform lg:static lg:translate-x-0",
+            "fixed inset-y-0 left-0 z-40 w-72 overflow-y-auto border-r border-emerald-900/20 bg-[#0e1412] text-zinc-100 transition-transform lg:sticky lg:top-0 lg:h-screen lg:translate-x-0",
             menuOpen ? "translate-x-0" : "-translate-x-full"
           )}
-        >
-          <div className="flex h-16 items-center border-b border-emerald-900/20 px-6">
+          >
+            <div className="flex h-16 items-center border-b border-emerald-900/20 px-6">
             <Link to="/" className="text-lg font-bold tracking-tight">
-              FundMatch Pro
+              Liquid +
             </Link>
           </div>
           <nav className="space-y-1 p-4">

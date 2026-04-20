@@ -16,6 +16,12 @@ export interface SupabaseSession {
   refreshToken?: string;
 }
 
+interface SupabaseRefreshResponse {
+  access_token: string;
+  refresh_token?: string;
+  user: SupabaseAuthUser;
+}
+
 interface SupabaseAuthUser {
   id: string;
   email?: string;
@@ -120,6 +126,28 @@ export const signUpWithSupabase = async (
     return null;
   }
 
+  const user = await fetchProfile(payload.user.id, payload.access_token);
+  return {
+    user,
+    accessToken: payload.access_token,
+    refreshToken: payload.refresh_token
+  };
+};
+
+export const refreshSupabaseSession = async (refreshToken: string): Promise<SupabaseSession> => {
+  ensureConfigured();
+  const response = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, {
+    method: "POST",
+    headers: authHeaders,
+    body: JSON.stringify({ refresh_token: refreshToken })
+  });
+
+  if (!response.ok) {
+    const message = await response.text();
+    throw new Error(message || "Unable to refresh session.");
+  }
+
+  const payload = (await response.json()) as SupabaseRefreshResponse;
   const user = await fetchProfile(payload.user.id, payload.access_token);
   return {
     user,

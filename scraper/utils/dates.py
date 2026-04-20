@@ -36,6 +36,28 @@ FIXED_HINTS = [
     "submissions close",
 ]
 
+MONTH_NAME_PATTERN = re.compile(
+    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+    r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
+    re.I,
+)
+NUMERIC_DATE_PATTERN = re.compile(
+    r"\b(?:\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?|\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\b"
+)
+
+
+def _has_explicit_date_shape(text: str) -> bool:
+    candidate = clean_text(text)
+    if not candidate:
+        return False
+    if "%" in candidate:
+        return False
+    if MONTH_NAME_PATTERN.search(candidate):
+        return True
+    if NUMERIC_DATE_PATTERN.search(candidate):
+        return True
+    return False
+
 
 def parse_deadline_info(text: str, relative_base: Optional[datetime] = None) -> Dict[str, object]:
     clean = clean_text(text)
@@ -69,8 +91,10 @@ def parse_deadline_info(text: str, relative_base: Optional[datetime] = None) -> 
         match = search_dates(sentence, settings=settings, languages=["en"])
         if not match:
             continue
+        if not _has_explicit_date_shape(sentence):
+            continue
         for found_text, found_date in match:
-            if found_date:
+            if found_date and _has_explicit_date_shape(found_text):
                 return {
                     "deadline_type": "FixedDate",
                     "deadline_date": found_date.date(),
@@ -84,7 +108,10 @@ def parse_deadline_info(text: str, relative_base: Optional[datetime] = None) -> 
         re.I,
     )
     if inline_date:
-        parsed = dateparser.parse(inline_date.group(2), settings=settings)
+        candidate_text = inline_date.group(2)
+        if not _has_explicit_date_shape(candidate_text):
+            return {"deadline_type": "Unknown", "deadline_date": None, "snippet": None, "confidence": 0.0}
+        parsed = dateparser.parse(candidate_text, settings=settings)
         if parsed:
             return {
                 "deadline_type": "FixedDate",
@@ -103,4 +130,3 @@ def looks_expired(text: str, deadline_date: Optional[date]) -> bool:
     if deadline_date and deadline_date < datetime.utcnow().date():
         return True
     return False
-

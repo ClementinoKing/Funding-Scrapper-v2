@@ -59,10 +59,44 @@ export interface ScrapeRun {
   startedAt: string;
   completedAt?: string;
   status: "running" | "success" | "partial" | "failed";
+  seedUrls: string[];
+  urlsCrawled: number;
+  pagesFetchedSuccessfully: number;
+  pagesFailed: number;
   recordsFound: number;
   recordsStored: number;
   recordsFlagged: number;
+  recordsWithMissingProgramName: number;
+  recordsWithMissingFunderName: number;
+  recordsWithUnknownFundingType: number;
+  recordsWithNoApplicationRoute: number;
+  lowConfidenceThreshold?: number;
+  warnings: string[];
+  errors: string[];
   errorSummary?: string;
+}
+
+export interface WebsiteSite {
+  siteKey: string;
+  displayName: string;
+  primaryDomain: string;
+  adapterKey: string;
+  seedUrls: string[];
+  adapterConfig: Record<string, unknown>;
+  active: boolean;
+  notes: string[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface SystemChangeLogEntry {
+  id: string;
+  title: string;
+  summary: string;
+  createdAt: string;
+  area: "scraper" | "admin" | "data" | "matching" | "platform";
+  impact: "high" | "medium" | "low";
+  highlights: string[];
 }
 
 export interface NotificationPreference {

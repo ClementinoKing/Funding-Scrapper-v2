@@ -1,58 +1,109 @@
-"""Adapter registry and fallback resolution for funding sites."""
+"""Adapter registry for the generic DB-driven scraper rules."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+import copy
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-from scraper.adapters.base import SiteAdapter
-from scraper.adapters.sites import DEFAULT_SITE_ADAPTERS
-from scraper.utils.urls import extract_domain
+from scraper.adapters.base import SiteAdapter, SiteExtractionProfile
 from scraper.utils.text import unique_preserve_order
+from scraper.utils.urls import extract_domain
 
 
-def _normalize_domain(value: str) -> str:
-    return extract_domain(value)
+def _build_generic_adapter() -> SiteAdapter:
+    # This is the one canonical adapter used by the runtime. The registry still
+    # exists for compatibility, but all sites now start from this generic rule
+    # set and then layer DB overrides on top.
+    return SiteAdapter(
+        key="generic",
+        domain="*",
+        include_url_terms=("fund", "grant", "loan", "finance", "programme", "program", "apply"),
+        exclude_url_terms=("press", "news", "media", "publication", "blog", "careers", "privacy"),
+        discovery_terms=("fund", "grant", "loan", "apply", "eligibility", "programme"),
+        content_selectors=("main", "article", ".content", ".programme-content"),
+        candidate_selectors=("article", "section.card", "section", ".card", ".tile", ".panel"),
+        site_profile=SiteExtractionProfile(
+            content_scope_selectors=("main", "article", ".content", ".programme-content"),
+            candidate_selectors=("article", "section.card", "section", ".card", ".tile", ".panel"),
+            section_heading_selectors=("h1", "h2", "h3", "h4"),
+        ),
+    )
 
 
 @dataclass
 class SiteAdapterRegistry:
-    """Resolve site-specific rules by domain, with a generic fallback."""
+    """Compatibility wrapper around the generic adapter.
 
-    adapters: Dict[str, SiteAdapter]
-    generic_adapter: SiteAdapter
+    Older call sites still expect a registry object, so we keep the shape while
+    letting the DB drive the active adapter profile for each site row.
+    """
+
+    adapters: Dict[str, SiteAdapter] = field(default_factory=dict)
+    generic_adapter: SiteAdapter = field(default_factory=_build_generic_adapter)
+    adapters_by_key: Dict[str, SiteAdapter] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Normalize any caller-supplied dicts so lookups are consistent.
+        self.adapters = dict(self.adapters)
+        if not self.adapters_by_key:
+            self.adapters_by_key = {adapter.key: adapter for adapter in self.adapters.values()}
+        else:
+            self.adapters_by_key = dict(self.adapters_by_key)
 
     @classmethod
     def default(cls) -> "SiteAdapterRegistry":
-        adapters = {adapter.domain: adapter for adapter in DEFAULT_SITE_ADAPTERS}
-        return cls(adapters=adapters, generic_adapter=SiteAdapter(
-            key="generic",
-            domain="*",
-            include_url_terms=("fund", "grant", "loan", "finance", "programme", "program", "apply"),
-            exclude_url_terms=("press", "news", "media", "publication", "blog", "careers", "privacy"),
-            discovery_terms=("fund", "grant", "loan", "apply", "eligibility", "programme"),
-            content_selectors=("main", "article", ".content", ".programme-content"),
-            candidate_selectors=("article", "section.card", "section", ".card", ".tile", ".panel"),
-        ))
+        # The default registry intentionally starts empty apart from the generic
+        # adapter. That makes the DB the source of truth for site-specific rules.
+        return cls()
 
     def register(self, adapter: SiteAdapter) -> None:
+        # Still supported for tests or edge cases, but not used by the normal
+        # runtime flow anymore.
         self.adapters[adapter.domain] = adapter
+        self.adapters_by_key[adapter.key] = adapter
 
     def resolve(self, domain_or_url: str) -> SiteAdapter:
-        domain = _normalize_domain(domain_or_url)
+        # Any unknown domain falls back to the generic adapter.
+        domain = extract_domain(domain_or_url)
         if not domain:
             return self.generic_adapter
-        if domain in self.adapters:
-            return self.adapters[domain]
         for registered_domain, adapter in self.adapters.items():
-            normalized_registered = _normalize_domain(registered_domain)
+            normalized_registered = extract_domain(registered_domain)
             if domain == normalized_registered:
                 return adapter
             if domain.endswith("." + normalized_registered) or normalized_registered.endswith("." + domain):
                 return adapter
         return self.generic_adapter
 
+    def get_by_key(self, adapter_key: str) -> SiteAdapter:
+        # Runtime safety still matters, so unknown keys fall back to generic.
+        if not adapter_key:
+            return self.generic_adapter
+        return self.adapters_by_key.get(adapter_key, self.generic_adapter)
+
+    def build_for_site(
+        self,
+        *,
+        adapter_key: str,
+        primary_domain: str,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> SiteAdapter:
+        # The DB is authoritative for site selection. If a row names an
+        # unregistered adapter profile, we still honor that profile name by
+        # cloning the generic baseline and attaching the DB key/domain.
+        normalized_key = (adapter_key or "").strip() or self.generic_adapter.key
+        base_adapter = self.adapters_by_key.get(normalized_key)
+        if base_adapter is None:
+            base_adapter = copy.copy(self.generic_adapter)
+            object.__setattr__(base_adapter, "key", normalized_key)
+            if primary_domain:
+                object.__setattr__(base_adapter, "domain", primary_domain)
+        return base_adapter.configured(config)
+
     def default_seed_urls(self) -> List[str]:
+        # In the one-adapter world this is only useful if tests or custom code
+        # manually registers extra adapters.
         urls: List[str] = []
         for adapter in self.adapters.values():
             urls.extend(adapter.default_seed_urls)

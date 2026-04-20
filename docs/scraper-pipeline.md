@@ -2,11 +2,12 @@
 
 ## Scheduled Ingestion Workflow
 1. Daily cron triggers source runners.
-2. Source-specific scraper extracts raw listing and detail data.
-3. Parser and normalizer map source data into canonical `funding_programs` schema.
-4. Validation service flags incomplete records and assigns `scrape_confidence`.
-5. Approved-level confidence data goes to `pending` admin review or auto-approve policy.
-6. Scrape run telemetry is written to `scrape_runs`.
+2. The scraper loads active crawl targets from the `sites` table.
+3. Each site resolves to an adapter via `adapter_key`, then extracts raw listing and detail data.
+4. Parser and normalizer map source data into canonical `funding_programs` schema.
+5. Validation service flags incomplete records and assigns `scrape_confidence`.
+6. Approved-level confidence data goes to `pending` admin review or auto-approve policy.
+7. Scrape run telemetry is written to `scrape_runs`.
 
 ## Reliability Patterns
 - Retry with exponential backoff per source.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from bs4 import BeautifulSoup
+
+from scraper.parsers.extractor_rules import CandidateBlock, extract_application_links
 from scraper.classifiers.geography import classify_geography
-from scraper.parsers.extractor_rules import CandidateBlock
 from scraper.parsers.normalization import build_programme_record
 from scraper.utils.text import generate_program_id
 
@@ -86,3 +88,72 @@ def test_build_programme_record_classifies_debt_quasi_equity_and_equity_as_hybri
     )
     assert record is not None
     assert record.funding_type.value == "Hybrid"
+
+
+def test_build_programme_record_falls_back_to_body_text_for_ticket_range_when_funding_section_is_requirements(settings) -> None:
+    block = CandidateBlock(
+        heading="Women Empowerment Fund (WEF)",
+        text=(
+            "The NEF Women Empowerment Fund is aimed at accelerating the provision of funding to businesses owned "
+            "by black women. The funding starts from R250 000 to R75 million across a range of sectors. "
+            "Funding requirements: Minimum of 51% black female ownership."
+        ),
+        source_url="https://www.nefcorp.co.za/products-services/women-empowerment-fund",
+        section_map={
+            "Funding requirements": [
+                "Minimum of 51% black female ownership.",
+            ]
+        },
+    )
+    record, _evidence = build_programme_record(
+        block=block,
+        page_url="https://www.nefcorp.co.za/products-services/women-empowerment-fund",
+        page_title="Women Empowerment Fund (WEF) - National Empowerment Fund",
+        settings=settings,
+    )
+    assert record is not None
+    assert record.ticket_min == 250000
+    assert record.ticket_max == 75000000
+    assert record.currency == "ZAR"
+
+
+def test_extract_application_links_ignores_document_downloads() -> None:
+    soup = BeautifulSoup(
+        """
+        <div>
+          <a href="/wp-content/uploads/2018/07/Funding-Application-Forms.pdf">Application Form</a>
+          <a href="https://online.nefcorp.co.za">The NEF Application Portal</a>
+        </div>
+        """,
+        "html.parser",
+    )
+
+    links = extract_application_links(soup, "https://www.nefcorp.co.za/products-services/women-empowerment-fund")
+
+    assert links == ["https://online.nefcorp.co.za"]
+
+
+def test_build_programme_record_prefers_live_application_portal_over_dead_pdf(settings) -> None:
+    block = CandidateBlock(
+        heading="Women Empowerment Fund (WEF)",
+        text=(
+            "The NEF Women Empowerment Fund supports black women-owned businesses. "
+            "See the application portal for online submissions."
+        ),
+        source_url="https://www.nefcorp.co.za/products-services/women-empowerment-fund",
+        application_links=[
+            "https://www.nefcorp.co.za/wp-content/uploads/2018/07/Funding-Application-Forms.pdf",
+            "https://online.nefcorp.co.za",
+        ],
+    )
+
+    record, _evidence = build_programme_record(
+        block=block,
+        page_url="https://www.nefcorp.co.za/products-services/women-empowerment-fund",
+        page_title="Women Empowerment Fund (WEF) - National Empowerment Fund",
+        settings=settings,
+    )
+
+    assert record is not None
+    assert record.application_channel.value == "Online form"
+    assert record.application_url == "https://online.nefcorp.co.za"
