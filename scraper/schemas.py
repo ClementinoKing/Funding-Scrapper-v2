@@ -112,11 +112,48 @@ class FieldEvidence(BaseModel):
     """Field-level traceability for extracted evidence."""
 
     field_name: str
-    snippet: str
-    source_url: str
-    confidence: float = 0.0
     normalized_value: Optional[Any] = None
-    section_name: Optional[str] = None
+    raw_value: Optional[Any] = None
+    evidence_text: str
+    source_url: str
+    source_section: Optional[str] = None
+    source_scope: Optional[str] = None
+    confidence: float = 0.0
+    method: str = "direct_page_evidence"
+
+
+class SectionNode(BaseModel):
+    """One node in the reviewer/debug section tree."""
+
+    title: str
+    level: int = 1
+    text: str = ""
+    source_url: Optional[str] = None
+    children: List["SectionNode"] = Field(default_factory=list)
+
+
+class PageDebugRecord(BaseModel):
+    """Compact per-record trace bundle for a crawled page."""
+
+    program_name: Optional[str] = None
+    parent_programme_name: Optional[str] = None
+    source_scope: Optional[str] = None
+    evidence_map: Dict[str, List[FieldEvidence]] = Field(default_factory=dict)
+    confidence_map: Dict[str, float] = Field(default_factory=dict)
+    notes: List[str] = Field(default_factory=list)
+
+
+class PageDebugPackage(BaseModel):
+    """Reviewer/debug artifact saved alongside parsed pages."""
+
+    page_url: str
+    final_url: Optional[str] = None
+    page_title: Optional[str] = None
+    cleaned_text: str = ""
+    section_tree: List[SectionNode] = Field(default_factory=list)
+    extracted_evidence_map: Dict[str, List[FieldEvidence]] = Field(default_factory=dict)
+    confidence_map: Dict[str, float] = Field(default_factory=dict)
+    records: List[PageDebugRecord] = Field(default_factory=list)
 
 
 class CrawlTraceEntry(BaseModel):
@@ -183,6 +220,7 @@ class FundingProgrammeRecord(BaseModel):
     source_urls: List[str] = Field(default_factory=list)
     source_domain: str
     source_page_title: Optional[str] = None
+    source_scope: Optional[str] = None
     scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_verified_at: Optional[date] = None
@@ -242,12 +280,14 @@ class FundingProgrammeRecord(BaseModel):
 
     raw_text_snippets: Dict[str, List[str]] = Field(default_factory=dict)
     extraction_confidence: Dict[str, float] = Field(default_factory=dict)
+    field_evidence: Dict[str, List[FieldEvidence]] = Field(default_factory=dict)
     related_documents: List[str] = Field(default_factory=list)
     parser_version: str = SCRAPER_VERSION
     needs_review: bool = False
     validation_errors: List[str] = Field(default_factory=list)
     deleted_at: Optional[datetime] = None
     notes: List[str] = Field(default_factory=list)
+    page_debug_package: Optional[PageDebugPackage] = None
 
     @field_validator(
         "funding_lines",
@@ -304,6 +344,48 @@ class FundingProgrammeRecord(BaseModel):
             value = [value]
         cleaned = unique_preserve_order([" ".join(str(item).split()).strip() for item in value if str(item).strip()])
         return cleaned or None
+
+    @field_validator("field_evidence", mode="before")
+    @classmethod
+    def _normalize_field_evidence(cls, value: Any) -> Dict[str, List[FieldEvidence]]:
+        if not value:
+            return {}
+        if isinstance(value, list):
+            value = {"evidence": value}
+        if not isinstance(value, dict):
+            return {}
+        normalized: Dict[str, List[FieldEvidence]] = {}
+        for field_name, evidence_items in value.items():
+            if evidence_items is None:
+                continue
+            if isinstance(evidence_items, (FieldEvidence, dict, str)):
+                iterable = [evidence_items]
+            else:
+                iterable = list(evidence_items)
+            cleaned: List[FieldEvidence] = []
+            for item in iterable:
+                try:
+                    if isinstance(item, FieldEvidence):
+                        cleaned.append(item)
+                    elif isinstance(item, dict):
+                        payload = dict(item)
+                        payload.setdefault("field_name", str(field_name))
+                        cleaned.append(FieldEvidence.model_validate(payload))
+                    else:
+                        text = " ".join(str(item).split()).strip()
+                        if text:
+                            cleaned.append(
+                                FieldEvidence(
+                                    field_name=str(field_name),
+                                    evidence_text=text,
+                                    source_url="",
+                                )
+                            )
+                except Exception:
+                    continue
+            if cleaned:
+                normalized[str(field_name)] = cleaned
+        return normalized
 
     @field_validator("raw_text_snippets", mode="before")
     @classmethod
@@ -423,6 +505,23 @@ class FundingProgrammeRecord(BaseModel):
             self.extraction_confidence_by_field = dict(self.extraction_confidence)
         if not self.extraction_confidence and self.extraction_confidence_by_field:
             self.extraction_confidence = dict(self.extraction_confidence_by_field)
+        if not self.field_evidence and self.evidence_by_field:
+            self.field_evidence = {
+                field_name: [
+                    FieldEvidence(
+                        field_name=field_name,
+                        evidence_text=snippet,
+                        source_url=self.source_url,
+                        source_section=field_name,
+                        source_scope=self.source_scope,
+                        confidence=self.extraction_confidence.get(field_name, 0.0),
+                        normalized_value=None,
+                        raw_value=snippet,
+                    )
+                    for snippet in snippets
+                ]
+                for field_name, snippets in self.evidence_by_field.items()
+            }
         if not self.program_id:
             self.program_id = generate_program_id(self.source_domain, self.funder_name, self.program_name)
         if not self.id:
@@ -445,6 +544,20 @@ class FundingProgrammeRecord(BaseModel):
             self.field_confidence = dict(self.extraction_confidence)
         if not self.extraction_confidence and self.field_confidence:
             self.extraction_confidence = dict(self.field_confidence)
+        if not self.evidence_by_field and self.field_evidence:
+            flattened: Dict[str, List[str]] = {}
+            for field_name, items in self.field_evidence.items():
+                flattened[field_name] = [item.evidence_text for item in items if item.evidence_text]
+            self.evidence_by_field = {
+                field_name: unique_preserve_order(values) for field_name, values in flattened.items() if values
+            }
+        if not self.raw_text_snippets and self.field_evidence:
+            self.raw_text_snippets = dict(self.evidence_by_field)
+        if not self.extraction_confidence_by_field and self.field_evidence:
+            self.extraction_confidence_by_field = {
+                field_name: max((item.confidence for item in items), default=0.0)
+                for field_name, items in self.field_evidence.items()
+            }
         self.validation_errors = unique_preserve_order(
             [cleaned for cleaned in (" ".join(item.split()).strip() for item in self.validation_errors) if cleaned]
         )
@@ -492,12 +605,15 @@ class ExtractionResult(BaseModel):
 
     page_url: str
     page_title: Optional[str] = None
+    cleaned_text: str = ""
+    section_tree: List[SectionNode] = Field(default_factory=list)
     discovered_links: List[str] = Field(default_factory=list)
     internal_links: List[str] = Field(default_factory=list)
     application_links: List[str] = Field(default_factory=list)
     document_links: List[str] = Field(default_factory=list)
     records: List[FundingProgrammeRecord] = Field(default_factory=list)
     evidence: List[FieldEvidence] = Field(default_factory=list)
+    page_debug_package: Optional[PageDebugPackage] = None
     page_type: str = "unknown"
     notes: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)

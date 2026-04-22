@@ -17,6 +17,8 @@ from scraper.adapters.base import SiteAdapter
 from scraper.parsers.extractor_rules import (
     CandidateBlock,
     build_scoped_soup,
+    build_section_bundle,
+    build_section_tree_from_soup,
     collect_anchor_candidates,
     collect_internal_anchor_candidates,
     extract_application_links,
@@ -26,7 +28,7 @@ from scraper.parsers.extractor_rules import (
     group_sections_from_soup,
 )
 from scraper.parsers.normalization import build_programme_record, classify_page_type
-from scraper.schemas import ExtractionResult, PageFetchResult
+from scraper.schemas import ExtractionResult, PageDebugPackage, PageFetchResult, PageDebugRecord
 from scraper.utils.text import clean_text
 from scraper.utils.urls import filter_and_sort_links
 
@@ -111,6 +113,18 @@ class GenericFundingParser:
                         scoped_soup,
                         heading_selectors=profile.section_heading_selectors if profile else (),
                     ),
+                    section_tree=build_section_tree_from_soup(
+                        scoped_soup,
+                        heading_selectors=profile.section_heading_selectors if profile else (),
+                        source_url=page.canonical_url,
+                    ),
+                    section_bundle=build_section_bundle(
+                        group_sections_from_soup(
+                            scoped_soup,
+                            heading_selectors=profile.section_heading_selectors if profile else (),
+                        ),
+                        section_aliases=profile.section_aliases if profile else None,
+                    ),
                     section_aliases=dict(profile.section_aliases) if profile else {},
                     detail_links=[],
                     application_links=page_application_links,
@@ -121,6 +135,7 @@ class GenericFundingParser:
 
         records = []
         evidence = []
+        record_packages = []
         for block in candidate_blocks:
             block.document_links = list(dict.fromkeys(block.document_links))
             block.application_links = list(dict.fromkeys(block.application_links))
@@ -137,6 +152,8 @@ class GenericFundingParser:
             if record:
                 records.append(record)
                 evidence.extend(record_evidence)
+                if record.page_debug_package:
+                    record_packages.append(record.page_debug_package)
             else:
                 warnings.append("Skipped a low-information block on %s." % page.canonical_url)
 
@@ -171,15 +188,51 @@ class GenericFundingParser:
                 document_link_count=document_link_count,
             )
 
+        combined_evidence_map = {}
+        for item in evidence:
+            combined_evidence_map.setdefault(item.field_name, []).append(item)
+        combined_confidence_map = {
+            field_name: max((item.confidence for item in items), default=0.0)
+            for field_name, items in combined_evidence_map.items()
+        }
+        combined_records = []
+        for package in record_packages:
+            combined_records.extend(package.records)
+        if not combined_records and records:
+            combined_records = [
+                PageDebugRecord(
+                    program_name=record.program_name,
+                    parent_programme_name=record.parent_programme_name,
+                    source_scope=record.source_scope,
+                    evidence_map=record.field_evidence,
+                    confidence_map=record.field_confidence,
+                    notes=record.notes,
+                )
+                for record in records
+            ]
+        page_debug_package = PageDebugPackage(
+            page_url=page.canonical_url,
+            final_url=page.final_url or page.canonical_url,
+            page_title=page_title,
+            cleaned_text=page_text,
+            section_tree=candidate_blocks[0].section_tree if candidate_blocks else [],
+            extracted_evidence_map=combined_evidence_map,
+            confidence_map=combined_confidence_map,
+            records=combined_records,
+        )
+
         return ExtractionResult(
             page_url=page.canonical_url,
             page_title=page_title,
+            cleaned_text=page_text,
+            section_tree=candidate_blocks[0].section_tree if candidate_blocks else [],
             discovered_links=discovered_links,
             internal_links=internal_links,
             application_links=page_application_links,
             document_links=document_links,
             records=records,
             evidence=evidence,
+            page_debug_package=page_debug_package,
             page_type=page_type,
             notes=notes,
             warnings=warnings,

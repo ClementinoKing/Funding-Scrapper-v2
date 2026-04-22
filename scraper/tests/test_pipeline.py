@@ -125,7 +125,7 @@ def test_pipeline_runs_db_site_targets_with_adapter_key(settings, monkeypatch) -
                   <article>
                     <h1>New Venture Capital - National Empowerment Fund</h1>
                     <p>Funding for startups and growth-stage businesses.</p>
-                    <a href="https://www.nefcorp.co.za/products-services/new-venture-capital">Learn more</a>
+                    <a href="https://www.nefcorp.co.za/products-services/rural-community-development-fund/2-new-venture-capital">Learn more</a>
                   </article>
                 </main>
               </body>
@@ -133,8 +133,8 @@ def test_pipeline_runs_db_site_targets_with_adapter_key(settings, monkeypatch) -
             """,
             "Products and Services - NEF",
         ),
-        "https://www.nefcorp.co.za/products-services/new-venture-capital": _page(
-            "https://www.nefcorp.co.za/products-services/new-venture-capital",
+        "https://www.nefcorp.co.za/products-services/rural-community-development-fund/2-new-venture-capital": _page(
+            "https://www.nefcorp.co.za/products-services/rural-community-development-fund/2-new-venture-capital",
             """
             <html>
               <head><title>New Venture Capital - National Empowerment Fund</title></head>

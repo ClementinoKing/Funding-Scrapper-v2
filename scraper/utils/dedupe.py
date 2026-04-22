@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 from rapidfuzz import fuzz
 
 from scraper.adapters.base import SiteAdapter
-from scraper.schemas import FundingProgrammeRecord, FundingType, ProgrammeNature
+from scraper.schemas import FieldEvidence, FundingProgrammeRecord, FundingType, ProgrammeNature
 from scraper.utils.text import completeness_score, generate_program_id, slugify, unique_preserve_order
 from scraper.utils.urls import canonicalize_url
 
@@ -88,6 +88,42 @@ def _merge_lists(left: List[str], right: List[str]) -> List[str]:
     return unique_preserve_order(list(left) + list(right))
 
 
+def _evidence_fingerprint(item: FieldEvidence | dict) -> Tuple[str, str, str, str, str]:
+    if isinstance(item, FieldEvidence):
+        normalized = item.normalized_value
+        evidence_text = item.evidence_text
+        source_url = item.source_url
+        source_section = item.source_section or ""
+        source_scope = item.source_scope or ""
+    else:
+        normalized = item.get("normalized_value")
+        evidence_text = str(item.get("evidence_text") or "")
+        source_url = str(item.get("source_url") or "")
+        source_section = str(item.get("source_section") or "")
+        source_scope = str(item.get("source_scope") or "")
+    return (
+        str(normalized),
+        evidence_text,
+        source_url,
+        source_section,
+        source_scope,
+    )
+
+
+def _merge_field_evidence(left: Dict[str, List[FieldEvidence]], right: Dict[str, List[FieldEvidence]]) -> Dict[str, List[FieldEvidence]]:
+    merged: Dict[str, List[FieldEvidence]] = {field: list(items) for field, items in left.items()}
+    for field_name, items in right.items():
+        existing = merged.setdefault(field_name, [])
+        seen = {_evidence_fingerprint(item) for item in existing}
+        for item in items:
+            fingerprint = _evidence_fingerprint(item)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            existing.append(item)
+    return merged
+
+
 def _merge_record_pair(
     primary: FundingProgrammeRecord,
     secondary: FundingProgrammeRecord,
@@ -106,6 +142,19 @@ def _merge_record_pair(
         elif isinstance(current_value, dict):
             updated = dict(current_value)
             if isinstance(candidate_value, dict):
+                if field_name == "field_evidence":
+                    current_evidence = {
+                        key: [FieldEvidence.model_validate(item) if isinstance(item, dict) else item for item in value]
+                        for key, value in updated.items()
+                        if isinstance(value, list)
+                    }
+                    candidate_evidence = {
+                        key: [FieldEvidence.model_validate(item) if isinstance(item, dict) else item for item in value]
+                        for key, value in candidate_value.items()
+                        if isinstance(value, list)
+                    }
+                    setattr(merged, field_name, _merge_field_evidence(current_evidence, candidate_evidence))
+                    continue
                 for key, value in candidate_value.items():
                     if isinstance(value, list):
                         existing = updated.get(key, [])
@@ -128,6 +177,8 @@ def _merge_record_pair(
     merged.source_urls = _merge_lists(primary.source_urls, secondary.source_urls)
     if merged.source_url not in merged.source_urls and merged.source_urls:
         merged.source_url = merged.source_urls[0]
+    if not merged.page_debug_package and secondary.page_debug_package:
+        merged.page_debug_package = secondary.page_debug_package
     if adapter:
         merged.program_name = adapter.program_name_for_merge(merged.program_name)
         merged.funder_name = adapter.funder_name_for_merge(merged.funder_name)

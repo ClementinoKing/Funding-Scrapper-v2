@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 WHITESPACE_RE = re.compile(r"\s+")
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 PHONE_RE = re.compile(r"(?:\+?\d[\d\s().-]{7,}\d)")
+URL_RE = re.compile(r"https?://[^\s<>\"]+", re.I)
 NUMBERED_SECTION_RE = re.compile(r"^\s*\d+(?:[.)]\s*|\s+)?")
 
 SUPPORT_TITLE_HINTS = (
@@ -108,6 +109,15 @@ def extract_phone_numbers(text: str) -> List[str]:
         if len(digits) >= 9:
             phones.append(phone)
     return unique_preserve_order(phones)
+
+
+def extract_urls(text: str) -> List[str]:
+    urls: List[str] = []
+    for match in URL_RE.finditer(text or ""):
+        url = collapse_whitespace(match.group(0)).rstrip(").,;]")
+        if url:
+            urls.append(url)
+    return unique_preserve_order(urls)
 
 
 def sentence_chunks(text: str) -> List[str]:

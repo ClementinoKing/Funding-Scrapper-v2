@@ -173,6 +173,16 @@ class Crawler:
 
         return extraction_page_type
 
+    @staticmethod
+    def _source_scope_for_page_type(page_type: Optional[str], current_scope: Optional[str] = None) -> Optional[str]:
+        if page_type == "parent":
+            return "parent_page"
+        if page_type in {"support-document", "application_support_page", "supporting_or_complementary_programme_page"}:
+            return "support_page"
+        if current_scope:
+            return current_scope
+        return "product_page"
+
     def crawl(
         self,
         seed_urls: Sequence[str],
@@ -216,6 +226,17 @@ class Crawler:
                     adapter=adapter,
                 )
                 if score is None:
+                    if skip_reason == "irrelevant-url":
+                        continue
+                    crawl_trace.append(
+                        self._trace(
+                            event="skipped",
+                            url=sitemap_url,
+                            adapter_name=adapter.key if adapter else None,
+                            depth=0,
+                            reason=skip_reason or "filtered",
+                        )
+                    )
                     continue
                 heapq.heappush(queue, (-score, next(order), sitemap_url, 0, "sitemap"))
                 queued.add(sitemap_url)
@@ -248,15 +269,6 @@ class Crawler:
                 )
                 continue
             if looks_irrelevant_url(current_url, self.settings.irrelevant_url_patterns):
-                crawl_trace.append(
-                    self._trace(
-                        event="skipped",
-                        url=current_url,
-                        adapter_name=adapter.key if adapter else None,
-                        depth=depth,
-                        reason="irrelevant-url",
-                    )
-                )
                 continue
             if adapter and not adapter.should_allow_url(current_url):
                 crawl_trace.append(
@@ -307,6 +319,8 @@ class Crawler:
             pages_fetched_successfully += 1
             self.storage.save_page_snapshot(page)
             extraction = self.parser.parse(page, allowed_domains=allowed_domains, adapter=adapter)
+            if extraction.page_debug_package:
+                self.storage.write_page_debug_package(extraction.page_debug_package)
             page_role = extraction.page_type
             self.storage.append_crawl_trace(
                 self._trace(
@@ -346,12 +360,37 @@ class Crawler:
                     extraction_page_type=extraction.page_type,
                     record=normalized_record,
                 )
+                resolved_scope = self._source_scope_for_page_type(record_page_type, normalized_record.source_scope)
+                if resolved_scope and resolved_scope != normalized_record.source_scope:
+                    updated_evidence = {
+                        field_name: [
+                            item.model_copy(update={"source_scope": resolved_scope}) for item in items
+                        ]
+                        for field_name, items in normalized_record.field_evidence.items()
+                    }
+                    updated_package = normalized_record.page_debug_package
+                    if updated_package:
+                        updated_package = updated_package.model_copy(
+                            update={
+                                "records": [
+                                    record_item.model_copy(update={"source_scope": resolved_scope})
+                                    for record_item in updated_package.records
+                                ]
+                            }
+                        )
+                    normalized_record = normalized_record.model_copy(
+                        update={
+                            "source_scope": resolved_scope,
+                            "field_evidence": updated_evidence,
+                            "page_debug_package": updated_package,
+                        }
+                    )
                 if adapter and not adapter.should_promote_record(normalized_record, record_page_type):
                     continue
                 enriched_payload = normalized_record.model_dump(mode="python", exclude={"site_adapter", "page_type"})
-                enriched_record = record.model_copy(update=enriched_payload)
-                enriched_record = enriched_record.model_copy(
-                    update={
+                enriched_record = FundingProgrammeRecord.model_validate(
+                    {
+                        **enriched_payload,
                         "site_adapter": adapter.key if adapter else record.site_adapter,
                         "page_type": record_page_type,
                     }
@@ -393,6 +432,8 @@ class Crawler:
                     adapter=adapter,
                 )
                 if score is None:
+                    if skip_reason == "irrelevant-url":
+                        continue
                     crawl_trace.append(
                         self._trace(
                             event="skipped",

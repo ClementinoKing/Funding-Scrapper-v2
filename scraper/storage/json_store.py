@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import List
 
-from scraper.schemas import CrawlState, CrawlTraceEntry, FundingProgrammeRecord, PageFetchResult, RunSummary
+from scraper.schemas import CrawlState, CrawlTraceEntry, FundingProgrammeRecord, PageDebugPackage, PageFetchResult, RunSummary
 from scraper.utils.text import slugify
 from scraper.utils.urls import get_domain_slug
 
@@ -20,6 +20,7 @@ class LocalJsonStore:
         self.pages_dir = self.raw_dir / "pages"
         self.normalized_dir = self.output_root / "normalized"
         self.logs_dir = self.output_root / "logs"
+        self.debug_dir = self.raw_dir / "debug"
         self.crawl_trace_path = self.logs_dir / "crawl_trace.jsonl"
         self.merge_trace_path = self.logs_dir / "merge_trace.json"
         self.extracted_jsonl_path = self.raw_dir / "extracted_programs.jsonl"
@@ -31,6 +32,7 @@ class LocalJsonStore:
 
     def initialize_run(self, run_id: str) -> None:
         self.pages_dir.mkdir(parents=True, exist_ok=True)
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.normalized_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         if not self.extracted_jsonl_path.exists():
@@ -62,6 +64,13 @@ class LocalJsonStore:
         html_path.write_text(page.html, encoding="utf-8")
         metadata_path.write_text(page.model_dump_json(indent=2), encoding="utf-8")
         return html_path
+
+    def write_page_debug_package(self, package: PageDebugPackage) -> Path:
+        basename = slugify(package.final_url or package.page_url, max_length=80)
+        path = self.debug_dir / ("%s.json" % basename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(package.model_dump_json(indent=2), encoding="utf-8")
+        return path
 
     def append_extracted_record(self, record: FundingProgrammeRecord) -> None:
         with self.extracted_jsonl_path.open("a", encoding="utf-8") as handle:

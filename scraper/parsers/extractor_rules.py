@@ -9,6 +9,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
+from scraper.schemas import SectionNode
 from scraper.utils.text import clean_text, split_lines, unique_preserve_order
 from scraper.utils.urls import canonicalize_url, is_internal_url, is_probably_document_url
 
@@ -65,11 +66,26 @@ GENERIC_SECTION_HEADINGS = {
 
 
 @dataclass
+class SectionBundle:
+    identity: List[str] = field(default_factory=list)
+    overview: List[str] = field(default_factory=list)
+    funding_offer: List[str] = field(default_factory=list)
+    eligibility: List[str] = field(default_factory=list)
+    terms_and_structure: List[str] = field(default_factory=list)
+    application_route: List[str] = field(default_factory=list)
+    related_documents: List[str] = field(default_factory=list)
+    traceability: List[str] = field(default_factory=list)
+    raw_sections: Dict[str, List[str]] = field(default_factory=dict)
+
+
+@dataclass
 class CandidateBlock:
     heading: str
     text: str
     source_url: str
     section_map: Dict[str, List[str]] = field(default_factory=dict)
+    section_tree: List[SectionNode] = field(default_factory=list)
+    section_bundle: SectionBundle = field(default_factory=SectionBundle)
     section_aliases: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     detail_links: List[str] = field(default_factory=list)
     application_links: List[str] = field(default_factory=list)
@@ -161,7 +177,7 @@ def extract_application_links(soup: BeautifulSoup, base_url: str) -> List[str]:
         if any(term in label for term in ["brochure", "checklist", "guidelines", "download"]):
             continue
         if any(keyword in label for keyword in APPLICATION_HINTS) or any(keyword in lowered_href for keyword in APPLICATION_HINTS):
-            links.append(href)
+            links.append(href.rstrip("/") or href)
     return unique_preserve_order(links)
 
 
@@ -176,6 +192,118 @@ def _extract_text_items(node: Tag, limit: int = 18) -> List[str]:
     if not items:
         items = split_lines(node.get_text("\n", strip=True))
     return unique_preserve_order(items[:limit])
+
+
+def _is_heading_tag(node: Tag) -> bool:
+    return bool(node.name and re.match(r"^h[1-4]$", node.name))
+
+
+def _heading_level(node: Tag) -> int:
+    if not node.name:
+        return 1
+    match = re.match(r"^h([1-4])$", node.name)
+    return int(match.group(1)) if match else 1
+
+
+def _collect_heading_sections(
+    soup: BeautifulSoup,
+    *,
+    heading_selectors: Sequence[str] = (),
+) -> List[Tuple[str, int, List[str]]]:
+    sections: List[Tuple[str, int, List[str]]] = []
+    if heading_selectors:
+        headings: List[Tag] = []
+        seen_ids = set()
+        for selector in heading_selectors:
+            for node in soup.select(selector):
+                if isinstance(node, Tag) and id(node) not in seen_ids:
+                    seen_ids.add(id(node))
+                    headings.append(node)
+    else:
+        headings = list(soup.find_all(re.compile(r"^h[1-4]$")))
+    for heading in headings:
+        title = clean_text(heading.get_text(" ", strip=True))
+        if not title:
+            continue
+        collected: List[str] = []
+        for sibling in heading.next_siblings:
+            if isinstance(sibling, Tag) and _is_heading_tag(sibling):
+                break
+            if isinstance(sibling, Tag):
+                collected.extend(_extract_text_items(sibling, limit=10))
+            if len(collected) >= 12:
+                break
+        sections.append((title, _heading_level(heading), unique_preserve_order(collected[:12])))
+    return sections
+
+
+def build_section_tree_from_soup(
+    soup: BeautifulSoup,
+    *,
+    heading_selectors: Sequence[str] = (),
+    source_url: Optional[str] = None,
+) -> List[SectionNode]:
+    root_nodes: List[SectionNode] = []
+    stack: List[SectionNode] = []
+    for title, level, values in _collect_heading_sections(soup, heading_selectors=heading_selectors):
+        node = SectionNode(
+            title=title,
+            level=level,
+            text=" ".join(values),
+            source_url=source_url,
+        )
+        while stack and stack[-1].level >= node.level:
+            stack.pop()
+        if stack:
+            stack[-1].children.append(node)
+        else:
+            root_nodes.append(node)
+        stack.append(node)
+    return root_nodes
+
+
+def build_section_bundle(
+    section_map: Dict[str, List[str]],
+    section_aliases: Optional[Dict[str, Tuple[str, ...]]] = None,
+) -> SectionBundle:
+    bundle = SectionBundle(raw_sections=dict(section_map))
+    category_sources = {
+        "identity": ("program", "overview", "about", "summary", "who we are", "what is"),
+        "overview": ("overview", "about", "summary", "background", "introduction"),
+        "funding_offer": ("funding", "offer", "funding offer", "funding lines", "products", "facilities", "benefits"),
+        "eligibility": ("eligibility", "criteria", "requirements", "who can apply", "who qualifies"),
+        "terms_and_structure": ("terms", "structure", "interest", "security", "collateral", "repayment", "tenor", "pricing"),
+        "application_route": ("application", "apply", "how to apply", "submission", "contact", "portal"),
+        "related_documents": ("documents", "documentation", "guidelines", "forms", "brochure", "download"),
+    }
+    for title, values in section_map.items():
+        lowered = title.lower()
+        target = None
+        for category, keywords in category_sources.items():
+            if any(keyword in lowered for keyword in keywords):
+                target = category
+                break
+        if target is None and any(keyword in lowered for keyword in ("faq", "support", "contact", "more info")):
+            target = "traceability"
+        if target is None:
+            target = "traceability"
+        getattr(bundle, target).extend(values)
+
+    if section_aliases:
+        for category, aliases in section_aliases.items():
+            target = clean_text(category).lower().replace(" ", "_")
+            if not hasattr(bundle, target):
+                continue
+            for alias in aliases:
+                alias_text = clean_text(alias).lower()
+                for title, values in section_map.items():
+                    if alias_text and alias_text in title.lower():
+                        getattr(bundle, target).extend(values)
+
+    for field_name in ("identity", "overview", "funding_offer", "eligibility", "terms_and_structure", "application_route", "related_documents", "traceability"):
+        values = unique_preserve_order(getattr(bundle, field_name))
+        setattr(bundle, field_name, values)
+    return bundle
 
 
 def build_scoped_soup(
@@ -222,30 +350,9 @@ def group_sections_from_soup(
     heading_selectors: Sequence[str] = (),
 ) -> Dict[str, List[str]]:
     sections: Dict[str, List[str]] = {}
-    if heading_selectors:
-        headings: List[Tag] = []
-        seen_ids = set()
-        for selector in heading_selectors:
-            for node in soup.select(selector):
-                if isinstance(node, Tag) and id(node) not in seen_ids:
-                    seen_ids.add(id(node))
-                    headings.append(node)
-    else:
-        headings = list(soup.find_all(re.compile(r"^h[1-4]$")))
-    for heading in headings:
-        title = clean_text(heading.get_text(" ", strip=True))
-        if not title:
-            continue
-        collected: List[str] = []
-        for sibling in heading.next_siblings:
-            if isinstance(sibling, Tag) and sibling.name and re.match(r"^h[1-4]$", sibling.name):
-                break
-            if isinstance(sibling, Tag):
-                collected.extend(_extract_text_items(sibling, limit=10))
-            if len(collected) >= 12:
-                break
+    for title, _level, collected in _collect_heading_sections(soup, heading_selectors=heading_selectors):
         if collected:
-            sections[title] = unique_preserve_order(collected[:12])
+            sections[title] = collected
     return sections
 
 
@@ -314,6 +421,15 @@ def extract_candidate_blocks(
                 text=text,
                 source_url=base_url,
                 section_map=group_sections_from_soup(node_soup, heading_selectors=section_heading_selectors),
+                section_tree=build_section_tree_from_soup(
+                    node_soup,
+                    heading_selectors=section_heading_selectors,
+                    source_url=base_url,
+                ),
+                section_bundle=build_section_bundle(
+                    group_sections_from_soup(node_soup, heading_selectors=section_heading_selectors),
+                    section_aliases=section_aliases,
+                ),
                 section_aliases=dict(section_aliases or {}),
                 detail_links=unique_preserve_order(detail_links),
                 application_links=extract_application_links(node_soup, base_url) or unique_preserve_order(application_links),

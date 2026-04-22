@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from scraper.classifiers.funding_type import classify_funding_type
 from scraper.classifiers.geography import classify_geography
@@ -19,6 +20,8 @@ from scraper.schemas import (
     FieldEvidence,
     FundingProgrammeRecord,
     InterestType,
+    PageDebugPackage,
+    PageDebugRecord,
     ProgrammeStatus,
     RepaymentFrequency,
     TriState,
@@ -29,6 +32,7 @@ from scraper.utils.text import (
     clean_text,
     extract_emails,
     extract_phone_numbers,
+    extract_urls,
     looks_like_support_title,
     match_keyword_map,
     sentence_chunks,
@@ -79,6 +83,29 @@ APPLICATION_TEXT_PATTERNS = {
     ApplicationChannel.ONLINE_FORM: ["apply online", "online application", "apply now", "complete the form online"],
 }
 
+SOURCE_SCOPE_HINTS = {
+    "support_page": (
+        "criteria",
+        "eligibility",
+        "guidelines",
+        "how-to-apply",
+        "how to apply",
+        "application",
+        "documents",
+        "checklist",
+        "faq",
+        "support",
+        "instrument",
+    ),
+    "parent_page": (
+        "programme",
+        "program",
+        "fund",
+        "overview",
+        "about",
+    ),
+}
+
 APPLICATION_LINK_POSITIVE_TERMS = (
     "portal",
     "apply",
@@ -98,6 +125,72 @@ APPLICATION_LINK_NEGATIVE_TERMS = (
     "sample",
 )
 
+
+def _scope_from_text(page_url: str, page_title: Optional[str], text: str, heading: str = "") -> str:
+    haystack = " ".join([page_url or "", page_title or "", text or "", heading or ""]).lower()
+    if any(term in haystack for term in SOURCE_SCOPE_HINTS["support_page"]):
+        return "support_page"
+    path_segments = [segment for segment in urlparse(page_url or "").path.split("/") if segment]
+    if len(path_segments) <= 2 and any(term in haystack for term in SOURCE_SCOPE_HINTS["parent_page"]):
+        return "parent_page"
+    return "product_page"
+
+
+def _percentage_mentions(text: str) -> List[str]:
+    mentions: List[str] = []
+    for match in re.finditer(r"\b\d{1,3}(?:\.\d+)?\s?%", text or ""):
+        mentions.append(clean_text(match.group(0)))
+    return unique_preserve_order(mentions)
+
+
+def _ownership_thresholds(text: str) -> List[str]:
+    thresholds: List[str] = []
+    patterns = [
+        re.compile(r"\b(?:minimum of|min\.?|at least|not less than)\s*(\d{1,3}(?:\.\d+)?)\s*%\s*(black|female|women|youth|black women|black female|black-owned|women-owned|youth-owned|minority)?(?:\s*(?:ownership|shareholding|equity|interest|ownership stake))?", re.I),
+        re.compile(r"\b(\d{1,3}(?:\.\d+)?)\s*%\s*(black|female|women|youth|black women|black female|black-owned|women-owned|youth-owned|minority)[^\n.]{0,80}", re.I),
+    ]
+    for pattern in patterns:
+        for match in pattern.finditer(text or ""):
+            thresholds.append(clean_text(match.group(0)))
+    return unique_preserve_order(thresholds)
+
+
+def _funding_keywords(text: str) -> List[str]:
+    keywords = []
+    for phrase in ["grant", "loan", "equity", "guarantee", "hybrid", "quasi-equity", "debt", "working capital", "asset finance", "acquisition finance"]:
+        if phrase in (text or "").lower():
+            keywords.append(phrase)
+    return unique_preserve_order(keywords)
+
+
+def _source_scope_for_record(page_url: str, page_title: Optional[str], text: str, heading: str, page_type: Optional[str] = None) -> str:
+    if page_type in {"parent"}:
+        return "parent_page"
+    if page_type in {"application_support_page", "support-document", "supporting_or_complementary_programme_page"}:
+        return "support_page"
+    return _scope_from_text(page_url, page_title, text, heading)
+
+
+def _method_confidence(method: str, fallback: float = 0.0) -> float:
+    return EVIDENCE_METHOD_CONFIDENCE.get(method, fallback)
+
+
+def _normalize_evidence_map(evidence: List[FieldEvidence]) -> Dict[str, List[FieldEvidence]]:
+    grouped: Dict[str, List[FieldEvidence]] = {}
+    for item in evidence:
+        grouped.setdefault(item.field_name, []).append(item)
+    return grouped
+
+
+def _confidence_map_from_evidence(evidence_map: Dict[str, List[FieldEvidence]]) -> Dict[str, float]:
+    confidence_map: Dict[str, float] = {}
+    for field_name, items in evidence_map.items():
+        if not items:
+            continue
+        best = max(items, key=lambda item: (EVIDENCE_METHOD_PRIORITY.get(item.method, 0), item.confidence))
+        confidence_map[field_name] = round(best.confidence, 4)
+    return confidence_map
+
 PUBLICATION_PATH_TERMS = (
     "press-release",
     "press-releases",
@@ -113,6 +206,24 @@ PUBLICATION_PATH_TERMS = (
     "success-story",
     "success-stories",
 )
+
+EVIDENCE_METHOD_CONFIDENCE = {
+    "direct_page_evidence": 0.96,
+    "deterministic_parser": 0.92,
+    "regex_from_prose": 0.84,
+    "heading_based_inference": 0.72,
+    "parent_page_inheritance": 0.64,
+    "llm_only_inference": 0.5,
+}
+
+EVIDENCE_METHOD_PRIORITY = {
+    "direct_page_evidence": 5,
+    "deterministic_parser": 4,
+    "regex_from_prose": 3,
+    "heading_based_inference": 2,
+    "parent_page_inheritance": 1,
+    "llm_only_inference": 0,
+}
 
 PUBLICATION_TEXT_TERMS = (
     "press release",
@@ -183,23 +294,34 @@ def _add_evidence(
     evidence_store: List[FieldEvidence],
     raw_text_snippets: Dict[str, List[str]],
     extraction_confidence: Dict[str, float],
+    *,
+    raw_value: Optional[object] = None,
+    source_section: Optional[str] = None,
+    source_scope: Optional[str] = None,
+    method: str = "regex_from_prose",
 ) -> None:
     if snippet:
         cleaned = clean_text(snippet)
         raw_text_snippets.setdefault(field_name, [])
         if cleaned and cleaned not in raw_text_snippets[field_name]:
             raw_text_snippets[field_name].append(cleaned)
+        score = max(confidence, _method_confidence(method, confidence))
         evidence_store.append(
             FieldEvidence(
                 field_name=field_name,
-                snippet=cleaned,
-                source_url=source_url,
-                confidence=confidence,
                 normalized_value=normalized_value,
+                raw_value=raw_value if raw_value is not None else cleaned,
+                evidence_text=cleaned,
+                source_url=source_url,
+                source_section=source_section,
+                source_scope=source_scope,
+                confidence=round(score, 4),
+                method=method,
             )
         )
-    if confidence > extraction_confidence.get(field_name, 0.0):
-        extraction_confidence[field_name] = round(confidence, 4)
+    score = max(confidence, _method_confidence(method, confidence))
+    if score > extraction_confidence.get(field_name, 0.0):
+        extraction_confidence[field_name] = round(score, 4)
 
 
 def _first_matching_sentences(text: str, keywords: Sequence[str], limit: int = 4) -> List[str]:
@@ -355,6 +477,7 @@ def _infer_funder_name(page_title: Optional[str], text: str) -> Optional[str]:
 
 def _extract_funding_lines(block: CandidateBlock, program_name: Optional[str]) -> List[str]:
     lines: List[str] = []
+    lines.extend(block.section_bundle.funding_offer)
     for heading, values in block.section_map.items():
         lowered = heading.lower()
         if any(term in lowered for term in ["funding products", "products", "facilities", "lines", "offerings"]):
@@ -370,9 +493,9 @@ def _extract_funding_lines(block: CandidateBlock, program_name: Optional[str]) -
 
 
 def _extract_eligibility_items(block: CandidateBlock) -> List[str]:
-    eligibility = find_section_values(block.section_map, "eligibility", block.section_aliases)
+    eligibility = block.section_bundle.eligibility or find_section_values(block.section_map, "eligibility", block.section_aliases)
     if eligibility:
-        return eligibility
+        return unique_preserve_order(eligibility)
     items = []
     for sentence in sentence_chunks(block.text):
         lowered = sentence.lower()
@@ -384,14 +507,27 @@ def _extract_eligibility_items(block: CandidateBlock) -> List[str]:
 
 
 def _extract_required_documents(block: CandidateBlock) -> List[str]:
-    documents = find_section_values(block.section_map, "documents", block.section_aliases)
+    documents = list(block.section_bundle.related_documents)
+    documents.extend(find_section_values(block.section_map, "documents", block.section_aliases))
     for document_link in block.document_links:
         documents.append(document_link)
-    return unique_preserve_order(documents)
+    filtered_documents: List[str] = []
+    for document in documents:
+        lowered = clean_text(document).lower()
+        if not lowered:
+            continue
+        if any(term in lowered for term in ["apply online", "application portal", "online portal", "submit application"]):
+            continue
+        if any(term in lowered for term in ["apply", "application", "portal", "form", "submit", "online"]) and not any(
+            term in lowered for term in ["document", "documents", "certificate", "certified", "checklist", "guideline", "guidelines", "requirements"]
+        ):
+            continue
+        filtered_documents.append(document)
+    return unique_preserve_order(filtered_documents)
 
 
 def _extract_raw_funding_offer_data(block: CandidateBlock, combined_text: str) -> List[str]:
-    section_values = find_section_values(block.section_map, "funding", block.section_aliases)
+    section_values = block.section_bundle.funding_offer or find_section_values(block.section_map, "funding", block.section_aliases)
     if section_values:
         return unique_preserve_order(section_values)
     funding_scope = _scoped_section_text(block.section_map, USE_OF_FUNDS_SECTION_HINTS)
@@ -401,7 +537,7 @@ def _extract_raw_funding_offer_data(block: CandidateBlock, combined_text: str) -
 
 
 def _extract_raw_terms_data(block: CandidateBlock, combined_text: str) -> List[str]:
-    terms_scope = _scoped_section_text(block.section_map, TERMS_SECTION_HINTS) or combined_text
+    terms_scope = " ".join(block.section_bundle.terms_and_structure) or _scoped_section_text(block.section_map, TERMS_SECTION_HINTS) or combined_text
     return _first_matching_sentences(
         terms_scope,
         ["repayment", "interest", "prime", "collateral", "security", "equity", "tenor"],
@@ -410,7 +546,11 @@ def _extract_raw_terms_data(block: CandidateBlock, combined_text: str) -> List[s
 
 
 def _extract_raw_application_data(block: CandidateBlock, combined_text: str) -> List[str]:
-    application_scope = _scoped_section_text(block.section_map, APPLICATION_SECTION_HINTS, block.section_aliases.get("application", ()))
+    application_scope = " ".join(block.section_bundle.application_route) or _scoped_section_text(
+        block.section_map,
+        APPLICATION_SECTION_HINTS,
+        block.section_aliases.get("application", ()),
+    )
     if application_scope:
         return unique_preserve_order(split_lines(application_scope)[:8] or sentence_chunks(application_scope)[:8])
     return _first_matching_sentences(
@@ -491,6 +631,12 @@ def _pick_application_route(block: CandidateBlock, page_url: str, text: str) -> 
         if best_link and score_candidate(best_link) >= 8:
             confidence = 0.92 if "portal" in best_link.lower() or "online." in best_link.lower() else 0.84
             return ApplicationChannel.ONLINE_FORM, best_link, best_link, confidence
+    text_urls = extract_urls(text)
+    if text_urls:
+        for url in text_urls:
+            lowered_url = url.lower()
+            if any(term in lowered_url for term in APPLICATION_LINK_POSITIVE_TERMS):
+                return ApplicationChannel.ONLINE_FORM, url, url, 0.86
     for channel, phrases in APPLICATION_TEXT_PATTERNS.items():
         for phrase in phrases:
             if phrase in lowered:
@@ -559,27 +705,88 @@ def build_programme_record(
         return None, []
 
     source_domain = extract_domain(page_url)
+    source_scope = _source_scope_for_record(page_url, page_title, block.text, block.heading)
     default_currency = infer_default_currency(combined_text, source_domain)
     raw_text_snippets: Dict[str, List[str]] = {}
     extraction_confidence: Dict[str, float] = {}
     evidence_store: List[FieldEvidence] = []
     notes: List[str] = []
 
+    identity_text = " ".join(unique_preserve_order([block.heading, page_title or "", " ".join(block.section_bundle.identity)]))
+    overview_text = " ".join(block.section_bundle.overview or split_lines(combined_text)[:3])
+    funding_text = " ".join(block.section_bundle.funding_offer or find_section_values(block.section_map, "funding", block.section_aliases))
+    eligibility_text = " ".join(block.section_bundle.eligibility or find_section_values(block.section_map, "eligibility", block.section_aliases))
+    terms_text = " ".join(block.section_bundle.terms_and_structure or find_section_values(block.section_map, "timing", block.section_aliases))
+    application_text = " ".join(block.section_bundle.application_route or find_section_values(block.section_map, "application", block.section_aliases))
+    related_documents_text = " ".join(block.section_bundle.related_documents or find_section_values(block.section_map, "documents", block.section_aliases))
+
     program_name = _infer_program_name(block, page_title)
     if program_name:
-        _add_evidence("program_name", program_name, block.heading or page_title, 0.92 if block.heading else 0.65, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "program_name",
+            program_name,
+            block.heading or page_title,
+            0.92 if block.heading else 0.7,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=block.heading or page_title,
+            source_section="identity",
+            source_scope=source_scope,
+            method="heading_based_inference",
+        )
 
     funder_name = _infer_funder_name(page_title, combined_text)
     if funder_name:
-        _add_evidence("funder_name", funder_name, page_title or combined_text, 0.68, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "funder_name",
+            funder_name,
+            page_title or combined_text,
+            0.68,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=page_title or combined_text,
+            source_section="identity",
+            source_scope=source_scope,
+            method="regex_from_prose",
+        )
 
-    funding_type, funding_type_confidence, funding_hits = classify_funding_type(combined_text)
+    funding_type, funding_type_confidence, funding_hits = classify_funding_type(" ".join([funding_text, overview_text, combined_text]))
     if funding_hits:
-        _add_evidence("funding_type", funding_type.value, ", ".join(funding_hits), funding_type_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "funding_type",
+            funding_type.value,
+            ", ".join(funding_hits),
+            funding_type_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=funding_hits,
+            source_section="funding_offer",
+            source_scope=source_scope,
+            method="deterministic_parser",
+        )
 
     funding_lines = _extract_funding_lines(block, program_name)
     if funding_lines:
-        _add_evidence("funding_lines", funding_lines, take_best_snippet(funding_lines), 0.72, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "funding_lines",
+            funding_lines,
+            take_best_snippet(funding_lines),
+            0.72,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=funding_lines,
+            source_section="funding_offer",
+            source_scope=source_scope,
+            method="regex_from_prose",
+        )
 
     raw_funding_offer_data = _extract_raw_funding_offer_data(block, combined_text)
     if raw_funding_offer_data:
@@ -587,14 +794,17 @@ def build_programme_record(
             "raw_funding_offer_data",
             raw_funding_offer_data,
             take_best_snippet(raw_funding_offer_data),
-            0.72,
+            0.8,
             page_url,
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=raw_funding_offer_data,
+            source_section="funding_offer",
+            source_scope=source_scope,
+            method="direct_page_evidence",
         )
 
-    funding_text = " ".join(find_section_values(block.section_map, "funding", block.section_aliases))
     ticket_min, ticket_max, currency, money_snippet, money_confidence = extract_money_range(
         funding_text or combined_text,
         default_currency=default_currency,
@@ -614,10 +824,14 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=money_snippet,
+            source_section="funding_offer",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
     budget_total, budget_currency, budget_snippet, budget_confidence = extract_budget_total(
-        combined_text,
+        " ".join([funding_text, overview_text, combined_text]),
         default_currency=default_currency,
     )
     if budget_snippet:
@@ -630,12 +844,14 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=budget_snippet,
+            source_section="funding_offer",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
     currency = currency or budget_currency
 
-    deadline_info = parse_deadline_info(
-        " ".join(find_section_values(block.section_map, "timing", block.section_aliases)) or combined_text
-    )
+    deadline_info = parse_deadline_info(terms_text or combined_text)
     if deadline_info["snippet"]:
         _add_evidence(
             "deadline",
@@ -646,10 +862,14 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=deadline_info["snippet"],
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
     funding_speed_days_min, funding_speed_days_max, speed_snippet, speed_confidence = _extract_day_range(
-        combined_text,
+        terms_text or combined_text,
         ["turnaround", "processing time", "funding within", "approval within"],
     )
     if speed_snippet:
@@ -662,9 +882,13 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=speed_snippet,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
-    geography = classify_geography(combined_text, settings)
+    geography = classify_geography(eligibility_text or combined_text, settings)
     if geography["evidence"]:
         _add_evidence(
             "geography",
@@ -679,14 +903,19 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=geography["evidence"],
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
     notes.extend(geography["notes"])
 
+    industries_text = " ".join(block.section_bundle.overview + block.section_bundle.funding_offer + block.section_bundle.eligibility) or combined_text
     industries_text = _scoped_section_text(
         block.section_map,
         INDUSTRY_SECTION_HINTS,
         block.section_aliases.get("industries", ()),
-    ) or combined_text
+    ) or industries_text
     industries, industries_evidence = classify_industries(industries_text, settings)
     if industries:
         _add_evidence(
@@ -698,13 +927,21 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=industries_evidence,
+            source_section="overview",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
+    use_of_funds_text = (
+        " ".join(block.section_bundle.funding_offer + block.section_bundle.overview + block.section_bundle.identity)
+        or combined_text
+    )
     use_of_funds_text = _scoped_section_text(
         block.section_map,
         USE_OF_FUNDS_SECTION_HINTS,
         block.section_aliases.get("funding", ()) + block.section_aliases.get("use_of_funds", ()),
-    ) or combined_text
+    ) or use_of_funds_text
     use_of_funds, use_of_funds_evidence = classify_use_of_funds(use_of_funds_text, settings)
     if use_of_funds:
         _add_evidence(
@@ -716,9 +953,13 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=use_of_funds_evidence,
+            source_section="funding_offer",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
-    business_stage, business_stage_evidence = _extract_stage_eligibility(combined_text)
+    business_stage, business_stage_evidence = _extract_stage_eligibility(eligibility_text or combined_text)
     if business_stage:
         _add_evidence(
             "business_stage_eligibility",
@@ -729,22 +970,38 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=business_stage_evidence,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
-    ownership_targets, ownership_evidence = classify_ownership_targets(combined_text, settings)
+    ownership_targets, ownership_evidence = classify_ownership_targets(eligibility_text or combined_text, settings)
+    ownership_thresholds = _ownership_thresholds(eligibility_text or combined_text)
+    percentage_mentions = _percentage_mentions(eligibility_text or combined_text)
+    if ownership_thresholds:
+        ownership_targets = unique_preserve_order([*ownership_targets, *ownership_thresholds])
+        ownership_evidence = {**ownership_evidence, "thresholds": ownership_thresholds}
+    if percentage_mentions:
+        ownership_targets = unique_preserve_order([*ownership_targets, *percentage_mentions])
+        ownership_evidence = {**ownership_evidence, "percentages": percentage_mentions}
     if ownership_targets:
         _add_evidence(
             "ownership_targets",
             ownership_targets,
-            ", ".join(sum(ownership_evidence.values(), [])),
+            ", ".join(sum(ownership_evidence.values(), [])) if isinstance(ownership_evidence, dict) else ", ".join(ownership_targets),
             0.76,
             page_url,
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=ownership_evidence,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
-    entity_types_allowed, entity_type_evidence = match_keyword_map(combined_text, settings.entity_type_keywords)
+    entity_types_allowed, entity_type_evidence = match_keyword_map(eligibility_text or combined_text, settings.entity_type_keywords)
     if entity_types_allowed:
         _add_evidence(
             "entity_types_allowed",
@@ -755,9 +1012,13 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=entity_type_evidence,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
-    certifications_required, certification_evidence = match_keyword_map(combined_text, settings.certification_keywords)
+    certifications_required, certification_evidence = match_keyword_map(eligibility_text or combined_text, settings.certification_keywords)
     if certifications_required:
         _add_evidence(
             "certifications_required",
@@ -768,9 +1029,13 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=certification_evidence,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
-    turnover_min, turnover_max, turnover_snippet, turnover_confidence = _extract_turnover_range(combined_text, source_domain)
+    turnover_min, turnover_max, turnover_snippet, turnover_confidence = _extract_turnover_range(eligibility_text or combined_text, source_domain)
     turnover_min, turnover_max, turnover_swapped = _normalize_ordered_pair(turnover_min, turnover_max)
     if turnover_swapped:
         notes.append("Turnover range values were inverted in source text and were normalized.")
@@ -784,10 +1049,14 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=turnover_snippet,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
     years_in_business_min, years_in_business_max, years_snippet, years_confidence = _extract_numeric_range(
-        combined_text,
+        eligibility_text or combined_text,
         ["years in business", "years operating", "trading for", "years of operation"],
     )
     years_in_business_min, years_in_business_max, years_swapped = _normalize_ordered_pair(
@@ -806,10 +1075,14 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=years_snippet,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
     employee_min_raw, employee_max_raw, employee_snippet, employee_confidence = _extract_numeric_range(
-        combined_text,
+        eligibility_text or combined_text,
         ["employees", "staff", "full-time employees", "headcount"],
     )
     employee_min = int(employee_min_raw) if employee_min_raw is not None else None
@@ -827,10 +1100,14 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=employee_snippet,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
     payback_months_min, payback_months_max, payback_snippet, payback_confidence = _extract_month_range(
-        combined_text,
+        terms_text or combined_text,
         ["repayment", "repayable", "loan term", "tenor", "repayment term"],
     )
     payback_months_min, payback_months_max, payback_swapped = _normalize_ordered_pair(payback_months_min, payback_months_max)
@@ -846,6 +1123,10 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=payback_snippet,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
     raw_terms_data = _extract_raw_terms_data(block, combined_text)
@@ -859,41 +1140,136 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=raw_terms_data,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="direct_page_evidence",
         )
 
-    security_required, security_snippet, security_confidence = _classify_tristate(combined_text, SECURITY_PATTERNS)
+    security_required, security_snippet, security_confidence = _classify_tristate(terms_text or combined_text, SECURITY_PATTERNS)
     if security_snippet:
-        _add_evidence("security_required", security_required.value, security_snippet, security_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "security_required",
+            security_required.value,
+            security_snippet,
+            security_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=security_snippet,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="regex_from_prose",
+        )
 
-    equity_required, equity_snippet, equity_confidence = _classify_tristate(combined_text, EQUITY_PATTERNS)
+    equity_required, equity_snippet, equity_confidence = _classify_tristate(terms_text or combined_text, EQUITY_PATTERNS)
     if equity_snippet:
-        _add_evidence("equity_required", equity_required.value, equity_snippet, equity_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "equity_required",
+            equity_required.value,
+            equity_snippet,
+            equity_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=equity_snippet,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="regex_from_prose",
+        )
 
-    interest_type, interest_snippet, interest_confidence = _classify_enum(combined_text, INTEREST_PATTERNS, InterestType.UNKNOWN)
+    interest_type, interest_snippet, interest_confidence = _classify_enum(terms_text or combined_text, INTEREST_PATTERNS, InterestType.UNKNOWN)
     if interest_snippet:
-        _add_evidence("interest_type", interest_type.value, interest_snippet, interest_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "interest_type",
+            interest_type.value,
+            interest_snippet,
+            interest_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=interest_snippet,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="regex_from_prose",
+        )
 
     repayment_frequency, repayment_snippet, repayment_confidence = _classify_enum(
-        combined_text,
+        terms_text or combined_text,
         REPAYMENT_PATTERNS,
         RepaymentFrequency.UNKNOWN,
     )
     if repayment_snippet:
-        _add_evidence("repayment_frequency", repayment_frequency.value, repayment_snippet, repayment_confidence, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "repayment_frequency",
+            repayment_frequency.value,
+            repayment_snippet,
+            repayment_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=repayment_snippet,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="regex_from_prose",
+        )
 
     raw_eligibility_data = _extract_eligibility_items(block)
     if raw_eligibility_data:
-        _add_evidence("raw_eligibility_data", raw_eligibility_data, take_best_snippet(raw_eligibility_data), 0.8, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "raw_eligibility_data",
+            raw_eligibility_data,
+            take_best_snippet(raw_eligibility_data),
+            0.8,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=raw_eligibility_data,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="direct_page_evidence",
+        )
 
     exclusions = _extract_exclusions(block)
     if exclusions:
-        _add_evidence("exclusions", exclusions, take_best_snippet(exclusions), 0.76, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "exclusions",
+            exclusions,
+            take_best_snippet(exclusions),
+            0.76,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=exclusions,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="regex_from_prose",
+        )
 
     required_documents = _extract_required_documents(block)
     if required_documents:
-        _add_evidence("required_documents", required_documents, take_best_snippet(required_documents), 0.74, page_url, evidence_store, raw_text_snippets, extraction_confidence)
+        _add_evidence(
+            "required_documents",
+            required_documents,
+            take_best_snippet(required_documents),
+            0.74,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=required_documents,
+            source_section="related_documents",
+            source_scope=source_scope,
+            method="direct_page_evidence",
+        )
 
-    raw_documents_data = unique_preserve_order(required_documents)
+    raw_documents_data = unique_preserve_order(required_documents + split_lines(related_documents_text))
     if raw_documents_data:
         _add_evidence(
             "raw_documents_data",
@@ -904,12 +1280,16 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=raw_documents_data,
+            source_section="related_documents",
+            source_scope=source_scope,
+            method="direct_page_evidence",
         )
 
     application_channel, application_url, application_snippet, application_confidence = _pick_application_route(
         block,
         page_url,
-        " ".join(find_section_values(block.section_map, "application", block.section_aliases)) or combined_text,
+        application_text or combined_text,
     )
     if application_snippet:
         _add_evidence(
@@ -921,10 +1301,45 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=application_snippet,
+            source_section="application_route",
+            source_scope=source_scope,
+            method="direct_page_evidence" if block.application_links else "regex_from_prose",
         )
 
-    related_documents = unique_preserve_order(block.document_links)
+    related_documents = unique_preserve_order([*block.document_links, *extract_urls(combined_text)])
     contact_email, contact_phone = _extract_contact_details(combined_text)
+    if contact_email:
+        _add_evidence(
+            "contact_email",
+            contact_email,
+            contact_email,
+            0.9,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=contact_email,
+            source_section="application_route",
+            source_scope=source_scope,
+            method="deterministic_parser",
+        )
+    if contact_phone:
+        _add_evidence(
+            "contact_phone",
+            contact_phone,
+            contact_phone,
+            0.9,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=contact_phone,
+            source_section="application_route",
+            source_scope=source_scope,
+            method="deterministic_parser",
+        )
+
     raw_application_data = _extract_raw_application_data(block, combined_text)
     if raw_application_data:
         _add_evidence(
@@ -936,6 +1351,10 @@ def build_programme_record(
             evidence_store,
             raw_text_snippets,
             extraction_confidence,
+            raw_value=raw_application_data,
+            source_section="application_route",
+            source_scope=source_scope,
+            method="direct_page_evidence",
         )
     if (
         application_channel == ApplicationChannel.UNKNOWN
@@ -955,6 +1374,10 @@ def build_programme_record(
                 evidence_store,
                 raw_text_snippets,
                 extraction_confidence,
+                raw_value=application_snippet,
+                source_section="application_route",
+                source_scope=source_scope,
+                method="regex_from_prose",
             )
 
     publication_signals = _publication_page_signals(page_url, page_title, combined_text)
@@ -992,6 +1415,15 @@ def build_programme_record(
         deadline_date=deadline_info["deadline_date"],
     )
 
+    evidence_map = _normalize_evidence_map(evidence_store)
+    confidence_map = _confidence_map_from_evidence(evidence_map)
+    raw_text_snippets = {
+        field_name: [item.evidence_text for item in items if item.evidence_text]
+        for field_name, items in evidence_map.items()
+        if items
+    }
+    field_evidence = evidence_map
+
     record = FundingProgrammeRecord(
         program_name=program_name,
         funder_name=funder_name,
@@ -999,6 +1431,7 @@ def build_programme_record(
         source_urls=[page_url],
         source_domain=source_domain,
         source_page_title=page_title,
+        source_scope=source_scope,
         scraped_at=datetime.now(timezone.utc),
         last_scraped_at=datetime.now(timezone.utc),
         raw_eligibility_data=raw_eligibility_data or None,
@@ -1007,7 +1440,9 @@ def build_programme_record(
         raw_documents_data=raw_documents_data,
         raw_application_data=raw_application_data,
         evidence_by_field=raw_text_snippets,
-        field_confidence=extraction_confidence,
+        field_confidence=confidence_map,
+        extraction_confidence=confidence_map,
+        field_evidence=field_evidence,
         funding_type=funding_type,
         funding_lines=funding_lines,
         ticket_min=ticket_min,
@@ -1048,11 +1483,30 @@ def build_programme_record(
         contact_email=contact_email,
         contact_phone=contact_phone,
         raw_text_snippets=raw_text_snippets,
-        extraction_confidence=extraction_confidence,
         related_documents=related_documents,
         notes=unique_preserve_order(notes),
     )
-    return record, evidence_store
+    debug_package = PageDebugPackage(
+        page_url=page_url,
+        final_url=page_url,
+        page_title=page_title,
+        cleaned_text=combined_text,
+        section_tree=block.section_tree,
+        extracted_evidence_map=evidence_map,
+        confidence_map=confidence_map,
+        records=[
+            PageDebugRecord(
+                program_name=record.program_name,
+                parent_programme_name=record.parent_programme_name,
+                source_scope=source_scope,
+                evidence_map=evidence_map,
+                confidence_map=confidence_map,
+                notes=record.notes,
+            )
+        ],
+    )
+    final_record = FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))
+    return final_record, evidence_store
 
 
 def classify_page_type(

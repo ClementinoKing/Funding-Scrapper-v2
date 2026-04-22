@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Protocol
 
-from scraper.schemas import CrawlState, CrawlTraceEntry, FundingProgrammeRecord, PageFetchResult, RunSummary
+from scraper.schemas import CrawlState, CrawlTraceEntry, FundingProgrammeRecord, PageDebugPackage, PageFetchResult, RunSummary
 
 
 class StorageBackend(Protocol):
@@ -16,6 +16,9 @@ class StorageBackend(Protocol):
         ...
 
     def save_page_snapshot(self, page: PageFetchResult) -> Path:
+        ...
+
+    def write_page_debug_package(self, package: PageDebugPackage) -> Path:
         ...
 
     def append_crawl_trace(self, entry: CrawlTraceEntry) -> None:
