@@ -86,6 +86,7 @@ class RuntimeOptions:
     headless: Optional[bool] = None
     browser_fallback: Optional[bool] = None
     respect_robots: Optional[bool] = None
+    ai_enrichment: Optional[bool] = None
 
 
 @dataclass
@@ -117,6 +118,9 @@ class ScraperSettings:
     ownership_target_keywords: Dict[str, List[str]] = field(default_factory=dict)
     entity_type_keywords: Dict[str, List[str]] = field(default_factory=dict)
     certification_keywords: Dict[str, List[str]] = field(default_factory=dict)
+    ai_enrichment: bool = False
+    ai_provider: str = "openai"
+    ai_model: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "ScraperSettings":
@@ -153,6 +157,9 @@ class ScraperSettings:
             ownership_target_keywords=load_json_resource("ownership_target_keywords.json"),
             entity_type_keywords=load_json_resource("entity_type_keywords.json"),
             certification_keywords=load_json_resource("certification_keywords.json"),
+            ai_enrichment=_env_bool("SCRAPER_AI_ENRICHMENT", False),
+            ai_provider=os.getenv("AI_PROVIDER", "openai").strip() or "openai",
+            ai_model=os.getenv("SCRAPER_AI_MODEL", "").strip() or None,
         )
 
     def with_overrides(self, options: RuntimeOptions) -> "ScraperSettings":
@@ -172,6 +179,7 @@ class ScraperSettings:
                 options.browser_fallback if options.browser_fallback is not None else self.browser_fallback
             ),
             respect_robots=options.respect_robots if options.respect_robots is not None else self.respect_robots,
+            ai_enrichment=options.ai_enrichment if options.ai_enrichment is not None else self.ai_enrichment,
             application_verification_timeout_seconds=self.application_verification_timeout_seconds,
             browser_wait_until=self.browser_wait_until,
             user_agents=list(self.user_agents),
@@ -184,6 +192,8 @@ class ScraperSettings:
             ownership_target_keywords=dict(self.ownership_target_keywords),
             entity_type_keywords=dict(self.entity_type_keywords),
             certification_keywords=dict(self.certification_keywords),
+            ai_provider=self.ai_provider,
+            ai_model=self.ai_model,
         )
 
 

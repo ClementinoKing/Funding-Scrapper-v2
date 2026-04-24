@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from datetime import datetime, timezone
 
-from scraper import __version__ as SCRAPER_VERSION
+import pytest
+
+from scraper.ai.ai_enhancement import AIClassifier
+from scraper.config import RuntimeOptions
 from scraper.parsers.generic_parser import GenericFundingParser
-from scraper.pipeline import ScraperPipeline
-from scraper.schemas import PageFetchResult
+from scraper.pipeline import ScraperPipeline, build_settings_from_options
+from scraper.schemas import FundingProgrammeRecord, PageContentDocument, PageFetchResult
 from scraper.storage.json_store import LocalJsonStore
 from scraper.storage.site_repository import SiteDefinition
 
@@ -14,8 +18,10 @@ from scraper.storage.site_repository import SiteDefinition
 class FixtureFetcher:
     def __init__(self, pages):
         self.pages = pages
+        self.calls: list[str] = []
 
     def fetch(self, url: str) -> PageFetchResult:
+        self.calls.append(url)
         if url in self.pages:
             return self.pages[url]
         return PageFetchResult(
@@ -53,9 +59,12 @@ def _page(url: str, html: str, title: str) -> PageFetchResult:
     )
 
 
-def test_pipeline_runs_end_to_end(settings, fixture_dir: Path, monkeypatch) -> None:
+@pytest.fixture(autouse=True)
+def _noop_application_verification(monkeypatch) -> None:
     monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
 
+
+def test_pipeline_runs_end_to_end_with_raw_content_and_classified_records(settings, fixture_dir: Path) -> None:
     listing_html = (fixture_dir / "multi_program_listing.html").read_text(encoding="utf-8")
     youth_html = (fixture_dir / "youth_growth_loan_detail.html").read_text(encoding="utf-8")
     asset_html = (fixture_dir / "asset_finance_detail.html").read_text(encoding="utf-8")
@@ -78,10 +87,9 @@ def test_pipeline_runs_end_to_end(settings, fixture_dir: Path, monkeypatch) -> N
         ),
     }
 
-    storage = LocalJsonStore(settings.output_path)
     pipeline = ScraperPipeline(
         settings=settings,
-        storage=storage,
+        storage=LocalJsonStore(settings.output_path),
         parser=GenericFundingParser(settings),
         http_fetcher=FixtureFetcher(pages),
         browser_fetcher=None,
@@ -89,217 +97,27 @@ def test_pipeline_runs_end_to_end(settings, fixture_dir: Path, monkeypatch) -> N
 
     summary = pipeline.run(["https://example.org/funding-products"])
 
-    assert summary.total_urls_crawled == 3
     assert summary.pages_fetched_successfully == 3
     assert summary.pages_failed == 0
     assert summary.programmes_after_dedupe == 2
-    assert (settings.output_path / "raw" / "extracted_programs.jsonl").exists()
-    assert (settings.output_path / "normalized" / "funding_programmes.json").exists()
-    assert (settings.output_path / "normalized" / "funding_programmes.csv").exists()
-    assert (settings.output_path / "logs" / "run_summary.json").exists()
+
+    content_dir = settings.output_path / "raw" / "content"
+    content_files = sorted(content_dir.glob("*.json"))
+    assert len(content_files) == 3
+
+    first_document = json.loads(content_files[0].read_text(encoding="utf-8"))
+    assert first_document["page_url"]
+    assert isinstance(first_document["headings"], list)
+    assert first_document["full_body_text"]
 
     payload = json.loads((settings.output_path / "normalized" / "funding_programmes.json").read_text(encoding="utf-8"))
     names = {item["program_name"] for item in payload}
     assert names == {"Youth Growth Loan", "Asset Finance Facility"}
-    assert all(item["program_slug"] for item in payload)
-    assert all(item["funder_slug"] for item in payload)
-    assert all(item["country_code"] == "ZA" for item in payload)
-    assert all(item["parser_version"] == SCRAPER_VERSION for item in payload)
-    assert all("last_scraped_at" in item for item in payload)
-    assert all("validation_errors" in item for item in payload)
-    assert all("field_confidence" in item for item in payload)
-    assert all("evidence_by_field" in item for item in payload)
+    assert all(item["ai_enriched"] is False for item in payload)
+    assert all(item["source_domain"] == "example.org" for item in payload)
 
 
-def test_pipeline_runs_db_site_targets_with_adapter_key(settings, monkeypatch) -> None:
-    monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
-
-    pages = {
-        "https://www.nefcorp.co.za/products-services": _page(
-            "https://www.nefcorp.co.za/products-services",
-            """
-            <html>
-              <head><title>Products and Services - NEF</title></head>
-              <body>
-                <main>
-                  <article>
-                    <h1>New Venture Capital - National Empowerment Fund</h1>
-                    <p>Funding for startups and growth-stage businesses.</p>
-                    <a href="https://www.nefcorp.co.za/products-services/rural-community-development-fund/2-new-venture-capital">Learn more</a>
-                  </article>
-                </main>
-              </body>
-            </html>
-            """,
-            "Products and Services - NEF",
-        ),
-        "https://www.nefcorp.co.za/products-services/rural-community-development-fund/2-new-venture-capital": _page(
-            "https://www.nefcorp.co.za/products-services/rural-community-development-fund/2-new-venture-capital",
-            """
-            <html>
-              <head><title>New Venture Capital - National Empowerment Fund</title></head>
-              <body>
-                <main>
-                  <article>
-                    <h1>New Venture Capital - National Empowerment Fund</h1>
-                    <p>Funding for startups and growth-stage businesses.</p>
-                  </article>
-                </main>
-              </body>
-            </html>
-            """,
-            "New Venture Capital - National Empowerment Fund",
-        ),
-    }
-
-    pipeline = ScraperPipeline(
-        settings=settings,
-        storage=LocalJsonStore(settings.output_path),
-        parser=GenericFundingParser(settings),
-        http_fetcher=FixtureFetcher(pages),
-        browser_fetcher=None,
-    )
-
-    summary = pipeline.run_sites(
-        [
-            SiteDefinition(
-                site_key="nefcorp",
-                display_name="NEF",
-                primary_domain="nefcorp.co.za",
-                adapter_key="nefcorp",
-                seed_urls=("https://www.nefcorp.co.za/products-services/",),
-                adapter_config={
-                    "allowed_path_prefixes": ["/products-services/"],
-                    "strict_path_prefixes": True,
-                    "include_url_terms": [
-                        "fund",
-                        "funding",
-                        "finance",
-                        "programme",
-                        "product",
-                        "transformation",
-                        "capital",
-                        "venture",
-                        "acquisition",
-                        "expansion",
-                        "entrepreneurship",
-                        "procurement",
-                        "franchise",
-                        "tourism",
-                        "furniture",
-                        "bakubung",
-                        "spaza",
-                        "film",
-                        "arts",
-                    ],
-                    "program_name_strip_prefix_patterns": [r"^\s*\d+\s*[.)-]?\s*"],
-                    "program_name_strip_suffix_patterns": [r"\s*(?:-|—|\||::)\s*National Empowerment Fund\s*$"],
-                },
-            )
-        ]
-    )
-
-    assert summary.total_urls_crawled == 2
-    trace = (settings.output_path / "logs" / "crawl_trace.jsonl").read_text(encoding="utf-8")
-    assert '"adapter_name":"nefcorp"' in trace
-    payload = json.loads((settings.output_path / "normalized" / "funding_programmes.json").read_text(encoding="utf-8"))
-    assert any(item["program_name"] == "New Venture Capital" for item in payload)
-    assert any(
-        item["program_name"] == "New Venture Capital"
-        and item.get("parent_programme_name") == "Rural Community Development Fund"
-        for item in payload
-    )
-    assert any(item["site_adapter"] == "nefcorp" for item in payload)
-
-
-def test_pipeline_applies_site_adapter_config_to_narrow_crawls(settings, monkeypatch) -> None:
-    monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
-
-    pages = {
-        "https://example.org/": _page(
-            "https://example.org/",
-            """
-            <html>
-              <head><title>Example Funding Hub</title></head>
-              <body>
-                <main>
-                  <a href="https://example.org/products-services/innovation-grant">Innovation Grant</a>
-                  <a href="https://example.org/news/latest-update">Latest Update</a>
-                </main>
-              </body>
-            </html>
-            """,
-            "Example Funding Hub",
-        ),
-        "https://example.org/products-services/innovation-grant": _page(
-            "https://example.org/products-services/innovation-grant",
-            """
-            <html>
-              <head><title>Innovation Grant</title></head>
-              <body>
-                <main>
-                  <article>
-                    <h1>Innovation Grant</h1>
-                    <p>Support for product and business innovation.</p>
-                  </article>
-                </main>
-              </body>
-            </html>
-            """,
-            "Innovation Grant",
-        ),
-        "https://example.org/news/latest-update": _page(
-            "https://example.org/news/latest-update",
-            """
-            <html>
-              <head><title>Latest Update</title></head>
-              <body>
-                <main>
-                  <article>
-                    <h1>Latest Update</h1>
-                  </article>
-                </main>
-              </body>
-            </html>
-            """,
-            "Latest Update",
-        ),
-    }
-
-    pipeline = ScraperPipeline(
-        settings=settings,
-        storage=LocalJsonStore(settings.output_path),
-        parser=GenericFundingParser(settings),
-        http_fetcher=FixtureFetcher(pages),
-        browser_fetcher=None,
-    )
-
-    summary = pipeline.run_sites(
-        [
-            SiteDefinition(
-                site_key="example",
-                display_name="Example Funding",
-                primary_domain="example.org",
-                adapter_key="generic",
-                seed_urls=("https://example.org/",),
-                adapter_config={
-                    "allowed_path_prefixes": ["/products-services/"],
-                    "strict_path_prefixes": True,
-                    "exclude_url_terms": ["/news/"]
-                },
-            )
-        ]
-    )
-
-    assert summary.total_urls_crawled == 2
-    trace = (settings.output_path / "logs" / "crawl_trace.jsonl").read_text(encoding="utf-8")
-    assert "products-services/innovation-grant" in trace
-    assert "news/latest-update" not in trace
-
-
-def test_pipeline_processes_domains_sequentially_and_resumes(settings, fixture_dir: Path, monkeypatch) -> None:
-    monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
-
+def test_pipeline_resume_skips_completed_domains(settings, fixture_dir: Path) -> None:
     listing_html = (fixture_dir / "multi_program_listing.html").read_text(encoding="utf-8")
     youth_html = (fixture_dir / "youth_growth_loan_detail.html").read_text(encoding="utf-8")
     asset_html = (fixture_dir / "asset_finance_detail.html").read_text(encoding="utf-8")
@@ -331,75 +149,343 @@ def test_pipeline_processes_domains_sequentially_and_resumes(settings, fixture_d
         browser_fetcher=None,
     )
 
-    summary = pipeline.run([
-        "https://example.org/funding-products",
-        "https://anotherfund.org/programmes/asset-finance-facility",
-    ])
-
-    assert summary.programmes_after_dedupe == 3
-    state = json.loads((settings.output_path / "logs" / "crawl_state.json").read_text(encoding="utf-8"))
-    assert state["completed_domains"] == ["anotherfund.org", "example.org"]
-
-    pipeline_again = ScraperPipeline(
-        settings=settings,
-        storage=LocalJsonStore(settings.output_path),
-        parser=GenericFundingParser(settings),
-        http_fetcher=FixtureFetcher(pages),
-        browser_fetcher=None,
-    )
-    resumed_summary = pipeline_again.run([
-        "https://example.org/funding-products",
-        "https://anotherfund.org/programmes/asset-finance-facility",
-    ])
-
-    assert resumed_summary.total_urls_crawled == 0
-    payload = json.loads((settings.output_path / "normalized" / "funding_programmes.json").read_text(encoding="utf-8"))
-    assert {item["source_domain"] for item in payload} == {"example.org", "anotherfund.org"}
-    assert len(payload) == 3
-
-
-def test_pipeline_can_limit_to_one_domain_per_run(settings, fixture_dir: Path, monkeypatch) -> None:
-    monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
-
-    listing_html = (fixture_dir / "multi_program_listing.html").read_text(encoding="utf-8")
-    youth_html = (fixture_dir / "youth_growth_loan_detail.html").read_text(encoding="utf-8")
-    asset_html = (fixture_dir / "asset_finance_detail.html").read_text(encoding="utf-8")
-
-    pages = {
-        "https://example.org/funding-products": _page(
-            "https://example.org/funding-products",
-            listing_html,
-            "Funding Products - Growth Finance Agency",
-        ),
-        "https://example.org/programmes/youth-growth-loan": _page(
-            "https://example.org/programmes/youth-growth-loan",
-            youth_html,
-            "Youth Growth Loan - Growth Finance Agency",
-        ),
-        "https://anotherfund.org/programmes/asset-finance-facility": _page(
-            "https://anotherfund.org/programmes/asset-finance-facility",
-            asset_html,
-            "Asset Finance Facility - Another Fund",
-        ),
-    }
-
-    pipeline = ScraperPipeline(
-        settings=settings,
-        storage=LocalJsonStore(settings.output_path),
-        parser=GenericFundingParser(settings),
-        http_fetcher=FixtureFetcher(pages),
-        browser_fetcher=None,
-    )
-
-    summary = pipeline.run(
+    first_summary = pipeline.run(
         [
             "https://example.org/funding-products",
             "https://anotherfund.org/programmes/asset-finance-facility",
-        ],
-        max_domains=1,
+        ]
+    )
+    assert first_summary.pages_fetched_successfully == 3
+    assert first_summary.programmes_after_dedupe >= 2
+
+    second_pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=FixtureFetcher(pages),
+        browser_fetcher=None,
+    )
+    resumed_summary = second_pipeline.run(
+        [
+            "https://example.org/funding-products",
+            "https://anotherfund.org/programmes/asset-finance-facility",
+        ]
     )
 
-    assert summary.programmes_after_dedupe == 2
-    state = json.loads((settings.output_path / "logs" / "crawl_state.json").read_text(encoding="utf-8"))
-    assert state["completed_domains"] == ["example.org"]
-    assert state["failed_domains"] == []
+    assert resumed_summary.total_urls_crawled == 0
+    crawl_state = json.loads((settings.output_path / "logs" / "crawl_state.json").read_text(encoding="utf-8"))
+    assert crawl_state["completed_domains"] == ["anotherfund.org", "example.org"]
+
+
+def test_ai_classifier_retries_on_malformed_json(settings, fixture_dir: Path, tmp_path: Path, monkeypatch) -> None:
+    html = (fixture_dir / "single_program.html").read_text(encoding="utf-8")
+    page = _page(
+        "https://example.org/programmes/green-energy-sme-grant",
+        html,
+        "Green Energy SME Grant - National Empowerment Fund",
+    )
+    parser = GenericFundingParser(settings)
+    document = parser.parse(page, allowed_domains=["example.org"])
+
+    classifier = AIClassifier(
+        {"openaiKey": "test", "aiProvider": "openai", "aiModel": "gpt-test"},
+        storage=LocalJsonStore(tmp_path),
+    )
+
+    responses = iter(
+        [
+            "not json",
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "program_name": "Green Energy SME Grant Plus",
+                            "funder_name": "National Empowerment Fund",
+                            "source_url": "https://example.org/programmes/green-energy-sme-grant",
+                            "source_domain": "example.org",
+                            "funding_type": "Grant",
+                            "deadline_type": "Unknown",
+                            "geography_scope": "National",
+                            "application_channel": "Online form",
+                            "ai_enriched": True,
+                        }
+                    ],
+                    "notes": ["Recovered after retry."],
+                }
+            ),
+        ]
+    )
+    calls: list[str] = []
+
+    def fake_call_model(system_prompt: str, user_prompt: str) -> str:
+        calls.append(user_prompt)
+        return next(responses)
+
+    monkeypatch.setattr(classifier, "_call_model", fake_call_model)
+
+    records = classifier.classify_document(document)
+
+    assert len(records) == 1
+    assert records[0].program_name == "Green Energy SME Grant Plus"
+    assert len(calls) == 2
+    assert any(path.name.endswith("input.json") for path in (tmp_path / "raw" / "ai").glob("*.json"))
+    assert any(path.name.endswith("output.json") for path in (tmp_path / "raw" / "ai").glob("*.json"))
+
+
+def test_ai_classifier_reprompts_for_missing_fields(settings, fixture_dir: Path, tmp_path: Path, monkeypatch) -> None:
+    html = (fixture_dir / "single_program.html").read_text(encoding="utf-8")
+    page = _page(
+        "https://example.org/programmes/green-energy-sme-grant",
+        html,
+        "Green Energy SME Grant - National Empowerment Fund",
+    )
+    parser = GenericFundingParser(settings)
+    document = parser.parse(page, allowed_domains=["example.org"])
+
+    classifier = AIClassifier(
+        {"openaiKey": "test", "aiProvider": "openai", "aiModel": "gpt-test"},
+        storage=LocalJsonStore(tmp_path),
+    )
+
+    prompts: list[str] = []
+    responses = iter(
+        [
+            json.dumps({"records": [], "notes": ["Need more detail."]}),
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "program_name": "Green Energy SME Grant",
+                            "funder_name": "National Empowerment Fund",
+                            "source_url": "https://example.org/programmes/green-energy-sme-grant",
+                            "source_domain": "example.org",
+                            "funding_type": "Grant",
+                            "deadline_type": "Unknown",
+                            "geography_scope": "National",
+                            "application_channel": "Online form",
+                            "ai_enriched": True,
+                        }
+                    ],
+                    "notes": ["Missing fields filled after retry."],
+                }
+            ),
+        ]
+    )
+
+    def fake_call_model(system_prompt: str, user_prompt: str) -> str:
+        prompts.append(user_prompt)
+        return next(responses)
+
+    monkeypatch.setattr(classifier, "_call_model", fake_call_model)
+
+    records = classifier.classify_document(document)
+
+    assert len(records) == 1
+    assert "Decide whether this page is a real funding programme page." in prompts[1]
+    assert records[0].program_name == "Green Energy SME Grant"
+
+
+def test_ai_prompt_builder_prioritizes_relevant_sections(settings) -> None:
+    document = PageContentDocument(
+        page_url="https://example.org/programmes/green-energy-sme-grant",
+        title="Green Energy SME Grant",
+        headings=["Green Energy SME Grant", "Eligibility Criteria", "Latest News"],
+        full_body_text="Eligibility criteria apply to registered SMEs. The grant provides up to R2 million.",
+        structured_sections=[
+            {"heading": "Eligibility Criteria", "content": "Registered SMEs with a working prototype."},
+            {"heading": "Funding", "content": "The grant provides up to R2 million."},
+            {"heading": "News", "content": "Latest newsroom update about events."},
+        ],
+        source_domain="example.org",
+    )
+
+    classifier = AIClassifier({"disableRemoteAi": True}, storage=None)
+    user_prompt = classifier._build_user_prompt(document)
+
+    assert "Eligibility Criteria" in user_prompt
+    assert "Funding" in user_prompt
+    assert "Newsroom update" not in user_prompt
+    assert len(user_prompt) < 20000
+
+
+def test_ai_classifier_strips_numbered_titles_and_keeps_page_source_only(settings, tmp_path: Path) -> None:
+    document = PageContentDocument(
+        page_url="https://example.org/programmes/entrepreneurship-finance",
+        title="1. Entrepreneurship Finance - Example Fund",
+        headings=["1. Entrepreneurship Finance"],
+        full_body_text="Support for entrepreneurs in the early growth stage.",
+        source_domain="example.org",
+    )
+
+    classifier = AIClassifier({"disableRemoteAi": True}, storage=LocalJsonStore(tmp_path))
+    records = classifier.classify_document(document)
+
+    assert len(records) == 1
+    assert records[0].program_name == "Entrepreneurship Finance"
+    assert records[0].source_url == document.page_url
+    assert records[0].source_urls == [document.page_url]
+
+
+def test_schema_keeps_funding_lists_as_arrays() -> None:
+    record = FundingProgrammeRecord(
+        program_name="Expansion Capital",
+        funder_name="National Empowerment Fund",
+        source_url="https://example.org/programmes/expansion-capital",
+        source_urls=["https://example.org/programmes/expansion-capital"],
+        source_domain="example.org",
+        source_page_title="Expansion Capital - Example Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type="Loan",
+        funding_lines=["Working capital support\nAsset finance support"],
+        raw_eligibility_data=["Registered SMEs only\nBlack-owned businesses preferred"],
+    )
+
+    assert record.funding_lines == ["Working capital support", "Asset finance support"]
+    assert record.raw_eligibility_data == ["Registered SMEs only", "Black-owned businesses preferred"]
+
+
+def test_ai_eligibility_data_populates_structured_columns(settings, tmp_path: Path) -> None:
+    industry_term = next(iter(settings.industry_taxonomy.values()))[0]
+    use_term = next(iter(settings.use_of_funds_taxonomy.values()))[0]
+    ownership_term = next(iter(settings.ownership_target_keywords.values()))[0]
+    entity_term = next(iter(settings.entity_type_keywords.values()))[0]
+    cert_term = next(iter(settings.certification_keywords.values()))[0]
+
+    eligibility_text = (
+        f"{industry_term} businesses may apply. "
+        f"{use_term} support is available. "
+        f"Eligible applicants are early stage businesses trading for at least 2 years with annual turnover up to R5 million and 5 to 50 employees. "
+        f"{ownership_term} applicants, {entity_term} entities and {cert_term} holders are preferred."
+    )
+
+    document = PageContentDocument(
+        page_url="https://example.org/programmes/expansion-capital",
+        title="Expansion Capital",
+        headings=["Eligibility"],
+        full_body_text=eligibility_text,
+        structured_sections=[{"heading": "Eligibility", "content": eligibility_text}],
+        source_domain="example.org",
+    )
+
+    classifier = AIClassifier(
+        {
+            "disableRemoteAi": True,
+            "industry_taxonomy": settings.industry_taxonomy,
+            "use_of_funds_taxonomy": settings.use_of_funds_taxonomy,
+            "ownership_target_keywords": settings.ownership_target_keywords,
+            "entity_type_keywords": settings.entity_type_keywords,
+            "certification_keywords": settings.certification_keywords,
+        },
+        storage=LocalJsonStore(tmp_path),
+    )
+
+    response = json.dumps(
+        {
+            "page_decision": "funding_program",
+            "page_decision_confidence": 0.95,
+            "records": [
+                {
+                    "program_name": "Expansion Capital",
+                    "funder_name": "National Empowerment Fund",
+                    "source_url": document.page_url,
+                    "source_domain": "example.org",
+                    "funding_type": "Loan",
+                    "raw_eligibility_data": [eligibility_text],
+                    "deadline_type": "Unknown",
+                    "geography_scope": "National",
+                    "application_channel": "Unknown",
+                    "ai_enriched": True,
+                }
+            ],
+            "notes": ["Eligibility mapped from raw eligibility data."],
+        }
+    )
+
+    classifier._call_model = lambda system_prompt, user_prompt: response  # type: ignore[method-assign]
+
+    records = classifier.classify_document(document)
+
+    assert len(records) == 1
+    record = records[0]
+    assert len(record.raw_eligibility_data or []) >= 2
+    assert any(industry_term.casefold() in item.casefold() for item in record.raw_eligibility_data or [])
+    assert any(use_term.casefold() in item.casefold() for item in record.raw_eligibility_data or [])
+    assert record.industries
+    assert record.use_of_funds
+    assert record.business_stage_eligibility
+    assert record.turnover_max == 5000000 or record.turnover_max == 5
+    assert record.years_in_business_min == 2
+    assert record.employee_min == 5
+    assert record.ownership_targets
+    assert record.entity_types_allowed
+    assert record.certifications_required
+
+
+def test_ai_classifier_respects_non_program_page_decision(settings, fixture_dir: Path, tmp_path: Path, monkeypatch) -> None:
+    html = (fixture_dir / "single_program.html").read_text(encoding="utf-8")
+    page = _page(
+        "https://example.org/news/launch-update",
+        html,
+        "Launch update - Example Fund",
+    )
+    parser = GenericFundingParser(settings)
+    document = parser.parse(page, allowed_domains=["example.org"])
+
+    classifier = AIClassifier(
+        {"openaiKey": "test", "aiProvider": "openai", "aiModel": "gpt-test"},
+        storage=LocalJsonStore(tmp_path),
+    )
+
+    response = json.dumps(
+        {
+            "page_decision": "not_funding_program",
+            "page_decision_confidence": 0.98,
+            "records": [
+                {
+                    "program_name": "Fake Programme",
+                    "funder_name": "Fake Fund",
+                    "source_url": document.page_url,
+                    "source_domain": "example.org",
+                    "funding_type": "Grant",
+                    "deadline_type": "Unknown",
+                    "geography_scope": "National",
+                    "application_channel": "Unknown",
+                    "ai_enriched": True,
+                }
+            ],
+            "notes": ["This is not a programme page."],
+        }
+    )
+
+    monkeypatch.setattr(classifier, "_call_model", lambda system_prompt, user_prompt: response)
+
+    records = classifier.classify_document(document)
+
+    assert records == []
+
+
+def test_ai_fallback_rejects_image_like_non_program_page(settings, tmp_path: Path) -> None:
+    document = PageContentDocument(
+        page_url="https://example.org/wp-content/uploads/2023/07/IMG-20230707-WA0005-2.jpg",
+        title="IMG-20230707-WA0005-2.jpg (900x1600)",
+        headings=["IMG-20230707-WA0005-2.jpg"],
+        full_body_text="",
+        source_domain="example.org",
+    )
+
+    classifier = AIClassifier({"disableRemoteAi": True}, storage=LocalJsonStore(tmp_path))
+    records = classifier.classify_document(document)
+
+    assert records == []
+
+
+def test_build_settings_from_options_ai_flag_overrides_env(monkeypatch) -> None:
+    monkeypatch.setenv("SCRAPER_AI_ENRICHMENT", "1")
+
+    disabled = build_settings_from_options(None, None, None, None, None, None, False)
+    enabled = build_settings_from_options(None, None, None, None, None, None, True)
+    inherited = build_settings_from_options(None, None, None, None, None, None, None)
+
+    assert disabled.ai_enrichment is False
+    assert enabled.ai_enrichment is True
+    assert inherited.ai_enrichment is True

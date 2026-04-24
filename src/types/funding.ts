@@ -94,6 +94,7 @@ export type ScrapedFundingProgramme = FundingProgram & {
   relatedDocuments?: string[];
   related_documents?: string[];
   notes?: string[];
+  ai_enriched?: boolean;
 };
 
 export interface BusinessProfile {

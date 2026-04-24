@@ -202,6 +202,58 @@ export const mockNotificationEvents: NotificationEvent[] = [
 
 export const mockSystemChangeLog: SystemChangeLogEntry[] = [
   {
+    id: "chg_2026_04_24_ai-rules-console",
+    title: "Admin sidebar now includes an AI Rules console",
+    summary: "The admin sidebar now exposes a dedicated AI Rules workspace for managing prompt bundles, schema mappings, and future database-backed rule editing.",
+    createdAt: "2026-04-24T10:15:00Z",
+    area: "admin",
+    impact: "medium",
+    highlights: [
+      "Added a dedicated AI Rules entry to the admin sidebar",
+      "The new workspace shows prompt bundles, schema mappings, and version history UI",
+      "The layout is ready for future database-backed rule editing without changing the screen structure"
+    ]
+  },
+  {
+    id: "chg_2026_04_24_ai-merge-judge",
+    title: "AI-assisted dedupe now keeps sibling programmes separate unless the page context clearly matches",
+    summary: "The merge step now uses a stricter AI judge for ambiguous same-name records so sibling programmes like different Expansion Capital pages do not collapse into one programme by mistake.",
+    createdAt: "2026-04-24T10:05:00Z",
+    area: "scraper",
+    impact: "high",
+    highlights: [
+      "Dedupe now only auto-merges exact source-page duplicates immediately",
+      "Ambiguous same-name records can be sent to AI for a merge or separate decision",
+      "The AI merge prompt now requires clear page URL or parent programme context before merging"
+    ]
+  },
+  {
+    id: "chg_2026_04_23_scraper-ai-first-refactor",
+    title: "Scraper now extracts raw page content first and classifies programmes with AI",
+    summary: "The scraper was refactored into a lightweight content extraction layer plus an AI classification step, with raw content, AI prompts, and AI outputs all persisted for review.",
+    createdAt: "2026-04-23T21:30:00Z",
+    area: "scraper",
+    impact: "high",
+    highlights: [
+      "Generic page extraction now captures title, headings, cleaned body text, and optional structured sections without field-specific scraping",
+      "Adapters now only discover valid programme URLs and filter irrelevant pages, leaving field mapping to the AI layer",
+      "The pipeline now logs raw page content plus AI input and output artifacts before saving normalized programme records"
+    ]
+  },
+  {
+    id: "chg_2026_04_23_scraper-host-strict-ai-enrichment",
+    title: "Scraper now keeps exact seed hosts and shows AI enrichment status in admin",
+    summary: "Seed loading now preserves the exact host from Supabase, the crawler stops following sibling subdomains, and the admin review screens now show whether a record passed through AI enrichment.",
+    createdAt: "2026-04-23T18:45:00Z",
+    area: "scraper",
+    impact: "high",
+    highlights: [
+      "run-seeds now preserves exact seed hosts instead of collapsing www and bare-domain variants",
+      "Crawler link matching is now host-strict, so sibling subdomains like online.nefcorp.co.za are no longer queued",
+      "Admin review and detail views now show a visible AI enriched badge for records that actually passed through the AI step"
+    ]
+  },
+  {
     id: "chg_2026_04_08_supabase-upload-fix",
     title: "Supabase programme uploads now recover from duplicate-page scraper noise",
     summary: "The upload path now normalizes record identity, collapses duplicate page candidates, and returns clear database errors so scraper pushes are much more reliable.",

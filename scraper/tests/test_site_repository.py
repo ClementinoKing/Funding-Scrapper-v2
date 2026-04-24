@@ -72,7 +72,7 @@ def test_site_repository_loads_active_sites_from_supabase_rows() -> None:
     site = sites[0]
     assert site.site_key == "nefcorp"
     assert site.display_name == "NEF"
-    assert site.primary_domain == "nefcorp.co.za"
+    assert site.primary_domain == "www.nefcorp.co.za"
     assert site.adapter_key == "nefcorp"
     assert site.seed_urls == ("https://www.nefcorp.co.za/products-services",)
     assert site.adapter_config == {
@@ -84,6 +84,34 @@ def test_site_repository_loads_active_sites_from_supabase_rows() -> None:
             "section_aliases": {"eligibility": ["who qualifies"]},
         },
     }
+
+
+def test_site_repository_reads_ai_enrichment_requirement_from_adapter_config() -> None:
+    settings = SupabaseSettings(url="https://example.supabase.co", anon_key="anon")
+    payload = [
+        {
+            "site_key": "nefcorp",
+            "display_name": "NEF",
+            "primary_domain": "www.nefcorp.co.za",
+            "adapter_key": "nefcorp",
+            "seed_urls": ["https://www.nefcorp.co.za/products-services/"],
+            "adapter_config": {
+                "ai_enrichment_required": True,
+            },
+            "active": True,
+            "notes": [],
+        }
+    ]
+    client = FakeClient(payload)
+    repo = SiteRepository(
+        settings=settings,
+        adapter_registry=build_default_registry(),
+        client_factory=lambda **kwargs: client,
+    )
+
+    site = repo.load_sites()[0]
+
+    assert site.ai_enrichment_required is True
 
 
 def test_site_repository_falls_back_to_local_seed_file(tmp_path: Path) -> None:
@@ -103,7 +131,7 @@ def test_site_repository_falls_back_to_local_seed_file(tmp_path: Path) -> None:
     sites = repo.load_sites(fallback_seed_file=seed_file)
     urls = repo.load_seed_urls(fallback_seed_file=seed_file)
 
-    assert {site.primary_domain for site in sites} == {"nefcorp.co.za", "nyda.gov.za"}
+    assert {site.primary_domain for site in sites} == {"www.nefcorp.co.za", "www.nyda.gov.za"}
     assert urls == [
         "https://www.nefcorp.co.za/products-services",
         "https://www.nyda.gov.za/",

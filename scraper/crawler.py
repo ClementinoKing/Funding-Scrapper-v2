@@ -16,11 +16,11 @@ from scraper.adapters.base import SiteAdapter
 from scraper.fetchers.browser_fetcher import BrowserFetcher
 from scraper.fetchers.http_fetcher import HttpFetcher
 from scraper.parsers.generic_parser import GenericFundingParser
-from scraper.schemas import CrawlTraceEntry, FundingProgrammeRecord, PageFetchResult
+from scraper.schemas import CrawlTraceEntry, PageContentDocument, PageFetchResult
 from scraper.storage.interfaces import StorageBackend
 from scraper.utils.logging import get_logger
 from scraper.utils.text import unique_preserve_order
-from scraper.utils.urls import canonicalize_url, extract_domain, is_internal_url, looks_irrelevant_url, score_url_relevance
+from scraper.utils.urls import canonicalize_url, extract_host, is_internal_url, looks_irrelevant_url, score_url_relevance
 from scraper.utils.quality import score_programme_quality
 
 
@@ -187,13 +187,13 @@ class Crawler:
         self,
         seed_urls: Sequence[str],
         adapter: Optional[SiteAdapter] = None,
-    ) -> Tuple[List[FundingProgrammeRecord], Dict[str, object]]:
-        allowed_domains = sorted({extract_domain(url) for url in seed_urls})
+    ) -> Tuple[List[PageContentDocument], Dict[str, object]]:
+        allowed_hosts = sorted({extract_host(url) for url in seed_urls})
         queue: List[Tuple[float, int, str, int, str]] = []
         order = count()
         queued: Set[str] = set()
         visited: Set[str] = set()
-        records: List[FundingProgrammeRecord] = []
+        documents: List[PageContentDocument] = []
         errors: List[str] = []
         warnings: List[str] = []
         pages_fetched_successfully = 0
@@ -215,9 +215,9 @@ class Crawler:
                 )
             )
 
-        for domain in allowed_domains:
+        for domain in allowed_hosts:
             for sitemap_url in self._fetch_sitemap_urls(domain):
-                if sitemap_url in queued or sitemap_url in visited or not is_internal_url(sitemap_url, allowed_domains):
+                if sitemap_url in queued or sitemap_url in visited or not is_internal_url(sitemap_url, allowed_hosts):
                     continue
                 score, skip_reason, adapter_reason = self._score_candidate_url(
                     sitemap_url,
@@ -257,7 +257,7 @@ class Crawler:
             queued.discard(current_url)
             if current_url in visited:
                 continue
-            if not is_internal_url(current_url, allowed_domains):
+            if not is_internal_url(current_url, allowed_hosts):
                 crawl_trace.append(
                     self._trace(
                         event="skipped",
@@ -318,112 +318,39 @@ class Crawler:
 
             pages_fetched_successfully += 1
             self.storage.save_page_snapshot(page)
-            extraction = self.parser.parse(page, allowed_domains=allowed_domains, adapter=adapter)
-            if extraction.page_debug_package:
-                self.storage.write_page_debug_package(extraction.page_debug_package)
-            page_role = extraction.page_type
+            page_content = self.parser.parse(page, allowed_domains=allowed_hosts, adapter=adapter)
+            self.storage.write_page_content_document(page_content)
             self.storage.append_crawl_trace(
                 self._trace(
-                    event="parsed",
+                    event="content_extracted",
                     url=current_url,
                     adapter_name=adapter.key if adapter else None,
                     source_url=page.requested_url,
                     canonical_url=page.canonical_url,
                     depth=depth,
-                    reason=extraction.page_type,
-                    page_role=page_role,
+                    reason=page_content.title or page_content.page_title or "content",
                     status_code=page.status_code,
-                    records_found=len(extraction.records),
-                    discovered_links=len(extraction.internal_links),
-                    document_links=len(extraction.document_links),
-                    notes=extraction.notes + extraction.warnings,
+                    records_found=0,
+                    discovered_links=len(page_content.internal_links),
+                    document_links=len(page_content.document_links),
+                    notes=[page_content.title or "", page_content.main_content_hint or ""],
                 )
             )
-            warnings.extend(extraction.warnings)
-            if extraction.notes:
-                self.logger.info("page_parsed", url=current_url, notes=extraction.notes, records=len(extraction.records))
-
-            for record in list(extraction.records):
-                normalized_record = (
-                    adapter.normalize_record(
-                        record,
-                        page_type=extraction.page_type,
-                        page_url=page.canonical_url,
-                        page_title=page.title,
-                    )
-                    if adapter
-                    else record
-                )
-                record_page_type = self._effective_record_page_type(
-                    adapter=adapter,
-                    page=page,
-                    extraction_page_type=extraction.page_type,
-                    record=normalized_record,
-                )
-                resolved_scope = self._source_scope_for_page_type(record_page_type, normalized_record.source_scope)
-                if resolved_scope and resolved_scope != normalized_record.source_scope:
-                    updated_evidence = {
-                        field_name: [
-                            item.model_copy(update={"source_scope": resolved_scope}) for item in items
-                        ]
-                        for field_name, items in normalized_record.field_evidence.items()
-                    }
-                    updated_package = normalized_record.page_debug_package
-                    if updated_package:
-                        updated_package = updated_package.model_copy(
-                            update={
-                                "records": [
-                                    record_item.model_copy(update={"source_scope": resolved_scope})
-                                    for record_item in updated_package.records
-                                ]
-                            }
-                        )
-                    normalized_record = normalized_record.model_copy(
-                        update={
-                            "source_scope": resolved_scope,
-                            "field_evidence": updated_evidence,
-                            "page_debug_package": updated_package,
-                        }
-                    )
-                if adapter and not adapter.should_promote_record(normalized_record, record_page_type):
-                    continue
-                enriched_payload = normalized_record.model_dump(mode="python", exclude={"site_adapter", "page_type"})
-                enriched_record = FundingProgrammeRecord.model_validate(
-                    {
-                        **enriched_payload,
-                        "site_adapter": adapter.key if adapter else record.site_adapter,
-                        "page_type": record_page_type,
-                    }
-                )
-                records.append(enriched_record)
-                self.storage.append_extracted_record(enriched_record)
-                self.storage.append_crawl_trace(
-                    self._trace(
-                        event="extracted",
-                        url=current_url,
-                        adapter_name=adapter.key if adapter else None,
-                        canonical_url=page.canonical_url,
-                        depth=depth,
-                        reason=enriched_record.program_name or enriched_record.funder_name,
-                        page_type=record_page_type,
-                        page_role=record_page_type,
-                        records_found=1,
-                        document_links=len(enriched_record.related_documents),
-                        notes=enriched_record.notes,
-                    )
-                )
+            documents.append(page_content)
+            if page_content.headings:
+                self.logger.info("page_content_extracted", url=current_url, headings=len(page_content.headings))
 
             if depth >= self.settings.depth_limit:
                 continue
 
-            ranked_links = extraction.internal_links + extraction.discovered_links + extraction.document_links
+            ranked_links = page_content.internal_links + page_content.discovered_links + page_content.document_links
             for discovered_link in ranked_links:
                 normalized = canonicalize_url(discovered_link)
                 if not normalized:
                     continue
                 if normalized in visited or normalized in queued:
                     continue
-                if not is_internal_url(normalized, allowed_domains):
+                if not is_internal_url(normalized, allowed_hosts):
                     continue
                 score, skip_reason, adapter_reason = self._score_candidate_url(
                     normalized,
@@ -455,14 +382,14 @@ class Crawler:
                         source_url=current_url,
                         depth=depth + 1,
                         score=score,
-                        reason=adapter_reason or extraction.page_type,
+                        reason=adapter_reason or "content-extracted",
                     )
                 )
 
         for entry in crawl_trace:
             self.storage.append_crawl_trace(entry)
 
-        return records, {
+        return documents, {
             "total_urls_crawled": len(visited),
             "pages_fetched_successfully": pages_fetched_successfully,
             "pages_failed": pages_failed,

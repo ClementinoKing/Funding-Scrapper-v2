@@ -83,6 +83,7 @@ type NormalizedProgrammeFields = {
   validation_errors?: string[] | Record<string, unknown> | null;
   deleted_at?: string | null;
   notes?: string[];
+  ai_enriched?: boolean;
 };
 
 export type FundingProgrammeRecord = NormalizedProgrammeFields & {
@@ -326,6 +327,7 @@ const mapRecordToProgram = (record: ProgrammeRecord): ScrapedFundingProgramme =>
     lastScrapedAt: record.scraped_at || new Date().toISOString(),
     createdAt: record.scraped_at || new Date().toISOString(),
     updatedAt: record.scraped_at || new Date().toISOString(),
+    ai_enriched: record.ai_enriched ?? false,
     program_name: "program_name" in record ? record.program_name : undefined,
     funder_name: record.funder_name,
     parent_programme_name: record.parent_programme_name,
@@ -406,6 +408,7 @@ const readLocalPublishedProgrammeRecords = (): FundingProgrammeRecord[] =>
     extraction_confidence: { overall: program.scrapeConfidence },
     related_documents: [],
     notes: [],
+    ai_enriched: false,
     approval_status: "approved"
   }));
 

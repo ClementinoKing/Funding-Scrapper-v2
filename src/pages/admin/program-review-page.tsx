@@ -34,6 +34,12 @@ const getScoreVariant = (score: number): "success" | "warning" | "secondary" =>
 const getApprovalVariant = (status: ScrapedFundingProgramme["approvalStatus"]): "success" | "warning" | "secondary" =>
   status === "approved" ? "success" : status === "pending" ? "warning" : "secondary";
 
+const getAiEnrichmentVariant = (programme: ScrapedFundingProgramme): "success" | "secondary" =>
+  programme.ai_enriched ? "success" : "secondary";
+
+const getAiEnrichmentLabel = (programme: ScrapedFundingProgramme): string =>
+  programme.ai_enriched ? "AI enriched" : "Deterministic";
+
 const getRowClassName = (programme: ScoredProgramme): string => {
   if (programme.approvalStatus === "approved") {
     return "border-l-4 border-l-emerald-500/70 bg-emerald-50/30";
@@ -140,7 +146,7 @@ function ReviewProgrammesTable({ programmes }: { programmes: ScoredProgramme[] }
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <Table className="min-w-[1120px]">
+            <Table className="min-w-[1200px]">
               <TableHeader>
                 <TableRow className="bg-muted/30 hover:bg-muted/30">
                   <TableHead className="pl-6">Programme</TableHead>
@@ -148,6 +154,7 @@ function ReviewProgrammesTable({ programmes }: { programmes: ScoredProgramme[] }
                   <TableHead>Priority</TableHead>
                   <TableHead>Quality</TableHead>
                   <TableHead>Approval</TableHead>
+                  <TableHead>AI</TableHead>
                   <TableHead>Funding range</TableHead>
                   <TableHead>Signals</TableHead>
                 </TableRow>
@@ -198,6 +205,9 @@ function ReviewProgrammesTable({ programmes }: { programmes: ScoredProgramme[] }
                     </TableCell>
                     <TableCell className="align-middle">
                       <Badge variant={getApprovalVariant(program.approvalStatus)}>{program.approvalStatus}</Badge>
+                    </TableCell>
+                    <TableCell className="align-middle">
+                      <Badge variant={getAiEnrichmentVariant(program)}>{getAiEnrichmentLabel(program)}</Badge>
                     </TableCell>
                     <TableCell className="align-middle text-sm">
                       <div className="space-y-0.5">

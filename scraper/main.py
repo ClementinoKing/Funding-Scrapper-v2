@@ -47,9 +47,18 @@ def _run_seed_pipeline(
     browser_fallback: bool,
     respect_robots: bool,
     fresh: bool,
+    ai_enrichment: Optional[bool],
     max_domains: Optional[int] = None,
 ):
-    settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
+    settings = build_settings_from_options(
+        output_path,
+        max_pages,
+        depth_limit,
+        headless,
+        browser_fallback,
+        respect_robots,
+        ai_enrichment,
+    )
     if fresh:
         _clear_local_scrape_output(settings.output_path)
     registry = build_default_registry()
@@ -78,8 +87,21 @@ def scrape_url(
     headless: bool = typer.Option(True, "--headless/--no-headless"),
     browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
     respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+    ai_enrichment: Optional[bool] = typer.Option(
+        None,
+        "--ai-enrichment/--no-ai-enrichment",
+        help="Enable or disable AI enrichment for this run.",
+    ),
 ) -> None:
-    settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
+    settings = build_settings_from_options(
+        output_path,
+        max_pages,
+        depth_limit,
+        headless,
+        browser_fallback,
+        respect_robots,
+        ai_enrichment,
+    )
     pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     summary = pipeline.run([url])
     _print_summary(summary)
@@ -94,8 +116,21 @@ def crawl_domain(
     headless: bool = typer.Option(True, "--headless/--no-headless"),
     browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
     respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+    ai_enrichment: Optional[bool] = typer.Option(
+        None,
+        "--ai-enrichment/--no-ai-enrichment",
+        help="Enable or disable AI enrichment for this run.",
+    ),
 ) -> None:
-    settings = build_settings_from_options(output_path, max_pages, depth_limit, headless, browser_fallback, respect_robots)
+    settings = build_settings_from_options(
+        output_path,
+        max_pages,
+        depth_limit,
+        headless,
+        browser_fallback,
+        respect_robots,
+        ai_enrichment,
+    )
     pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     summary = pipeline.run([url])
     _print_summary(summary)
@@ -109,6 +144,11 @@ def run_seeds(
     headless: bool = typer.Option(True, "--headless/--no-headless"),
     browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
     respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+    ai_enrichment: Optional[bool] = typer.Option(
+        None,
+        "--ai-enrichment/--no-ai-enrichment",
+        help="Enable or disable AI enrichment for this run.",
+    ),
     fresh: bool = typer.Option(
         True,
         "--fresh/--resume",
@@ -123,6 +163,7 @@ def run_seeds(
         headless=headless,
         browser_fallback=browser_fallback,
         respect_robots=respect_robots,
+        ai_enrichment=ai_enrichment,
         fresh=fresh,
         max_domains=max_domains,
     )
@@ -137,6 +178,11 @@ def run_next_seed(
     headless: bool = typer.Option(True, "--headless/--no-headless"),
     browser_fallback: bool = typer.Option(True, "--browser-fallback/--no-browser-fallback"),
     respect_robots: bool = typer.Option(True, "--respect-robots/--no-respect-robots"),
+    ai_enrichment: Optional[bool] = typer.Option(
+        None,
+        "--ai-enrichment/--no-ai-enrichment",
+        help="Enable or disable AI enrichment for this run.",
+    ),
 ) -> None:
     summary = _run_seed_pipeline(
         max_pages=max_pages,
@@ -145,6 +191,7 @@ def run_next_seed(
         headless=headless,
         browser_fallback=browser_fallback,
         respect_robots=respect_robots,
+        ai_enrichment=ai_enrichment,
         fresh=False,
         max_domains=1,
     )

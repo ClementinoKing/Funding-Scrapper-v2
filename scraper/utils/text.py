@@ -13,6 +13,7 @@ EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 PHONE_RE = re.compile(r"(?:\+?\d[\d\s().-]{7,}\d)")
 URL_RE = re.compile(r"https?://[^\s<>\"]+", re.I)
 NUMBERED_SECTION_RE = re.compile(r"^\s*\d+(?:[.)]\s*|\s+)?")
+LEADING_NUMBER_PREFIX_RE = re.compile(r"^\s*(?:\d+|[ivxlcdm]+)(?:\s*[.)-]\s*|\s+)", re.I)
 
 SUPPORT_TITLE_HINTS = (
     "eligibility criteria",
@@ -56,10 +57,18 @@ def looks_like_support_title(text: str) -> bool:
     cleaned = clean_text(text).lower()
     if not cleaned:
         return False
-    stripped = NUMBERED_SECTION_RE.sub("", cleaned).strip()
+    stripped = strip_leading_numbered_prefix(cleaned)
     if stripped in SUPPORT_TITLE_HINTS:
         return True
     return any(hint in stripped for hint in SUPPORT_TITLE_HINTS)
+
+
+def strip_leading_numbered_prefix(text: str) -> str:
+    cleaned = clean_text(text)
+    if not cleaned:
+        return ""
+    stripped = LEADING_NUMBER_PREFIX_RE.sub("", cleaned, count=1)
+    return clean_text(stripped)
 
 
 def split_lines(text: str) -> List[str]:

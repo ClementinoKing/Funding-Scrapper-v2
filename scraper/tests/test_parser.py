@@ -23,7 +23,7 @@ def _page(url: str, html: str, title: str) -> PageFetchResult:
     )
 
 
-def test_generic_parser_extracts_single_programme(settings, fixture_dir: Path) -> None:
+def test_generic_parser_extracts_clean_content_and_sections(settings, fixture_dir: Path) -> None:
     parser = GenericFundingParser(settings)
     html = (fixture_dir / "single_program.html").read_text(encoding="utf-8")
     page = _page(
@@ -34,17 +34,17 @@ def test_generic_parser_extracts_single_programme(settings, fixture_dir: Path) -
 
     result = parser.parse(page, allowed_domains=["example.org"])
 
-    assert result.records
-    record_names = {record.program_name for record in result.records}
-    assert "Green Energy SME Grant" in record_names
-    programme = next(record for record in result.records if record.program_name == "Green Energy SME Grant")
-    assert programme.funding_type.value == "Grant"
-    assert programme.application_url == "https://example.org/apply/green-energy-sme-grant"
-    assert programme.raw_eligibility_data
-    assert any(document.endswith(".pdf") for document in programme.related_documents)
+    assert result.page_url == "https://example.org/programmes/green-energy-sme-grant"
+    assert result.title == "Green Energy SME Grant - National Empowerment Fund"
+    assert result.headings[:3] == ["Green Energy SME Grant", "Eligibility", "Funding Offer"]
+    assert "grant funding to qualifying SMEs" in result.full_body_text
+    assert any(section.heading == "Eligibility" for section in result.structured_sections)
+    assert any("business plan" in section.content.lower() for section in result.structured_sections)
+    assert result.application_links == ["https://example.org/apply/green-energy-sme-grant"]
+    assert any(document.endswith(".pdf") for document in result.document_links)
 
 
-def test_generic_parser_extracts_multiple_programmes_and_links(settings, fixture_dir: Path) -> None:
+def test_generic_parser_keeps_listing_pages_generic(settings, fixture_dir: Path) -> None:
     parser = GenericFundingParser(settings)
     html = (fixture_dir / "multi_program_listing.html").read_text(encoding="utf-8")
     page = _page(
@@ -55,9 +55,8 @@ def test_generic_parser_extracts_multiple_programmes_and_links(settings, fixture
 
     result = parser.parse(page, allowed_domains=["example.org"])
 
-    record_names = {record.program_name for record in result.records if record.program_name}
-    assert "Youth Growth Loan" in record_names
-    assert "Asset Finance Facility" in record_names
+    assert result.title == "Funding Products - Growth Finance Agency"
+    assert result.headings == ["Youth Growth Loan", "Asset Finance Facility"]
+    assert "working capital loan for youth-owned businesses" in result.full_body_text.lower()
     assert "https://example.org/programmes/youth-growth-loan" in result.discovered_links
     assert "https://example.org/programmes/asset-finance-facility" in result.discovered_links
-

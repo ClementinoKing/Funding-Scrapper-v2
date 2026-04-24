@@ -18,6 +18,7 @@ def settings(tmp_path: Path) -> ScraperSettings:
             headless=True,
             browser_fallback=False,
             respect_robots=False,
+            ai_enrichment=False,
         )
     )
 
@@ -25,4 +26,3 @@ def settings(tmp_path: Path) -> ScraperSettings:
 @pytest.fixture()
 def fixture_dir() -> Path:
     return Path(__file__).parent / "fixtures"
-

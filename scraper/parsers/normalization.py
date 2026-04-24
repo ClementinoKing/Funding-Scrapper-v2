@@ -335,6 +335,20 @@ def _first_matching_sentences(text: str, keywords: Sequence[str], limit: int = 4
     return unique_preserve_order(matches)
 
 
+def _split_section_items(values: Sequence[str], *, max_items: int = 12) -> List[str]:
+    items: List[str] = []
+    for value in values:
+        for line in split_lines(value):
+            for sentence in sentence_chunks(line):
+                cleaned = clean_text(sentence)
+                if cleaned:
+                    items.append(cleaned)
+    if not items:
+        return []
+    deduped = unique_preserve_order(items)
+    return deduped[:max_items]
+
+
 def _extract_stage_eligibility(text: str) -> Tuple[List[str], List[str]]:
     lowered = (text or "").lower()
     stages: List[str] = []
@@ -477,13 +491,12 @@ def _infer_funder_name(page_title: Optional[str], text: str) -> Optional[str]:
 
 def _extract_funding_lines(block: CandidateBlock, program_name: Optional[str]) -> List[str]:
     lines: List[str] = []
-    lines.extend(block.section_bundle.funding_offer)
+    lines.extend(_split_section_items(block.section_bundle.funding_offer))
     for heading, values in block.section_map.items():
         lowered = heading.lower()
         if any(term in lowered for term in ["funding products", "products", "facilities", "lines", "offerings"]):
             for value in values:
-                if 3 <= len(value) <= 80:
-                    lines.append(value)
+                lines.extend(_split_section_items([value], max_items=6))
     for value in block.section_map.keys():
         if any(term in value.lower() for term in ["loan", "grant", "finance", "facility"]) and len(value) <= 80:
             lines.append(value)
@@ -495,7 +508,7 @@ def _extract_funding_lines(block: CandidateBlock, program_name: Optional[str]) -
 def _extract_eligibility_items(block: CandidateBlock) -> List[str]:
     eligibility = block.section_bundle.eligibility or find_section_values(block.section_map, "eligibility", block.section_aliases)
     if eligibility:
-        return unique_preserve_order(eligibility)
+        return _split_section_items(eligibility)
     items = []
     for sentence in sentence_chunks(block.text):
         lowered = sentence.lower()
@@ -503,7 +516,7 @@ def _extract_eligibility_items(block: CandidateBlock) -> List[str]:
             items.append(sentence)
         if len(items) >= 10:
             break
-    return unique_preserve_order(items)
+    return _split_section_items(items)
 
 
 def _extract_required_documents(block: CandidateBlock) -> List[str]:

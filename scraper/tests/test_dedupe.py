@@ -126,3 +126,95 @@ def test_dedupe_keeps_ttf_support_pages_under_the_parent_programme() -> None:
         record.program_name == "TTF Checklist" and "Commercial viability required" in record.raw_eligibility_data
         for record in deduped
     )
+
+
+def test_dedupe_does_not_merge_same_named_programmes_from_different_parent_programmes() -> None:
+    left = FundingProgrammeRecord(
+        program_name="Expansion Capital",
+        funder_name="National Empowerment Fund",
+        parent_programme_name="Umnotho Fund",
+        source_url="https://www.nefcorp.co.za/products-services/umnotho-fund/3-expansion-capital",
+        source_urls=["https://www.nefcorp.co.za/products-services/umnotho-fund/3-expansion-capital"],
+        source_domain="nefcorp.co.za",
+        source_page_title="3. Expansion Capital - Umnotho Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.LOAN,
+    )
+    right = FundingProgrammeRecord(
+        program_name="Expansion Capital",
+        funder_name="National Empowerment Fund",
+        parent_programme_name="Rural Community Development Fund",
+        source_url="https://www.nefcorp.co.za/products-services/rural-community-development-fund/3-expansion-capital",
+        source_urls=["https://www.nefcorp.co.za/products-services/rural-community-development-fund/3-expansion-capital"],
+        source_domain="nefcorp.co.za",
+        source_page_title="3. Expansion Capital - Rural Community Development Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.LOAN,
+    )
+
+    deduped = dedupe_records([left, right])
+
+    assert len(deduped) == 2
+    assert {record.parent_programme_name for record in deduped} == {
+        "Umnotho Fund",
+        "Rural Community Development Fund",
+    }
+
+
+def test_dedupe_does_not_merge_same_named_programmes_when_parent_context_is_only_in_source_url() -> None:
+    left = FundingProgrammeRecord(
+        program_name="Expansion Capital",
+        funder_name="National Empowerment Fund",
+        source_url="https://www.nefcorp.co.za/products-services/umnotho-fund/3-expansion-capital",
+        source_urls=["https://www.nefcorp.co.za/products-services/umnotho-fund/3-expansion-capital"],
+        source_domain="nefcorp.co.za",
+        source_page_title="3. Expansion Capital - Umnotho Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.LOAN,
+    )
+    right = FundingProgrammeRecord(
+        program_name="Expansion Capital",
+        funder_name="National Empowerment Fund",
+        source_url="https://www.nefcorp.co.za/products-services/rural-community-development-fund/3-expansion-capital",
+        source_urls=["https://www.nefcorp.co.za/products-services/rural-community-development-fund/3-expansion-capital"],
+        source_domain="nefcorp.co.za",
+        source_page_title="3. Expansion Capital - Rural Community Development Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.LOAN,
+    )
+
+    deduped = dedupe_records([left, right])
+
+    assert len(deduped) == 2
+    assert {record.program_name for record in deduped} == {"Expansion Capital"}
+
+
+def test_dedupe_can_use_ai_decider_to_keep_ambiguous_same_named_programmes_separate() -> None:
+    left = FundingProgrammeRecord(
+        program_name="Expansion Capital",
+        funder_name="National Empowerment Fund",
+        source_url="https://example.org/expansion-capital",
+        source_urls=["https://example.org/expansion-capital"],
+        source_domain="example.org",
+        source_page_title="Expansion Capital",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.LOAN,
+    )
+    right = FundingProgrammeRecord(
+        program_name="Expansion Capital",
+        funder_name="National Empowerment Fund",
+        source_url="https://example.org/expansion-capital-terms",
+        source_urls=["https://example.org/expansion-capital-terms"],
+        source_domain="example.org",
+        source_page_title="Expansion Capital Terms",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.LOAN,
+    )
+
+    class _RejectingDecider:
+        def should_merge_records(self, _left, _right):
+            return False
+
+    deduped = dedupe_records([left, right], merge_decider=_RejectingDecider())
+
+    assert len(deduped) == 2

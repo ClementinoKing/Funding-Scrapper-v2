@@ -45,6 +45,11 @@ def extract_domain(url: str) -> str:
     return parsed.netloc.lower().removeprefix("www.")
 
 
+def extract_host(url: str) -> str:
+    parsed = urlparse(url if "://" in url else "https://%s" % url)
+    return parsed.netloc.lower()
+
+
 def get_domain_slug(url_or_domain: str) -> str:
     domain = extract_domain(url_or_domain)
     return slugify(domain.replace(".", "-"), max_length=40)
@@ -53,10 +58,10 @@ def get_domain_slug(url_or_domain: str) -> str:
 def is_internal_url(url: str, allowed_domains: Sequence[str]) -> bool:
     if not allowed_domains:
         return True
-    domain = extract_domain(url)
+    host = extract_host(url)
     for allowed in allowed_domains:
-        normalized = extract_domain(allowed)
-        if domain == normalized or domain.endswith("." + normalized) or normalized.endswith("." + domain):
+        normalized = extract_host(allowed)
+        if host == normalized:
             return True
     return False
 

@@ -12,7 +12,15 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from scraper.config import load_json_resource
 from scraper import __version__ as SCRAPER_VERSION
-from scraper.utils.text import generate_program_id, slugify, unique_preserve_order
+from scraper.utils.text import (
+    clean_text,
+    generate_program_id,
+    sentence_chunks,
+    slugify,
+    split_lines,
+    strip_leading_numbered_prefix,
+    unique_preserve_order,
+)
 
 
 APPROVED_PROVINCES = set(load_json_resource("provinces.json"))
@@ -83,6 +91,12 @@ class ProgrammeStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ApprovalStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
 class ProgrammeNature(str, Enum):
     DIRECT_FUNDING = "direct_funding"
     VOUCHER_SUPPORT = "voucher_support"
@@ -143,7 +157,297 @@ class PageDebugRecord(BaseModel):
     notes: List[str] = Field(default_factory=list)
 
 
-class PageDebugPackage(BaseModel):
+class PageContentSection(BaseModel):
+    """A semantic section extracted from the cleaned page body."""
+
+    heading: str
+    content: str
+
+
+class PageContentDocument(BaseModel):
+    """Raw, generic page content sent to the AI classifier."""
+
+    page_url: str
+    title: Optional[str] = None
+    headings: List[str] = Field(default_factory=list)
+    full_body_text: str = ""
+    structured_sections: List[PageContentSection] = Field(default_factory=list)
+    discovered_links: List[str] = Field(default_factory=list)
+    internal_links: List[str] = Field(default_factory=list)
+    application_links: List[str] = Field(default_factory=list)
+    document_links: List[str] = Field(default_factory=list)
+    main_content_hint: Optional[str] = None
+    source_domain: Optional[str] = None
+    page_title: Optional[str] = None
+    fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "PageContentDocument":
+        self.headings = unique_preserve_order([cleaned for cleaned in (clean_text(item) for item in self.headings) if cleaned])
+        self.full_body_text = clean_text(self.full_body_text)
+        self.title = clean_text(self.title) or None
+        self.page_title = clean_text(self.page_title) or self.title
+        self.structured_sections = [
+            PageContentSection(
+                heading=clean_text(section.heading),
+                content=clean_text(section.content),
+            )
+            for section in self.structured_sections
+            if clean_text(section.heading) or clean_text(section.content)
+        ]
+        self.discovered_links = unique_preserve_order([clean_text(item) for item in self.discovered_links if clean_text(item)])
+        self.internal_links = unique_preserve_order([clean_text(item) for item in self.internal_links if clean_text(item)])
+        self.application_links = unique_preserve_order([clean_text(item) for item in self.application_links if clean_text(item)])
+        self.document_links = unique_preserve_order([clean_text(item) for item in self.document_links if clean_text(item)])
+        self.main_content_hint = clean_text(self.main_content_hint or "") or None
+        self.source_domain = clean_text(self.source_domain or "") or None
+        return self
+
+    @property
+    def records(self) -> List["FundingProgrammeRecord"]:
+        from scraper.ai.ai_enhancement import AIClassifier
+
+        classifier = AIClassifier({"aiProvider": "openai", "disableRemoteAi": True}, storage=None)
+        return classifier.classify_document(self)
+
+    @property
+    def page_ai_context(self) -> "PageAIContext":
+        record_snapshots = [
+            PageAIRecordSnapshot(
+                record_index=index,
+                normalized_record=record.model_dump(mode="json", exclude={"page_debug_package"}),
+            )
+            for index, record in enumerate(self.records)
+        ]
+        candidate_blocks: List[CandidateBlockSnapshot] = []
+        if self.structured_sections:
+            for section in self.structured_sections:
+                candidate_blocks.append(
+                    CandidateBlockSnapshot(
+                        heading=section.heading,
+                        text=section.content,
+                        source_url=self.page_url,
+                        section_map={section.heading: [section.content]},
+                        section_tree=[],
+                        section_bundle={},
+                        section_aliases={},
+                        detail_links=list(self.internal_links),
+                        application_links=list(self.application_links),
+                        document_links=list(self.document_links),
+                    )
+                )
+        else:
+            candidate_blocks.append(
+                CandidateBlockSnapshot(
+                    heading=self.title or self.page_title or "",
+                    text=self.full_body_text,
+                    source_url=self.page_url,
+                    section_map={},
+                    section_tree=[],
+                    section_bundle={},
+                    section_aliases={},
+                    detail_links=list(self.internal_links),
+                    application_links=list(self.application_links),
+                    document_links=list(self.document_links),
+                )
+            )
+        return PageAIContext(
+            page_url=self.page_url,
+            final_url=self.page_url,
+            page_title=self.title or self.page_title,
+            cleaned_text=self.full_body_text,
+            section_tree=[],
+            discovered_links=list(self.discovered_links),
+            internal_links=list(self.internal_links),
+            application_links=list(self.application_links),
+            document_links=list(self.document_links),
+            candidate_blocks=candidate_blocks,
+            current_records=record_snapshots,
+            debug_package=PageDebugPackageSnapshot(
+                page_url=self.page_url,
+                final_url=self.page_url,
+                page_title=self.title or self.page_title,
+                cleaned_text=self.full_body_text,
+                section_tree=[],
+                extracted_evidence_map={},
+                confidence_map={},
+                records=[],
+            ),
+        )
+
+    @property
+    def page_debug_package(self) -> "PageDebugPackage":
+        return PageDebugPackage(
+            page_url=self.page_url,
+            final_url=self.page_url,
+            page_title=self.title or self.page_title,
+            cleaned_text=self.full_body_text,
+            section_tree=[],
+            extracted_evidence_map={},
+            confidence_map={},
+            records=[],
+            ai_context=self.page_ai_context,
+        )
+
+
+class AIProgrammeDraft(BaseModel):
+    """One AI-produced draft record before local technical fields are added."""
+
+    program_name: Optional[str] = None
+    funder_name: Optional[str] = None
+    parent_programme_name: Optional[str] = None
+    source_url: Optional[str] = None
+    source_urls: List[str] = Field(default_factory=list)
+    source_page_title: Optional[str] = None
+    raw_eligibility_data: Optional[List[str]] = None
+    raw_funding_offer_data: List[str] = Field(default_factory=list)
+    raw_terms_data: List[str] = Field(default_factory=list)
+    raw_documents_data: List[str] = Field(default_factory=list)
+    raw_application_data: List[str] = Field(default_factory=list)
+    funding_type: Optional[str] = None
+    funding_lines: List[str] = Field(default_factory=list)
+    ticket_min: Optional[float] = None
+    ticket_max: Optional[float] = None
+    currency: Optional[str] = None
+    program_budget_total: Optional[float] = None
+    deadline_type: Optional[str] = None
+    deadline_date: Optional[date] = None
+    funding_speed_days_min: Optional[int] = None
+    funding_speed_days_max: Optional[int] = None
+    geography_scope: Optional[str] = None
+    provinces: List[str] = Field(default_factory=list)
+    municipalities: List[str] = Field(default_factory=list)
+    postal_code_ranges: List[str] = Field(default_factory=list)
+    industries: List[str] = Field(default_factory=list)
+    use_of_funds: List[str] = Field(default_factory=list)
+    business_stage_eligibility: List[str] = Field(default_factory=list)
+    turnover_min: Optional[float] = None
+    turnover_max: Optional[float] = None
+    years_in_business_min: Optional[float] = None
+    years_in_business_max: Optional[float] = None
+    employee_min: Optional[int] = None
+    employee_max: Optional[int] = None
+    ownership_targets: List[str] = Field(default_factory=list)
+    entity_types_allowed: List[str] = Field(default_factory=list)
+    certifications_required: List[str] = Field(default_factory=list)
+    security_required: Optional[str] = None
+    equity_required: Optional[str] = None
+    payback_months_min: Optional[int] = None
+    payback_months_max: Optional[int] = None
+    interest_type: Optional[str] = None
+    repayment_frequency: Optional[str] = None
+    exclusions: List[str] = Field(default_factory=list)
+    required_documents: List[str] = Field(default_factory=list)
+    application_channel: Optional[str] = None
+    application_url: Optional[str] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    raw_text_snippets: Dict[str, List[str]] = Field(default_factory=dict)
+    extraction_confidence: Dict[str, float] = Field(default_factory=dict)
+    related_documents: List[str] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+    approval_status: Optional[str] = None
+    country_code: Optional[str] = None
+    status: Optional[str] = None
+    page_type: Optional[str] = None
+    source_scope: Optional[str] = None
+    ai_enriched: Optional[bool] = None
+
+    @field_validator(
+        "source_urls",
+        "raw_funding_offer_data",
+        "raw_terms_data",
+        "raw_documents_data",
+        "raw_application_data",
+        "provinces",
+        "municipalities",
+        "postal_code_ranges",
+        "industries",
+        "use_of_funds",
+        "business_stage_eligibility",
+        "ownership_targets",
+        "entity_types_allowed",
+        "certifications_required",
+        "exclusions",
+        "required_documents",
+        "related_documents",
+        "notes",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_list_fields(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        cleaned: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = clean_text(str(item))
+            if text:
+                cleaned.append(text)
+        return unique_preserve_order(cleaned)
+
+    @field_validator("funding_lines", mode="before")
+    @classmethod
+    def _normalize_funding_lines(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        cleaned: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            for fragment in sentence_chunks(str(item)) or split_lines(str(item)):
+                text = clean_text(fragment)
+                if text:
+                    cleaned.append(text)
+        return unique_preserve_order(cleaned)
+
+    @field_validator("raw_eligibility_data", mode="before")
+    @classmethod
+    def _normalize_optional_list_fields(cls, value: Any) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = [value]
+        cleaned: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            fragments = sentence_chunks(str(item)) or split_lines(str(item))
+            for fragment in fragments:
+                text = clean_text(str(fragment))
+                if text:
+                    cleaned.append(text)
+        return unique_preserve_order(cleaned) or None
+
+    @field_validator("raw_text_snippets", "extraction_confidence", mode="before")
+    @classmethod
+    def _normalize_mapping_fields(cls, value: Any) -> Dict[str, Any]:
+        return value or {}
+
+
+class AIClassificationResponse(BaseModel):
+    """Strict JSON response returned by the AI model."""
+
+    page_decision: Optional[str] = None
+    page_decision_confidence: Optional[float] = None
+    records: List[AIProgrammeDraft] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+
+class AIMergeDecisionResponse(BaseModel):
+    """Strict JSON response returned by the AI merge judge."""
+
+    merge_decision: Optional[str] = None
+    confidence: Optional[float] = None
+    reason: Optional[str] = None
+
+
+class PageDebugPackageBase(BaseModel):
     """Reviewer/debug artifact saved alongside parsed pages."""
 
     page_url: str
@@ -154,6 +458,53 @@ class PageDebugPackage(BaseModel):
     extracted_evidence_map: Dict[str, List[FieldEvidence]] = Field(default_factory=dict)
     confidence_map: Dict[str, float] = Field(default_factory=dict)
     records: List[PageDebugRecord] = Field(default_factory=list)
+
+
+class PageDebugPackageSnapshot(PageDebugPackageBase):
+    """AI-safe snapshot of the page debug bundle."""
+
+
+class PageAIRecordSnapshot(BaseModel):
+    """One normalized record snapshot supplied to AI for column-aware repair."""
+
+    record_index: int
+    normalized_record: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CandidateBlockSnapshot(BaseModel):
+    """AI-safe snapshot of a candidate programme block."""
+
+    heading: str
+    text: str
+    source_url: str
+    section_map: Dict[str, List[str]] = Field(default_factory=dict)
+    section_tree: List[SectionNode] = Field(default_factory=list)
+    section_bundle: Dict[str, Any] = Field(default_factory=dict)
+    section_aliases: Dict[str, List[str]] = Field(default_factory=dict)
+    detail_links: List[str] = Field(default_factory=list)
+    application_links: List[str] = Field(default_factory=list)
+    document_links: List[str] = Field(default_factory=list)
+
+
+class PageAIContext(BaseModel):
+    """Structured page payload passed to the AI enrichment step."""
+
+    page_url: str
+    final_url: Optional[str] = None
+    page_title: Optional[str] = None
+    cleaned_text: str = ""
+    section_tree: List[SectionNode] = Field(default_factory=list)
+    discovered_links: List[str] = Field(default_factory=list)
+    internal_links: List[str] = Field(default_factory=list)
+    application_links: List[str] = Field(default_factory=list)
+    document_links: List[str] = Field(default_factory=list)
+    candidate_blocks: List[CandidateBlockSnapshot] = Field(default_factory=list)
+    current_records: List[PageAIRecordSnapshot] = Field(default_factory=list)
+    debug_package: Optional[PageDebugPackageSnapshot] = None
+
+
+class PageDebugPackage(PageDebugPackageBase):
+    ai_context: Optional[PageAIContext] = None
 
 
 class CrawlTraceEntry(BaseModel):
@@ -210,6 +561,7 @@ class FundingProgrammeRecord(BaseModel):
     funder_slug: Optional[str] = None
     country_code: str = "ZA"
     status: ProgrammeStatus = ProgrammeStatus.UNKNOWN
+    approval_status: ApprovalStatus = ApprovalStatus.PENDING
     site_adapter: Optional[str] = None
     page_type: Optional[str] = None
     parent_programme_name: Optional[str] = None
@@ -222,6 +574,8 @@ class FundingProgrammeRecord(BaseModel):
     source_page_title: Optional[str] = None
     source_scope: Optional[str] = None
     scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_verified_at: Optional[date] = None
     raw_eligibility_data: Optional[List[str]] = None
@@ -283,6 +637,7 @@ class FundingProgrammeRecord(BaseModel):
     field_evidence: Dict[str, List[FieldEvidence]] = Field(default_factory=dict)
     related_documents: List[str] = Field(default_factory=list)
     parser_version: str = SCRAPER_VERSION
+    ai_enriched: bool = False
     needs_review: bool = False
     validation_errors: List[str] = Field(default_factory=list)
     deleted_at: Optional[datetime] = None
@@ -290,7 +645,6 @@ class FundingProgrammeRecord(BaseModel):
     page_debug_package: Optional[PageDebugPackage] = None
 
     @field_validator(
-        "funding_lines",
         "provinces",
         "municipalities",
         "postal_code_ranges",
@@ -326,6 +680,24 @@ class FundingProgrammeRecord(BaseModel):
                 cleaned.append(text)
         return unique_preserve_order(cleaned)
 
+    @field_validator("funding_lines", mode="before")
+    @classmethod
+    def _normalize_funding_lines(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        cleaned: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            fragments = sentence_chunks(str(item)) or split_lines(str(item))
+            for fragment in fragments:
+                text = clean_text(str(fragment))
+                if text:
+                    cleaned.append(text)
+        return unique_preserve_order(cleaned)
+
     @field_validator("source_urls", mode="before")
     @classmethod
     def _normalize_source_urls(cls, value: Any) -> List[str]:
@@ -342,7 +714,16 @@ class FundingProgrammeRecord(BaseModel):
             return None
         if isinstance(value, str):
             value = [value]
-        cleaned = unique_preserve_order([" ".join(str(item).split()).strip() for item in value if str(item).strip()])
+        cleaned: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            fragments = sentence_chunks(str(item)) or split_lines(str(item))
+            for fragment in fragments:
+                text = clean_text(str(fragment))
+                if text:
+                    cleaned.append(text)
+        cleaned = unique_preserve_order(cleaned)
         return cleaned or None
 
     @field_validator("field_evidence", mode="before")
@@ -478,6 +859,8 @@ class FundingProgrammeRecord(BaseModel):
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> "FundingProgrammeRecord":
+        self.program_name = strip_leading_numbered_prefix(self.program_name or "") or self.program_name
+        self.parent_programme_name = strip_leading_numbered_prefix(self.parent_programme_name or "") or self.parent_programme_name
         self.ticket_min, self.ticket_max = self._normalize_order(self.ticket_min, self.ticket_max)
         self.payback_months_min, self.payback_months_max = self._normalize_order(
             self.payback_months_min,
@@ -614,6 +997,7 @@ class ExtractionResult(BaseModel):
     records: List[FundingProgrammeRecord] = Field(default_factory=list)
     evidence: List[FieldEvidence] = Field(default_factory=list)
     page_debug_package: Optional[PageDebugPackage] = None
+    page_ai_context: Optional[PageAIContext] = None
     page_type: str = "unknown"
     notes: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)

@@ -7,25 +7,28 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
-from scraper.config import RuntimeOptions, ScraperSettings
+from scraper.ai.ai_enhancement import AIClassifier
 from scraper.adapters.registry import SiteAdapterRegistry, build_default_registry
 from scraper.crawler import Crawler
 from scraper.fetchers.browser_fetcher import BrowserFetcher
 from scraper.fetchers.http_fetcher import HttpFetcher
 from scraper.parsers.generic_parser import GenericFundingParser
-from scraper.storage.site_repository import SiteDefinition
-from scraper.schemas import ApplicationChannel, CrawlState, FundingProgrammeRecord, FundingType, RunSummary
+from scraper.schemas import ApplicationChannel, CrawlState, FundingProgrammeRecord, FundingType, PageContentDocument, RunSummary
 from scraper.storage.csv_store import CSVStore
 from scraper.storage.interfaces import StorageBackend
 from scraper.storage.json_store import LocalJsonStore
-from scraper.utils.quality import is_borderline_programme_record, is_real_programme_record, score_programme_quality
+from scraper.storage.site_repository import SiteDefinition
 from scraper.utils.dedupe import dedupe_records_with_trace
 from scraper.utils.logging import configure_logging, get_logger
+from scraper.utils.quality import is_borderline_programme_record, is_real_programme_record, score_programme_quality
 from scraper.utils.validators import add_application_verification_note, is_low_confidence
-from scraper.utils.urls import canonicalize_url, extract_domain
+from scraper.utils.urls import canonicalize_url, extract_host
 from scraper.utils.text import unique_preserve_order
+
+if TYPE_CHECKING:
+    from scraper.ai.ai_enhancement import AIClassifier as AIClassifierType
 
 
 def build_run_id(seed_urls: Sequence[str]) -> str:
@@ -44,20 +47,22 @@ class CrawlTarget:
     adapter_key: str
     adapter_config: Dict[str, Any]
     seed_urls: tuple[str, ...]
+    ai_enrichment_required: bool = False
 
 
 class ScraperPipeline:
-    """Run a full scraping pass from seeds through normalized storage."""
+    """Run a crawl, classify raw content with AI, and persist normalized records."""
 
     def __init__(
         self,
-        settings: ScraperSettings,
+        settings,
         storage: Optional[StorageBackend] = None,
         csv_store: Optional[CSVStore] = None,
         parser: Optional[GenericFundingParser] = None,
         http_fetcher: Optional[HttpFetcher] = None,
         browser_fetcher: Optional[BrowserFetcher] = None,
         adapter_registry: Optional[SiteAdapterRegistry] = None,
+        ai_enhancer: Optional["AIClassifierType"] = None,
     ) -> None:
         self.settings = settings
         configure_logging(self.settings.output_path / "logs")
@@ -68,33 +73,65 @@ class ScraperPipeline:
         self.http_fetcher = http_fetcher or HttpFetcher(self.settings)
         self.browser_fetcher = browser_fetcher or (BrowserFetcher(self.settings) if self.settings.browser_fallback else None)
         self.adapter_registry = adapter_registry or build_default_registry()
+        self.ai_enhancer = ai_enhancer or self._build_ai_classifier()
 
     def close(self) -> None:
         self.http_fetcher.close()
         if self.browser_fetcher:
             self.browser_fetcher.close()
 
+    def _build_ai_classifier(self) -> AIClassifier:
+        try:
+            return AIClassifier(
+                {
+                    "aiProvider": self.settings.ai_provider,
+                    "aiModel": self.settings.ai_model,
+                    "disableRemoteAi": not self.settings.ai_enrichment,
+                    "industry_taxonomy": self.settings.industry_taxonomy,
+                    "use_of_funds_taxonomy": self.settings.use_of_funds_taxonomy,
+                    "ownership_target_keywords": self.settings.ownership_target_keywords,
+                    "entity_type_keywords": self.settings.entity_type_keywords,
+                    "certification_keywords": self.settings.certification_keywords,
+                },
+                storage=self.storage,
+            )
+        except Exception as exc:
+            self.logger.warning("ai_classifier_disabled", error=str(exc))
+            return AIClassifier(
+                {
+                    "aiProvider": self.settings.ai_provider,
+                    "aiModel": self.settings.ai_model,
+                    "disableRemoteAi": True,
+                    "industry_taxonomy": self.settings.industry_taxonomy,
+                    "use_of_funds_taxonomy": self.settings.use_of_funds_taxonomy,
+                    "ownership_target_keywords": self.settings.ownership_target_keywords,
+                    "entity_type_keywords": self.settings.entity_type_keywords,
+                    "certification_keywords": self.settings.certification_keywords,
+                },
+                storage=None,
+            )
+
     @staticmethod
     def _group_seed_urls_by_domain(seed_urls: Sequence[str]) -> List[tuple[str, str]]:
         grouped: List[tuple[str, str]] = []
-        seen_domains: set[str] = set()
+        seen_hosts: set[str] = set()
         for seed_url in seed_urls:
             canonical = canonicalize_url(seed_url)
-            domain = extract_domain(canonical)
-            if not domain or domain in seen_domains:
+            host = extract_host(canonical)
+            if not host or host in seen_hosts:
                 continue
-            seen_domains.add(domain)
-            grouped.append((domain, canonical))
+            seen_hosts.add(host)
+            grouped.append((host, canonical))
         return grouped
 
     def _build_targets_from_seed_urls(self, seed_urls: Sequence[str]) -> List[CrawlTarget]:
         targets: List[CrawlTarget] = []
-        for domain, domain_seed_url in self._group_seed_urls_by_domain(seed_urls):
+        for host, domain_seed_url in self._group_seed_urls_by_domain(seed_urls):
             targets.append(
                 CrawlTarget(
-                    key=domain,
-                    label=domain,
-                    primary_domain=domain,
+                    key=host,
+                    label=host,
+                    primary_domain=host,
                     adapter_key=self.adapter_registry.generic_adapter.key,
                     adapter_config={},
                     seed_urls=(domain_seed_url,),
@@ -118,7 +155,7 @@ class ScraperPipeline:
             )
             if not seed_urls:
                 continue
-            primary_domain = site.primary_domain or (extract_domain(seed_urls[0]) if seed_urls else "")
+            primary_domain = extract_host(site.primary_domain or (seed_urls[0] if seed_urls else ""))
             target_key = site.site_key or primary_domain or self.adapter_registry.generic_adapter.key
             targets.append(
                 CrawlTarget(
@@ -128,10 +165,32 @@ class ScraperPipeline:
                     adapter_key=site.adapter_key or self.adapter_registry.generic_adapter.key,
                     adapter_config=site.adapter_config,
                     seed_urls=tuple(seed_urls),
+                    ai_enrichment_required=site.ai_enrichment_required,
                 )
             )
             run_seed_urls.extend(seed_urls)
+        if any(target.ai_enrichment_required for target in targets) and self.ai_enhancer is None:
+            self.ai_enhancer = self._build_ai_classifier()
         return self._run_targets(targets=targets, run_seed_urls=run_seed_urls, max_domains=max_sites)
+
+    def _classify_documents(self, documents: Sequence[PageContentDocument]) -> List[FundingProgrammeRecord]:
+        records: List[FundingProgrammeRecord] = []
+        for document in documents:
+            try:
+                if hasattr(self.ai_enhancer, "classify_document"):
+                    classified = self.ai_enhancer.classify_document(document)
+                elif hasattr(self.ai_enhancer, "classify_documents"):
+                    classified = self.ai_enhancer.classify_documents([document])
+                else:
+                    classified = []
+                for item in classified:
+                    if isinstance(item, FundingProgrammeRecord):
+                        records.append(FundingProgrammeRecord.model_validate(item.model_dump(mode="python")))
+                    else:
+                        records.append(FundingProgrammeRecord.model_validate(item))
+            except Exception as exc:
+                self.logger.warning("ai_classification_failed", page_url=document.page_url, error=str(exc))
+        return records
 
     def _run_targets(
         self,
@@ -193,9 +252,8 @@ class ScraperPipeline:
 
                 domain_errors: List[str] = []
                 domain_warnings: List[str] = []
-                domain_raw_records: List[FundingProgrammeRecord] = []
-                domain_validated_records: List[FundingProgrammeRecord] = []
-                domain_summary_records: List[FundingProgrammeRecord] = []
+                domain_documents: List[PageContentDocument] = []
+                domain_classified_records: List[FundingProgrammeRecord] = []
                 adapter = self.adapter_registry.build_for_site(
                     adapter_key=target.adapter_key,
                     primary_domain=target.primary_domain,
@@ -209,28 +267,51 @@ class ScraperPipeline:
                 )
 
                 try:
-                    raw_records, crawl_stats = crawler.crawl(domain_seed_urls, adapter=adapter)
-                    domain_raw_records = list(raw_records)
+                    documents, crawl_stats = crawler.crawl(domain_seed_urls, adapter=adapter)
+                    domain_documents = list(documents)
                     aggregate_total_urls_crawled += int(crawl_stats["total_urls_crawled"])
                     aggregate_pages_fetched_successfully += int(crawl_stats["pages_fetched_successfully"])
                     aggregate_pages_failed += int(crawl_stats["pages_failed"])
                     aggregate_errors.extend(list(crawl_stats["errors"]))
                     aggregate_warnings.extend(list(crawl_stats["warnings"]))
 
-                    for record in raw_records:
-                        try:
-                            enriched = add_application_verification_note(
-                                record,
-                                timeout_seconds=self.settings.application_verification_timeout_seconds,
+                    domain_classified_records = self._classify_documents(domain_documents)
+                    domain_classified_records = [
+                        record.model_copy(update={"site_adapter": adapter.key})
+                        if record.site_adapter != adapter.key
+                        else record
+                        for record in domain_classified_records
+                    ]
+                    if target.ai_enrichment_required:
+                        if not self.ai_enhancer:
+                            raise RuntimeError(
+                                "AI enrichment is required for %s but no AI classifier is configured." % target.label
                             )
-                            validated = FundingProgrammeRecord.model_validate(enriched.model_dump(mode="python"))
-                            domain_validated_records.append(validated)
-                        except Exception as exc:
-                            domain_errors.append("Validation failed for %s: %s" % (record.source_url, exc))
+                        if any(not record.ai_enriched for record in domain_classified_records):
+                            raise RuntimeError(
+                                "AI enrichment is required for %s but some records were not AI enriched."
+                                % target.label
+                            )
 
-                    deduped_records, merge_trace = dedupe_records_with_trace(domain_validated_records, adapter=adapter)
+                    validated_records = [
+                        add_application_verification_note(
+                            record,
+                            timeout_seconds=self.settings.application_verification_timeout_seconds,
+                        )
+                        for record in domain_classified_records
+                    ]
+                    validated_records = [
+                        FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))
+                        for record in validated_records
+                    ]
+                    aggregate_programmes_extracted += len(validated_records)
+
+                    deduped_records, merge_trace = dedupe_records_with_trace(
+                        validated_records,
+                        adapter=adapter,
+                        merge_decider=self.ai_enhancer,
+                    )
                     domain_merge_traces.extend(merge_trace)
-                    aggregate_programmes_extracted += len(domain_raw_records)
 
                     accepted_records = []
                     borderline_records = []
@@ -277,7 +358,7 @@ class ScraperPipeline:
                     review_records = [record for record in review_records if record.source_domain != target.primary_domain]
                     review_records.extend(borderline_records)
                     borderline_count += len(borderline_records)
-                    domain_summary_records = accepted_records
+
                     self.storage.save_programmes(persisted_records)
                     self.csv_store.write(persisted_records, self.storage.csv_path)  # type: ignore[attr-defined]
                     self.storage.write_borderline_review(review_records)
@@ -319,8 +400,8 @@ class ScraperPipeline:
                     "domain_completed",
                     message=f"[{index}/{total_domains}] Completed domain: {target.label}",
                     domain=target.primary_domain,
-                    records=len(domain_summary_records),
-                    extracted=len(domain_raw_records),
+                    records=len(domain_classified_records),
+                    extracted=len(domain_documents),
                     adapter=adapter.key,
                 )
 
@@ -392,7 +473,10 @@ def build_settings_from_options(
     headless: Optional[bool],
     browser_fallback: Optional[bool],
     respect_robots: Optional[bool],
-) -> ScraperSettings:
+    ai_enrichment: Optional[bool] = None,
+):
+    from scraper.config import RuntimeOptions, ScraperSettings
+
     base = ScraperSettings.from_env()
     return base.with_overrides(
         RuntimeOptions(
@@ -402,5 +486,6 @@ def build_settings_from_options(
             headless=headless,
             browser_fallback=browser_fallback,
             respect_robots=respect_robots,
+            ai_enrichment=ai_enrichment,
         )
     )

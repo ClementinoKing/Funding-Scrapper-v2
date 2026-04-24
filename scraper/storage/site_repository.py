@@ -12,7 +12,7 @@ import httpx
 from scraper.adapters.registry import SiteAdapterRegistry, build_default_registry
 from scraper.config import SupabaseSettings
 from scraper.utils.text import clean_text, unique_preserve_order
-from scraper.utils.urls import canonicalize_url, extract_domain
+from scraper.utils.urls import canonicalize_url, extract_host
 
 
 def _coerce_text_list(value: Any) -> List[str]:
@@ -64,6 +64,16 @@ def _coerce_adapter_config(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
 def _load_seed_urls_from_file(seed_file: Path) -> List[str]:
     payload = json.loads(seed_file.read_text(encoding="utf-8"))
     urls: List[str] = []
@@ -85,6 +95,7 @@ class SiteDefinition:
     adapter_key: str
     seed_urls: tuple[str, ...] = ()
     adapter_config: Dict[str, Any] = field(default_factory=dict)
+    ai_enrichment_required: bool = False
     active: bool = True
     notes: tuple[str, ...] = ()
     raw: Dict[str, Any] = field(default_factory=dict)
@@ -93,10 +104,11 @@ class SiteDefinition:
     def from_row(cls, row: Dict[str, Any], adapter_registry: Optional[SiteAdapterRegistry] = None) -> "SiteDefinition":
         registry = adapter_registry or build_default_registry()
         seed_urls = _coerce_seed_urls(row.get("seed_urls"))
-        primary_domain = clean_text(str(row.get("primary_domain") or "")) or (
-            extract_domain(seed_urls[0]) if seed_urls else ""
+        primary_domain = (
+            extract_host(seed_urls[0])
+            if seed_urls
+            else extract_host(clean_text(str(row.get("primary_domain") or "")))
         )
-        primary_domain = extract_domain(primary_domain) if primary_domain else ""
         adapter_key = clean_text(str(row.get("adapter_key") or "")) or registry.generic_adapter.key
         site_key = clean_text(str(row.get("site_key") or row.get("key") or "")) or (
             adapter_key if adapter_key else primary_domain
@@ -104,13 +116,20 @@ class SiteDefinition:
         display_name = clean_text(str(row.get("display_name") or row.get("name") or "")) or site_key or primary_domain
         notes = tuple(_coerce_text_list(row.get("notes")))
         adapter_config = _coerce_adapter_config(row.get("adapter_config"))
+        ai_enrichment_required = _coerce_bool(
+            row.get("ai_enrichment_required")
+            or adapter_config.get("ai_enrichment_required")
+            or adapter_config.get("require_ai_enrichment")
+            or adapter_config.get("ai_required")
+        )
         return cls(
             site_key=site_key or primary_domain or adapter_key or "unknown-site",
             display_name=display_name or primary_domain or adapter_key or "Unknown site",
-            primary_domain=primary_domain or (extract_domain(seed_urls[0]) if seed_urls else ""),
+            primary_domain=primary_domain or (extract_host(seed_urls[0]) if seed_urls else ""),
             adapter_key=adapter_key or registry.generic_adapter.key,
             seed_urls=tuple(seed_urls),
             adapter_config=adapter_config,
+            ai_enrichment_required=ai_enrichment_required,
             active=bool(row.get("active", True)),
             notes=notes,
             raw=dict(row),
@@ -163,7 +182,7 @@ class SiteRepository:
         grouped: Dict[str, Dict[str, Any]] = {}
         for seed_url in seed_urls:
             canonical = canonicalize_url(seed_url)
-            primary_domain = extract_domain(canonical)
+            primary_domain = extract_host(canonical)
             if not primary_domain:
                 continue
             bucket = grouped.setdefault(
