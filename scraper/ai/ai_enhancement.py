@@ -19,6 +19,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from scraper import __version__ as SCRAPER_VERSION
 from scraper.schemas import (
+    CandidateBlockSnapshot,
     AIMergeDecisionResponse,
     AIClassificationResponse,
     AIProgrammeDraft,
@@ -30,6 +31,7 @@ from scraper.schemas import (
     GeographyScope,
     InterestType,
     PageContentDocument,
+    PageAIRecordSnapshot,
     ProgrammeStatus,
     RepaymentFrequency,
     TriState,
@@ -333,6 +335,151 @@ def _build_prompt_content(document: PageContentDocument) -> Dict[str, Any]:
         },
     }
     return {key: value for key, value in prompt_payload.items() if value not in (None, "", [], {})}
+
+
+PROMPT_RECORD_FIELD_EXCLUSIONS = {
+    "id",
+    "program_id",
+    "program_slug",
+    "funder_slug",
+    "created_at",
+    "updated_at",
+    "last_scraped_at",
+    "last_verified_at",
+    "parser_version",
+    "deleted_at",
+    "field_evidence",
+    "evidence_by_field",
+    "extraction_confidence_by_field",
+}
+
+
+def _compact_prompt_value(value: Any) -> Any:
+    if value is None or value == "" or value == [] or value == {}:
+        return None
+    if isinstance(value, dict):
+        compacted = {
+            str(key): compacted_value
+            for key, compacted_value in ((key, _compact_prompt_value(item)) for key, item in value.items())
+            if compacted_value not in (None, "", [], {})
+        }
+        return compacted or None
+    if isinstance(value, (list, tuple, set)):
+        compacted_items = [_compact_prompt_value(item) for item in value]
+        compacted = [item for item in compacted_items if item not in (None, "", [], {})]
+        return compacted or None
+    return value
+
+
+def _compact_record_prompt_data(record_data: Dict[str, Any]) -> Dict[str, Any]:
+    prompt_data: Dict[str, Any] = {}
+    for key, value in record_data.items():
+        if key in PROMPT_RECORD_FIELD_EXCLUSIONS:
+            continue
+        compacted = _compact_prompt_value(value)
+        if compacted not in (None, "", [], {}):
+            prompt_data[key] = compacted
+    return prompt_data
+
+
+def _record_prompt_terms(record_data: Dict[str, Any]) -> List[str]:
+    terms: List[str] = []
+    for field_name in ("program_name", "funder_name", "parent_programme_name", "source_page_title", "application_channel", "geography_scope"):
+        value = record_data.get(field_name)
+        if isinstance(value, str) and value.strip():
+            terms.append(value.strip())
+    for field_name in ("raw_eligibility_data", "raw_funding_offer_data", "raw_terms_data", "raw_documents_data", "raw_application_data"):
+        value = record_data.get(field_name)
+        if isinstance(value, list):
+            terms.extend(item for item in value if isinstance(item, str) and item.strip())
+        elif isinstance(value, str) and value.strip():
+            terms.append(value.strip())
+    return unique_preserve_order([clean_text(term) for term in terms if clean_text(term)])
+
+
+def _score_candidate_block(block: CandidateBlockSnapshot, prompt_terms: Sequence[str]) -> int:
+    haystack = " ".join(
+        [
+            clean_text(block.heading),
+            clean_text(block.text),
+            clean_text(block.source_url),
+            " ".join(clean_text(item) for item in block.detail_links),
+            " ".join(clean_text(item) for item in block.application_links),
+            " ".join(clean_text(item) for item in block.document_links),
+        ]
+    ).casefold()
+    score = 0
+    for term in prompt_terms:
+        lowered = term.casefold()
+        if not lowered:
+            continue
+        if lowered in haystack:
+            score += 4
+            continue
+        term_parts = [part for part in lowered.split() if len(part) >= 4]
+        score += sum(1 for part in term_parts if part in haystack)
+    return score
+
+
+def _select_candidate_block(blocks: Sequence[CandidateBlockSnapshot], record_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not blocks:
+        return None
+    prompt_terms = _record_prompt_terms(record_data)
+    ranked = sorted(
+        ((block, _score_candidate_block(block, prompt_terms)) for block in blocks),
+        key=lambda item: (item[1], len(item[0].text or ""), len(item[0].heading or "")),
+        reverse=True,
+    )
+    selected_block, selected_score = ranked[0]
+    if selected_score <= 0:
+        selected_block = blocks[0]
+    compact_block = {
+        "heading": clean_text(selected_block.heading) or None,
+        "text": clean_text(selected_block.text)[:MAX_BODY_CHARS] if selected_block.text else None,
+        "source_url": clean_text(selected_block.source_url) or None,
+        "detail_links": unique_preserve_order([clean_text(item) for item in selected_block.detail_links if clean_text(item)]),
+        "application_links": unique_preserve_order([clean_text(item) for item in selected_block.application_links if clean_text(item)]),
+        "document_links": unique_preserve_order([clean_text(item) for item in selected_block.document_links if clean_text(item)]),
+    }
+    return {key: value for key, value in compact_block.items() if value not in (None, "", [], {})}
+
+
+def _build_record_context_prompt(snapshot: PageAIRecordSnapshot | Dict[str, Any] | Any, blocks: Sequence[CandidateBlockSnapshot]) -> Dict[str, Any]:
+    if isinstance(snapshot, PageAIRecordSnapshot):
+        record_index = snapshot.record_index
+        record_data = dict(snapshot.normalized_record or {})
+    elif isinstance(snapshot, dict):
+        record_index = int(snapshot.get("record_index", 0) or 0)
+        record_data = dict(snapshot.get("normalized_record") or snapshot)
+    else:
+        record_index = int(getattr(snapshot, "record_index", 0) or 0)
+        record_data = dict(getattr(snapshot, "normalized_record", {}) or {})
+    compact_record = _compact_record_prompt_data(record_data)
+    prompt_record = {
+        "record_index": record_index,
+        "filled_fields": list(compact_record.keys()),
+        "current_record": compact_record,
+        "selected_candidate_block": _select_candidate_block(blocks, record_data),
+    }
+    return {key: value for key, value in prompt_record.items() if value not in (None, "", [], {})}
+
+
+def _build_context_prompt_payload(
+    document: PageContentDocument,
+    *,
+    record_snapshots: Optional[Sequence[PageAIRecordSnapshot | Dict[str, Any] | Any]] = None,
+) -> Dict[str, Any]:
+    payload = _build_prompt_content(document)
+    context = document.page_ai_context
+    snapshots = list(record_snapshots or context.current_records)
+    payload["current_records"] = [
+        record_prompt
+        for record_prompt in (
+            _build_record_context_prompt(snapshot, context.candidate_blocks) for snapshot in snapshots
+        )
+        if record_prompt
+    ]
+    return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
 
 
 def _estimate_prompt_size(payload: Dict[str, Any]) -> int:
@@ -974,6 +1121,7 @@ class AIClassifier:
             "You are a strict JSON classifier for funding programme pages.\n"
             "Return JSON only. Do not add markdown, comments, or explanations.\n"
             "Use only evidence present in the supplied page content.\n"
+            "Existing extracted values are included in current_records; treat them as the starting record state and preserve any populated field unless the page evidence clearly supports a correction.\n"
             "Do not invent missing values. If a value is absent, use null, an empty array, or Unknown.\n"
             "Prefer exact wording for eligibility and requirements.\n"
             "Normalize money values to plain numbers.\n"
@@ -993,8 +1141,13 @@ class AIClassifier:
             "Allowed business fields include program_name, funder_name, source_url, source_urls, source_page_title, raw_eligibility_data, raw_funding_offer_data, raw_terms_data, raw_documents_data, raw_application_data, funding_type, funding_lines, ticket_min, ticket_max, currency, program_budget_total, deadline_type, deadline_date, funding_speed_days_min, funding_speed_days_max, geography_scope, provinces, municipalities, postal_code_ranges, industries, use_of_funds, business_stage_eligibility, turnover_min, turnover_max, years_in_business_min, years_in_business_max, employee_min, employee_max, ownership_targets, entity_types_allowed, certifications_required, security_required, equity_required, payback_months_min, payback_months_max, interest_type, repayment_frequency, exclusions, required_documents, application_channel, application_url, contact_email, contact_phone, raw_text_snippets, extraction_confidence, related_documents, notes, status, country_code, and parent_programme_name."
         )
 
-    def _build_user_prompt(self, document: PageContentDocument) -> str:
-        payload = _build_prompt_content(document)
+    def _build_user_prompt(
+        self,
+        document: PageContentDocument,
+        *,
+        record_snapshots: Optional[Sequence[PageAIRecordSnapshot | Dict[str, Any] | Any]] = None,
+    ) -> str:
+        payload = _build_context_prompt_payload(document, record_snapshots=record_snapshots)
         prompt = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if len(prompt) > MAX_PROMPT_CHARS:
             prompt = prompt[: MAX_PROMPT_CHARS - 3] + "..."
@@ -1002,13 +1155,20 @@ class AIClassifier:
             "Map the page content into zero or more funding-programme records.\n"
             "If the page is not a programme page, return {\"page_decision\": \"not_funding_program\", \"records\": [], \"notes\": [...]}.\n"
             "If the page is a sub-programme with its own name and terms, keep it as an independent programme record.\n"
+            "Use the values already present under current_records as the baseline record state and only change them when the page evidence supports a better value.\n"
             "Keep all extracted wording close to the source text.\n"
             "Return only JSON.\n\n"
             f"PAGE CONTENT:\n{prompt}"
         )
 
-    def _build_missing_fields_prompt(self, document: PageContentDocument, missing_fields: Sequence[str]) -> str:
-        payload = _build_prompt_content(document)
+    def _build_missing_fields_prompt(
+        self,
+        document: PageContentDocument,
+        missing_fields: Sequence[str],
+        *,
+        record_snapshots: Optional[Sequence[PageAIRecordSnapshot | Dict[str, Any] | Any]] = None,
+    ) -> str:
+        payload = _build_context_prompt_payload(document, record_snapshots=record_snapshots)
         payload["missing_fields"] = list(missing_fields)
         prompt = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if len(prompt) > MAX_PROMPT_CHARS:
@@ -1020,8 +1180,13 @@ class AIClassifier:
             f"PAGE CONTENT:\n{prompt}"
         )
 
-    def _build_decision_reprompt(self, document: PageContentDocument) -> str:
-        payload = _build_prompt_content(document)
+    def _build_decision_reprompt(
+        self,
+        document: PageContentDocument,
+        *,
+        record_snapshots: Optional[Sequence[PageAIRecordSnapshot | Dict[str, Any] | Any]] = None,
+    ) -> str:
+        payload = _build_context_prompt_payload(document, record_snapshots=record_snapshots)
         prompt = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if len(prompt) > MAX_PROMPT_CHARS:
             prompt = prompt[: MAX_PROMPT_CHARS - 3] + "..."
@@ -1470,6 +1635,47 @@ class AIClassifier:
 
     def enrich_records(self, records: List[FundingProgrammeRecord], page_context: Any) -> List[FundingProgrammeRecord]:
         if isinstance(page_context, PageContentDocument):
+            if self.api_key:
+                record_snapshots = [
+                    PageAIRecordSnapshot(
+                        record_index=index,
+                        normalized_record=record.model_dump(mode="json", exclude={"page_debug_package"}),
+                    )
+                    for index, record in enumerate(records)
+                ] if records else None
+                if record_snapshots is not None:
+                    system_prompt = self._build_system_prompt()
+                    user_prompt = self._build_user_prompt(page_context, record_snapshots=record_snapshots)
+                    self._write_artifact("input", page_context, {"system_prompt": system_prompt, "user_prompt": user_prompt})
+                    raw_response = self._call_model(system_prompt, user_prompt)
+                    parsed = self._parse_response(raw_response)
+                    parsed.page_decision = _normalize_page_decision(parsed.page_decision)
+                    if parsed.page_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
+                        return []
+                    updated_records: List[FundingProgrammeRecord] = []
+                    for draft in _merge_drafts(parsed.records):
+                        normalized = _normalize_draft(
+                            draft,
+                            page_context,
+                            industry_taxonomy=self.industry_taxonomy,
+                            use_of_funds_taxonomy=self.use_of_funds_taxonomy,
+                            ownership_target_keywords=self.ownership_target_keywords,
+                            entity_type_keywords=self.entity_type_keywords,
+                            certification_keywords=self.certification_keywords,
+                        )
+                        updated_records.append(
+                            _draft_to_record(
+                                normalized,
+                                page_context,
+                                parser_version="ai-first-v1",
+                                industry_taxonomy=self.industry_taxonomy,
+                                use_of_funds_taxonomy=self.use_of_funds_taxonomy,
+                                ownership_target_keywords=self.ownership_target_keywords,
+                                entity_type_keywords=self.entity_type_keywords,
+                                certification_keywords=self.certification_keywords,
+                            )
+                        )
+                    return updated_records or list(records)
             classified = self.classify_document(page_context)
             return classified or list(records)
         if not records:

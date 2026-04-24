@@ -59,6 +59,17 @@ def _parse_number(number_text: str, scale_text: Optional[str]) -> float:
     return number
 
 
+def _looks_like_year(number_text: str) -> bool:
+    digits = re.sub(r"[\s,]", "", number_text)
+    if not re.fullmatch(r"\d{4}", digits):
+        return False
+    try:
+        year = int(digits)
+    except ValueError:
+        return False
+    return 1900 <= year <= 2099
+
+
 def parse_money_token(text: str, default_currency: Optional[str] = None) -> Optional[MoneyMatch]:
     cleaned = clean_text(text)
     match = MONEY_TOKEN_RE.fullmatch(cleaned)
@@ -69,6 +80,8 @@ def parse_money_token(text: str, default_currency: Optional[str] = None) -> Opti
     number = match.group("number")
     if not currency and not scale:
         try:
+            if _looks_like_year(number):
+                return None
             if float(number.replace(" ", "").replace(",", "")) < 1000:
                 return None
         except ValueError:

@@ -305,7 +305,97 @@ def test_ai_prompt_builder_prioritizes_relevant_sections(settings) -> None:
     assert "Eligibility Criteria" in user_prompt
     assert "Funding" in user_prompt
     assert "Newsroom update" not in user_prompt
+    assert "current_records" in user_prompt
+    assert "Green Energy SME Grant" in user_prompt
     assert len(user_prompt) < 20000
+
+
+def test_ai_prompt_builder_includes_existing_record_values(settings) -> None:
+    document = PageContentDocument(
+        page_url="https://example.org/programmes/green-energy-sme-grant",
+        title="Green Energy SME Grant",
+        headings=["Green Energy SME Grant", "Eligibility Criteria", "Funding"],
+        full_body_text="Registered SMEs only. The grant provides up to R2 million for clean energy equipment.",
+        structured_sections=[
+            {"heading": "Eligibility Criteria", "content": "Registered SMEs only."},
+            {"heading": "Funding", "content": "The grant provides up to R2 million for clean energy equipment."},
+        ],
+        source_domain="example.org",
+    )
+
+    classifier = AIClassifier({"disableRemoteAi": True}, storage=None)
+    user_prompt = classifier._build_user_prompt(document)
+
+    assert "current_records" in user_prompt
+    assert "Registered SMEs only" in user_prompt
+    assert "Green Energy SME Grant" in user_prompt
+
+
+def test_ai_enrichment_reuses_passed_records_in_prompt(settings, tmp_path: Path, monkeypatch) -> None:
+    document = PageContentDocument(
+        page_url="https://example.org/programmes/green-energy-sme-grant",
+        title="Green Energy SME Grant",
+        headings=["Green Energy SME Grant", "Eligibility Criteria"],
+        full_body_text="Registered SMEs only. The grant provides up to R2 million.",
+        structured_sections=[
+            {"heading": "Eligibility Criteria", "content": "Registered SMEs only."},
+            {"heading": "Funding", "content": "The grant provides up to R2 million."},
+        ],
+        source_domain="example.org",
+    )
+
+    existing_record = FundingProgrammeRecord(
+        program_name="Green Energy SME Grant",
+        funder_name="National Empowerment Fund",
+        source_url="https://example.org/programmes/green-energy-sme-grant",
+        source_urls=["https://example.org/programmes/green-energy-sme-grant"],
+        source_domain="example.org",
+        source_page_title="Green Energy SME Grant - National Empowerment Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type="Grant",
+        funding_lines=["The grant provides up to R2 million."],
+        raw_eligibility_data=["Registered SMEs only."],
+        ai_enriched=True,
+        contact_email="apply@example.org",
+        notes=["AI updated contact details."],
+    )
+
+    classifier = AIClassifier(
+        {"openaiKey": "test", "aiProvider": "openai", "aiModel": "gpt-test"},
+        storage=LocalJsonStore(tmp_path),
+    )
+
+    prompts: list[str] = []
+
+    def fake_call_model(system_prompt: str, user_prompt: str) -> str:
+        prompts.append(user_prompt)
+        return json.dumps(
+            {
+                "page_decision": "funding_program",
+                "records": [
+                    {
+                        "program_name": "Green Energy SME Grant",
+                        "funder_name": "National Empowerment Fund",
+                        "source_url": "https://example.org/programmes/green-energy-sme-grant",
+                        "source_domain": "example.org",
+                        "funding_type": "Grant",
+                        "application_channel": "Online form",
+                        "ai_enriched": True,
+                    }
+                ],
+                "notes": ["Updated from existing record state."],
+            }
+        )
+
+    monkeypatch.setattr(classifier, "_call_model", fake_call_model)
+
+    records = classifier.enrich_records([existing_record], document)
+
+    assert len(records) == 1
+    assert "current_records" in prompts[0]
+    assert "AI updated contact details." in prompts[0]
+    assert "apply@example.org" in prompts[0]
+    assert records[0].ai_enriched is True
 
 
 def test_ai_classifier_strips_numbered_titles_and_keeps_page_source_only(settings, tmp_path: Path) -> None:

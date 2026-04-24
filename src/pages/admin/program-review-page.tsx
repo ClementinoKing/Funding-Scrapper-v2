@@ -5,6 +5,7 @@ import {
   Clock3,
   Database,
   Filter,
+  Circle,
   Search,
   X
 } from "lucide-react";
@@ -39,6 +40,103 @@ const getAiEnrichmentVariant = (programme: ScrapedFundingProgramme): "success" |
 
 const getAiEnrichmentLabel = (programme: ScrapedFundingProgramme): string =>
   programme.ai_enriched ? "AI enriched" : "Deterministic";
+
+type ProgramSignal = {
+  label: string;
+  description: string;
+  present: boolean;
+};
+
+const hasMeaningfulValue = (value?: string | number | null): boolean => {
+  if (value === null || value === undefined) return false;
+  if (typeof value === "number") return Number.isFinite(value);
+  return Boolean(String(value).trim());
+};
+
+const hasKnownFundingType = (programme: ScoredProgramme): boolean => {
+  const value = (programme.funding_type ?? programme.fundingType ?? "").trim();
+  return Boolean(value && value.toLowerCase() !== "unknown");
+};
+
+const hasRepaymentDetails = (programme: ScoredProgramme): boolean =>
+  {
+    const record = programme as ScoredProgramme & {
+      payback_months_min?: number | null;
+      payback_months_max?: number | null;
+      repayment_frequency?: string | null;
+      interest_type?: string | null;
+    };
+    return Boolean(
+      hasMeaningfulValue(record.payback_months_min) ||
+        hasMeaningfulValue(record.payback_months_max) ||
+        hasMeaningfulValue(record.repayment_frequency) ||
+        hasMeaningfulValue(record.interest_type)
+    );
+  };
+
+const hasEligibilityCriteria = (programme: ScoredProgramme): boolean =>
+  Boolean(
+    (Array.isArray(programme.raw_eligibility_data) && programme.raw_eligibility_data.some(Boolean)) ||
+      (Array.isArray(programme.industries) && programme.industries.some(Boolean)) ||
+      (Array.isArray(programme.use_of_funds) && programme.use_of_funds.some(Boolean)) ||
+      (Array.isArray(programme.business_stage_eligibility) && programme.business_stage_eligibility.some(Boolean)) ||
+      hasMeaningfulValue(programme.turnover_min) ||
+      hasMeaningfulValue(programme.turnover_max) ||
+      hasMeaningfulValue(programme.years_in_business_min) ||
+      hasMeaningfulValue(programme.years_in_business_max) ||
+      hasMeaningfulValue(programme.employee_min) ||
+      hasMeaningfulValue(programme.employee_max) ||
+      (Array.isArray(programme.ownership_targets) && programme.ownership_targets.some(Boolean)) ||
+      (Array.isArray(programme.entity_types_allowed) && programme.entity_types_allowed.some(Boolean)) ||
+      (Array.isArray(programme.certifications_required) && programme.certifications_required.some(Boolean))
+  );
+
+const getProgramSignals = (programme: ScoredProgramme): ProgramSignal[] => [
+  {
+    label: "Has program name",
+    description: "Programme title is captured in the row data.",
+    present: Boolean(programme.title?.trim())
+  },
+  {
+    label: "Has funder name",
+    description: "Provider or funder attribution is captured.",
+    present: Boolean(programme.providerName?.trim())
+  },
+  {
+    label: "Known Funding Type",
+    description: "Funding type is classified as something other than Unknown.",
+    present: hasKnownFundingType(programme)
+  },
+  {
+    label: "Has deadline",
+    description: "Deadline date or deadline type is present.",
+    present: Boolean(
+      programme.deadline_date ||
+        programme.deadlineDate ||
+        ((programme.deadline_type ?? programme.deadlineType) && (programme.deadline_type ?? programme.deadlineType) !== "Unknown")
+    )
+  },
+  {
+    label: "Has repayment",
+    description: "Repayment period, frequency, or interest structure is captured.",
+    present: hasRepaymentDetails(programme)
+  },
+  {
+    label: "Has eligibility criteria",
+    description: "Eligibility wording or structured eligibility fields are captured.",
+    present: hasEligibilityCriteria(programme)
+  },
+  {
+    label: "Has min and max ticket amount",
+    description: "Both funding amount minimum and maximum are captured.",
+    present: hasMeaningfulValue(programme.ticket_min) && hasMeaningfulValue(programme.ticket_max)
+  },
+  {
+    label: "Application URL",
+    description: "A direct application link is available.",
+    present: Boolean(programme.application_url?.trim() || programme.applicationUrl?.trim())
+  }
+];
 
 const getRowClassName = (programme: ScoredProgramme): string => {
   if (programme.approvalStatus === "approved") {
@@ -216,16 +314,21 @@ function ReviewProgrammesTable({ programmes }: { programmes: ScoredProgramme[] }
                       </div>
                     </TableCell>
                     <TableCell className="align-middle">
-                      <div className="flex max-w-[240px] flex-wrap gap-1">
-                        {program.reasonTags.slice(0, 3).map((reason) => (
-                          <Badge
-                            key={reason}
-                            variant="outline"
-                            title={reason}
-                            className="bg-background/90 px-2 py-0.5 text-[11px] font-normal"
+                      <div className="grid max-w-[240px] grid-cols-4 gap-2">
+                        {getProgramSignals(program).map((signal) => (
+                          <div
+                            key={signal.label}
+                            title={`${signal.label}: ${signal.description}`}
+                            aria-label={`${signal.label}: ${signal.present ? "present" : "missing"}`}
+                            className={cn(
+                              "flex h-10 items-center justify-center rounded-xl border transition-colors",
+                              signal.present
+                                ? "border-emerald-200 bg-emerald-50/80 text-emerald-600"
+                                : "border-slate-200 bg-muted/40 text-slate-400"
+                            )}
                           >
-                            {reason}
-                          </Badge>
+                            {signal.present ? <CheckCircle2 className="h-5 w-5" /> : <Circle className="h-5 w-5" />}
+                          </div>
                         ))}
                       </div>
                     </TableCell>
