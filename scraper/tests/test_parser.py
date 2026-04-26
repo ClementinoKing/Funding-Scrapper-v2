@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from bs4 import BeautifulSoup
+
+from scraper.parsers.extractor_rules import extract_document_links
 from scraper.parsers.generic_parser import GenericFundingParser
 from scraper.schemas import PageFetchResult
 
@@ -60,3 +63,47 @@ def test_generic_parser_keeps_listing_pages_generic(settings, fixture_dir: Path)
     assert "working capital loan for youth-owned businesses" in result.full_body_text.lower()
     assert "https://example.org/programmes/youth-growth-loan" in result.discovered_links
     assert "https://example.org/programmes/asset-finance-facility" in result.discovered_links
+
+
+def test_extract_document_links_includes_office_and_image_files() -> None:
+    soup = BeautifulSoup(
+        """
+        <div>
+          <a href="/docs/application-pack.pdf">Application pack</a>
+          <a href="/docs/application-pack.docx">Download form</a>
+          <a href="/docs/application-sheet.xlsx">Eligibility sheet</a>
+          <a href="/docs/poster.png">Poster</a>
+        </div>
+        """,
+        "html.parser",
+    )
+
+    links = extract_document_links(soup, "https://example.org/programmes/green-energy-grant")
+
+    assert "https://example.org/docs/application-pack.pdf" in links
+    assert "https://example.org/docs/application-pack.docx" in links
+    assert "https://example.org/docs/application-sheet.xlsx" in links
+    assert "https://example.org/docs/poster.png" in links
+
+
+def test_extract_document_links_filters_unrelated_site_wide_documents() -> None:
+    soup = BeautifulSoup(
+        """
+        <div>
+          <a href="/wp-content/uploads/2025/05/Spaza-Shop-Support-Fund-May.pdf">Download Spaza Shop Support Fund Brochure</a>
+          <a href="/wp-content/uploads/2018/07/Tourism-Transformation-Checklist.pdf">TTF Checklist</a>
+          <a href="/wp-content/uploads/2018/07/Funding-Application-Forms.pdf">Application Form</a>
+        </div>
+        """,
+        "html.parser",
+    )
+
+    links = extract_document_links(
+        soup,
+        "https://www.nefcorp.co.za/products-services/spaza-shop-support-fund/",
+        context_text="Spaza Shop Support Fund - National Empowerment Fund",
+    )
+
+    assert links == [
+        "https://www.nefcorp.co.za/wp-content/uploads/2025/05/Spaza-Shop-Support-Fund-May.pdf",
+    ]

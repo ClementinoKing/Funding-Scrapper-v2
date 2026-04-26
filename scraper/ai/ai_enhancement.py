@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from scraper.schemas import (
     AIMergeDecisionResponse,
     AIClassificationResponse,
     AIProgrammeDraft,
+    DocumentEvidenceSnapshot,
     ApprovalStatus,
     ApplicationChannel,
     DeadlineType,
@@ -36,6 +38,7 @@ from scraper.schemas import (
     RepaymentFrequency,
     TriState,
 )
+from scraper.utils.document_reader import compact_document_text, extract_local_document_text, infer_document_kind
 from scraper.utils.dates import parse_deadline_info
 from scraper.utils.money import extract_budget_total, extract_money_range, infer_default_currency
 from scraper.parsers.normalization import classify_page_type
@@ -50,7 +53,7 @@ from scraper.utils.text import (
     strip_leading_numbered_prefix,
     unique_preserve_order,
 )
-from scraper.utils.urls import canonicalize_url, extract_domain
+from scraper.utils.urls import canonicalize_url, document_link_matches_context, extract_domain
 
 
 logger = structlog.get_logger()
@@ -59,9 +62,11 @@ PROMPT_KEYWORDS = ("fund", "eligibility", "criteria", "requirements", "investmen
 MAX_SECTION_CHARS = 1800
 MAX_BODY_CHARS = 8000
 MAX_PROMPT_CHARS = 22000
+MAX_DOCUMENT_SUMMARY_CHARS = 2400
 PAGE_DECISION_FUNDING_PROGRAM = "funding_program"
 PAGE_DECISION_NOT_FUNDING_PROGRAM = "not_funding_program"
 PAGE_DECISION_UNCLEAR = "unclear"
+COMMON_TLDS = {"com", "co", "org", "net", "za", "gov", "edu", "ac", "io", "biz", "info", "co.za", "org.za", "gov.za"}
 PROGRAMME_SIGNAL_TERMS = (
     "funding",
     "fund",
@@ -79,6 +84,39 @@ PROGRAMME_SIGNAL_TERMS = (
     "who qualifies",
     "support for entrepreneurs",
 )
+FUNDER_SEPARATOR_PATTERN = re.compile(r"\s+(?:[-|:–—])\s+")
+FUNDER_HINT_TERMS = (
+    "fund",
+    "foundation",
+    "agency",
+    "department",
+    "corporation",
+    "council",
+    "bank",
+    "trust",
+    "enterprise",
+    "investment",
+    "development",
+    "authority",
+    "institute",
+    "society",
+    "group",
+)
+GENERIC_FUNDER_TOKENS = {
+    "home",
+    "products",
+    "services",
+    "support",
+    "funding",
+    "programme",
+    "program",
+    "page",
+    "overview",
+    "about",
+    "apply",
+    "application",
+    "contact",
+}
 NON_PROGRAMME_SIGNAL_TERMS = (
     "news",
     "article",
@@ -324,6 +362,7 @@ def _build_prompt_content(document: PageContentDocument) -> Dict[str, Any]:
     prompt_payload = {
         "page_url": document.page_url,
         "title": document.title,
+        "source_content_type": document.source_content_type,
         "headings": document.headings,
         "structured_sections": selected_sections,
         "full_body_text": body_excerpt,
@@ -479,7 +518,133 @@ def _build_context_prompt_payload(
         )
         if record_prompt
     ]
+    if document.document_evidence:
+        payload["document_evidence"] = [
+            {
+                "document_url": item.document_url,
+                "document_kind": item.document_kind,
+                "content_type": item.content_type,
+                "source_method": item.source_method,
+                "summary": compact_document_text(item.summary or "", max_chars=600) or None,
+                "key_points": item.key_points[:6],
+                "extracted_text": compact_document_text(item.extracted_text or "", max_chars=1200) or None,
+                "notes": item.notes,
+            }
+            for item in document.document_evidence
+        ]
+        payload["document_evidence_text"] = _document_evidence_text(document)
     return {key: value for key, value in payload.items() if value not in (None, "", [], {})}
+
+
+def _document_evidence_text(document: PageContentDocument) -> str:
+    return _document_evidence_context(document)["combined_text"]
+
+
+def _document_evidence_context(document: PageContentDocument) -> Dict[str, Any]:
+    evidence_lines: List[str] = []
+    funding_lines: List[str] = []
+    eligibility_lines: List[str] = []
+    application_lines: List[str] = []
+    required_documents: List[str] = []
+    notes: List[str] = []
+    for item in document.document_evidence:
+        fragments = [item.summary, *item.key_points, item.extracted_text]
+        cleaned_fragments = unique_preserve_order([clean_text(fragment) for fragment in fragments if clean_text(fragment)])
+        if not cleaned_fragments:
+            continue
+        tagged = f"{item.document_url}: {' '.join(cleaned_fragments)}"
+        evidence_lines.append(tagged)
+        lowered = tagged.lower()
+        if any(term in lowered for term in ("fund", "funding", "grant", "loan", "finance", "investment", "amount", "budget", "offer")):
+            funding_lines.append(tagged)
+        if any(term in lowered for term in ("eligibility", "criteria", "requirements", "who can apply", "qualif", "turnover", "employee", "ownership")):
+            eligibility_lines.append(tagged)
+        if any(term in lowered for term in ("apply", "application", "portal", "register", "submission", "submit", "deadline", "closing date", "how to apply")):
+            application_lines.append(tagged)
+        if any(term in lowered for term in ("document", "documents", "checklist", "certificate", "proof", "registration", "required")):
+            required_documents.append(tagged)
+        notes.append(f"Document evidence read from {item.document_url}")
+
+    combined_text = compact_document_text("\n".join(evidence_lines), max_chars=MAX_DOCUMENT_SUMMARY_CHARS)
+    combined_for_extraction = " ".join(
+        [
+            combined_text,
+            " ".join(funding_lines),
+            " ".join(eligibility_lines),
+            " ".join(application_lines),
+        ]
+    ).strip()
+    urls = unique_preserve_order(extract_urls(combined_for_extraction))
+    emails = unique_preserve_order(extract_emails(combined_for_extraction))
+    phones = unique_preserve_order(extract_phone_numbers(combined_for_extraction))
+    return {
+        "combined_text": combined_text,
+        "evidence_lines": evidence_lines,
+        "funding_lines": funding_lines,
+        "eligibility_lines": eligibility_lines,
+        "application_lines": application_lines,
+        "required_documents": unique_preserve_order(required_documents),
+        "urls": urls,
+        "emails": emails,
+        "phones": phones,
+        "notes": unique_preserve_order(notes),
+    }
+
+
+def _looks_like_funder_name(candidate: str) -> bool:
+    text = clean_text(candidate or "")
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered in GENERIC_FUNDER_TOKENS:
+        return False
+    if any(term in lowered for term in FUNDER_HINT_TERMS):
+        return True
+    return len(text.split()) >= 2
+
+
+def _extract_funder_name_from_title(title: Optional[str]) -> Optional[str]:
+    cleaned = clean_text(title or "")
+    if not cleaned:
+        return None
+    parts = FUNDER_SEPARATOR_PATTERN.split(cleaned, maxsplit=1)
+    if len(parts) < 2:
+        return None
+    candidate = clean_text(parts[-1])
+    return candidate if _looks_like_funder_name(candidate) else None
+
+
+def _humanize_source_domain(domain: Optional[str]) -> Optional[str]:
+    cleaned = clean_text(domain or "")
+    if not cleaned:
+        return None
+    host = cleaned.lower().removeprefix("www.")
+    parts = [part for part in host.split(".") if part]
+    while parts and parts[-1] in COMMON_TLDS:
+        parts.pop()
+    while parts and parts[0] == "www":
+        parts.pop(0)
+    if not parts:
+        return None
+    candidate = parts[0]
+    return candidate.replace("-", " ").replace("_", " ").title()
+
+
+def _infer_funder_name(document: PageContentDocument, payload: Dict[str, Any]) -> Optional[str]:
+    explicit = _coerce_optional_text(payload.get("funder_name"))
+    if explicit and not re.fullmatch(r"(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\.[a-z]{2,})*", explicit.casefold() or ""):
+        return explicit
+
+    for title_candidate in (
+        _extract_funder_name_from_title(document.title),
+        _extract_funder_name_from_title(document.page_title),
+        _extract_funder_name_from_title(_coerce_optional_text(payload.get("source_page_title"))),
+    ):
+        if title_candidate:
+            return title_candidate
+
+    source_domain = _coerce_optional_text(payload.get("source_domain")) or document.source_domain or extract_domain(document.page_url)
+    return _humanize_source_domain(source_domain)
 
 
 def _estimate_prompt_size(payload: Dict[str, Any]) -> int:
@@ -797,12 +962,13 @@ def _normalize_draft(
     certification_keywords: Dict[str, List[str]],
 ) -> AIProgrammeDraft:
     derived = _derive_page_evidence(document)
+    document_context = _document_evidence_context(document)
     payload = draft.model_dump(mode="python")
     ai_eligibility_items = _coerce_list(payload.get("raw_eligibility_data"))
     eligibility_text = _combine_eligibility_text(
         document,
         ai_eligibility_items or derived["raw_eligibility_data"] or [],
-        derived["raw_terms_data"],
+        [*derived["raw_terms_data"], document_context["combined_text"]] if document_context["combined_text"] else derived["raw_terms_data"],
     )
     eligibility_profile = _derive_eligibility_profile(
         eligibility_text,
@@ -818,7 +984,7 @@ def _normalize_draft(
     payload["program_name"] = strip_leading_numbered_prefix(_coerce_optional_text(payload.get("program_name")) or "")
     if not payload["program_name"] and document.title:
         payload["program_name"] = strip_leading_numbered_prefix(document.title)
-    payload["funder_name"] = _coerce_optional_text(payload.get("funder_name"))
+    payload["funder_name"] = _infer_funder_name(document, payload) or _coerce_optional_text(payload.get("funder_name"))
     payload["parent_programme_name"] = _coerce_optional_text(payload.get("parent_programme_name"))
     payload["funding_type"] = (_coerce_enum(FundingType, payload.get("funding_type")) or FundingType.UNKNOWN).value
     payload["deadline_type"] = (_coerce_enum(DeadlineType, payload.get("deadline_type")) or DeadlineType.UNKNOWN).value
@@ -832,7 +998,10 @@ def _normalize_draft(
     payload["application_channel"] = (
         _coerce_enum(ApplicationChannel, payload.get("application_channel")) or ApplicationChannel.UNKNOWN
     ).value
-    payload["funding_lines"] = _coerce_list(payload.get("funding_lines")) or list(derived["raw_funding_offer_data"])
+    base_funding_lines = _coerce_list(payload.get("funding_lines")) or list(derived["raw_funding_offer_data"])
+    payload["funding_lines"] = unique_preserve_order(
+        [*base_funding_lines, *document_context["funding_lines"]]
+    )
     payload["raw_eligibility_data"] = ai_eligibility_items or derived["raw_eligibility_data"]
     payload["provinces"] = _coerce_list(payload.get("provinces"))
     payload["municipalities"] = _coerce_list(payload.get("municipalities"))
@@ -844,9 +1013,14 @@ def _normalize_draft(
     payload["entity_types_allowed"] = _coerce_list(payload.get("entity_types_allowed")) or eligibility_profile["entity_types_allowed"]
     payload["certifications_required"] = _coerce_list(payload.get("certifications_required")) or eligibility_profile["certifications_required"]
     payload["exclusions"] = _coerce_list(payload.get("exclusions"))
-    payload["required_documents"] = _coerce_list(payload.get("required_documents"))
+    payload["required_documents"] = unique_preserve_order(
+        [
+            *_coerce_list(payload.get("required_documents")),
+            *document_context["required_documents"],
+        ]
+    )
     payload["related_documents"] = unique_preserve_order([*document.document_links, *_coerce_list(payload.get("related_documents"))])
-    payload["notes"] = _coerce_list(payload.get("notes"))
+    payload["notes"] = unique_preserve_order([*_coerce_list(payload.get("notes")), *document_context["notes"]])
     payload["ticket_min"] = _coerce_float(payload.get("ticket_min"))
     payload["ticket_max"] = _coerce_float(payload.get("ticket_max"))
     payload["program_budget_total"] = _coerce_float(payload.get("program_budget_total"))
@@ -863,12 +1037,21 @@ def _normalize_draft(
     payload["application_url"] = _coerce_optional_text(payload.get("application_url"))
     payload["contact_email"] = _coerce_optional_text(payload.get("contact_email"))
     payload["contact_phone"] = _coerce_optional_text(payload.get("contact_phone"))
-    payload["raw_funding_offer_data"] = _coerce_list(payload.get("raw_funding_offer_data")) or list(derived["raw_funding_offer_data"])
-    payload["raw_terms_data"] = _coerce_list(payload.get("raw_terms_data")) or list(derived["raw_terms_data"])
-    payload["raw_documents_data"] = _coerce_list(payload.get("raw_documents_data")) or list(derived["raw_documents_data"])
-    payload["raw_application_data"] = _coerce_list(payload.get("raw_application_data")) or list(derived["raw_application_data"])
+    base_raw_funding_offer_data = _coerce_list(payload.get("raw_funding_offer_data")) or list(derived["raw_funding_offer_data"])
+    base_raw_terms_data = _coerce_list(payload.get("raw_terms_data")) or list(derived["raw_terms_data"])
+    base_raw_documents_data = _coerce_list(payload.get("raw_documents_data")) or list(derived["raw_documents_data"])
+    base_raw_application_data = _coerce_list(payload.get("raw_application_data")) or list(derived["raw_application_data"])
+    payload["raw_funding_offer_data"] = unique_preserve_order([*base_raw_funding_offer_data, *document_context["funding_lines"]])
+    payload["raw_terms_data"] = unique_preserve_order([*base_raw_terms_data, *document_context["eligibility_lines"]])
+    payload["raw_documents_data"] = unique_preserve_order([*base_raw_documents_data, *document_context["evidence_lines"]])
+    payload["raw_application_data"] = unique_preserve_order([*base_raw_application_data, *document_context["application_lines"]])
     payload["raw_text_snippets"] = {
-        key: _coerce_list(value) for key, value in {**derived["raw_text_snippets"], **dict(payload.get("raw_text_snippets") or {})}.items()
+        key: _coerce_list(value)
+        for key, value in {
+            **derived["raw_text_snippets"],
+            **dict(payload.get("raw_text_snippets") or {}),
+            "document_evidence": document_context["evidence_lines"],
+        }.items()
     }
     payload["extraction_confidence"] = {
         str(key): max(0.0, min(float(value), 1.0))
@@ -887,7 +1070,28 @@ def _normalize_draft(
     payload["program_name"] = payload["program_name"] or strip_leading_numbered_prefix(document.title or "") or (
         document.title if document.title and len(document.title.split()) <= 12 else None
     )
-    payload["funder_name"] = payload["funder_name"] or payload["source_domain"].replace(".", " ").title() if payload["source_domain"] else None
+    payload["funder_name"] = payload["funder_name"] or _infer_funder_name(document, payload)
+
+    if not payload["ticket_min"] or not payload["ticket_max"] or not payload["program_budget_total"]:
+        doc_money_min, doc_money_max, doc_currency, _snippet, _confidence = extract_money_range(
+            document_context["combined_text"],
+            default_currency=None,
+        )
+        if payload["ticket_min"] is None:
+            payload["ticket_min"] = doc_money_min
+        if payload["ticket_max"] is None:
+            payload["ticket_max"] = doc_money_max
+        if payload["program_budget_total"] is None:
+            payload["program_budget_total"] = doc_money_max or doc_money_min
+        if not payload.get("currency"):
+            payload["currency"] = doc_currency
+    if not payload["application_url"]:
+        application_urls = [url for url in document_context["urls"] if any(term in url.lower() for term in ["apply", "application", "portal", "register"])]
+        payload["application_url"] = application_urls[0] if application_urls else None
+    if not payload["contact_email"] and document_context["emails"]:
+        payload["contact_email"] = document_context["emails"][0]
+    if not payload["contact_phone"] and document_context["phones"]:
+        payload["contact_phone"] = document_context["phones"][0]
     return AIProgrammeDraft.model_validate(payload)
 
 
@@ -904,12 +1108,13 @@ def _draft_to_record(
 ) -> FundingProgrammeRecord:
     now = datetime.now(timezone.utc)
     derived = _derive_page_evidence(document)
+    document_context = _document_evidence_context(document)
     payload = draft.model_dump(mode="python")
     ai_eligibility_items = _coerce_list(payload.get("raw_eligibility_data"))
     eligibility_text = _combine_eligibility_text(
         document,
         ai_eligibility_items or derived["raw_eligibility_data"] or [],
-        derived["raw_terms_data"],
+        [*derived["raw_terms_data"], document_context["combined_text"]] if document_context["combined_text"] else derived["raw_terms_data"],
     )
     eligibility_profile = _derive_eligibility_profile(
         eligibility_text,
@@ -932,7 +1137,8 @@ def _draft_to_record(
     approval_status = _coerce_enum(ApprovalStatus, payload.get("approval_status")) or ApprovalStatus.PENDING
 
     raw_eligibility_data = ai_eligibility_items or eligibility_profile["raw_eligibility_data"] or derived["raw_eligibility_data"]
-    funding_lines = _coerce_list(payload.get("funding_lines")) or list(derived["raw_funding_offer_data"])
+    base_funding_lines = _coerce_list(payload.get("funding_lines")) or list(derived["raw_funding_offer_data"])
+    funding_lines = unique_preserve_order([*base_funding_lines, *document_context["funding_lines"]])
     provinces = _coerce_list(payload.get("provinces"))
     municipalities = _coerce_list(payload.get("municipalities"))
     postal_code_ranges = _coerce_list(payload.get("postal_code_ranges"))
@@ -943,9 +1149,9 @@ def _draft_to_record(
     entity_types_allowed = _coerce_list(payload.get("entity_types_allowed")) or eligibility_profile["entity_types_allowed"]
     certifications_required = _coerce_list(payload.get("certifications_required")) or eligibility_profile["certifications_required"]
     exclusions = _coerce_list(payload.get("exclusions"))
-    required_documents = _coerce_list(payload.get("required_documents"))
-    related_documents = unique_preserve_order([*document.document_links])
-    notes = unique_preserve_order([*_coerce_list(payload.get("notes"))])
+    required_documents = unique_preserve_order([*_coerce_list(payload.get("required_documents")), *document_context["required_documents"]])
+    related_documents = unique_preserve_order([*document.document_links, *_coerce_list(payload.get("related_documents"))])
+    notes = unique_preserve_order([*_coerce_list(payload.get("notes")), *document_context["notes"]])
     source_urls = [source_url]
 
     ticket_min = _coerce_float(payload.get("ticket_min"))
@@ -966,7 +1172,10 @@ def _draft_to_record(
     payback_months_max = _coerce_int(payload.get("payback_months_max"))
     currency = _coerce_text(payload.get("currency")) or None
     if not currency:
-        currency = infer_default_currency(document.full_body_text or document.title or "", source_domain=source_domain or "")
+        currency = infer_default_currency(
+            " ".join([document.full_body_text or "", document_context["combined_text"], document.title or ""]),
+            source_domain=source_domain or "",
+        )
     if not currency and any(text for text in (ticket_min, ticket_max, program_budget_total) if text is not None):
         currency = "ZAR" if (source_domain or "").endswith(".za") else None
 
@@ -975,6 +1184,7 @@ def _draft_to_record(
             [
                 document.title or "",
                 document.full_body_text or "",
+                document_context["combined_text"],
                 " ".join(section.content for section in document.structured_sections),
             ]
         )
@@ -990,8 +1200,31 @@ def _draft_to_record(
 
     raw_text_snippets = {
         key: _coerce_list(value)
-        for key, value in {**derived["raw_text_snippets"], **dict(payload.get("raw_text_snippets") or {})}.items()
+        for key, value in {
+            **derived["raw_text_snippets"],
+            **dict(payload.get("raw_text_snippets") or {}),
+            "document_evidence": document_context["evidence_lines"],
+        }.items()
     }
+
+    if not ticket_min or not ticket_max or not program_budget_total:
+        doc_money_min, doc_money_max, doc_currency, _snippet, _confidence = extract_money_range(document_context["combined_text"], default_currency=None)
+        if ticket_min is None:
+            ticket_min = doc_money_min
+        if ticket_max is None:
+            ticket_max = doc_money_max
+        if program_budget_total is None:
+            program_budget_total = doc_money_max or doc_money_min
+        if not currency:
+            currency = doc_currency
+
+    if not payload.get("application_url"):
+        application_urls = [url for url in document_context["urls"] if any(term in url.lower() for term in ["apply", "application", "portal", "register"])]
+    else:
+        application_urls = []
+    application_url = _coerce_optional_text(payload.get("application_url")) or (application_urls[0] if application_urls else None)
+    contact_email = _coerce_optional_text(payload.get("contact_email")) or (document_context["emails"][0] if document_context["emails"] else None)
+    contact_phone = _coerce_optional_text(payload.get("contact_phone")) or (document_context["phones"][0] if document_context["phones"] else None)
 
     extraction_confidence = {
         str(key): max(0.0, min(float(value), 1.0))
@@ -1014,10 +1247,10 @@ def _draft_to_record(
         updated_at=now,
         last_scraped_at=now,
         raw_eligibility_data=raw_eligibility_data,
-        raw_funding_offer_data=list(derived["raw_funding_offer_data"]),
-        raw_terms_data=list(derived["raw_terms_data"]),
-        raw_documents_data=list(derived["raw_documents_data"]),
-        raw_application_data=list(derived["raw_application_data"]),
+        raw_funding_offer_data=unique_preserve_order([*derived["raw_funding_offer_data"], *document_context["funding_lines"]]),
+        raw_terms_data=unique_preserve_order([*derived["raw_terms_data"], *document_context["eligibility_lines"]]),
+        raw_documents_data=unique_preserve_order([*derived["raw_documents_data"], *document_context["evidence_lines"]]),
+        raw_application_data=unique_preserve_order([*derived["raw_application_data"], *document_context["application_lines"]]),
         funding_type=funding_type,
         funding_lines=funding_lines,
         ticket_min=ticket_min,
@@ -1055,9 +1288,9 @@ def _draft_to_record(
         exclusions=exclusions,
         required_documents=required_documents,
         application_channel=application_channel,
-        application_url=_coerce_optional_text(payload.get("application_url")),
-        contact_email=_coerce_optional_text(payload.get("contact_email")),
-        contact_phone=_coerce_optional_text(payload.get("contact_phone")),
+        application_url=application_url,
+        contact_email=contact_email,
+        contact_phone=contact_phone,
         raw_text_snippets=raw_text_snippets,
         extraction_confidence=extraction_confidence,
         evidence_by_field={},
@@ -1082,6 +1315,19 @@ class AIClassifier:
         self.disable_remote_ai = bool(config.get("disableRemoteAi") or config.get("offline"))
         self.ai_provider = (config.get("aiProvider") or os.getenv("AI_PROVIDER") or "openai").strip().lower()
         self.model = config.get("aiModel") or os.getenv("SCRAPER_AI_MODEL") or "gpt-4o-mini"
+        self.document_ai_max_documents_per_page = int(config.get("documentAiMaxDocumentsPerPage") or config.get("document_ai_max_documents_per_page") or 4)
+        self.document_ai_max_extracted_chars = int(config.get("documentAiMaxExtractedChars") or config.get("document_ai_max_extracted_chars") or 5000)
+        self.document_ai_timeout_seconds = float(config.get("documentAiTimeoutSeconds") or config.get("document_ai_timeout_seconds") or 45)
+        self.document_ai_skip_content_types = {
+            clean_text(value).lower()
+            for value in (config.get("documentAiSkipContentTypes") or config.get("document_ai_skip_content_types") or [])
+            if clean_text(value)
+        }
+        self.document_ai_skip_url_terms = [
+            clean_text(value).lower()
+            for value in (config.get("documentAiSkipUrlTerms") or config.get("document_ai_skip_url_terms") or [])
+            if clean_text(value)
+        ]
         if self.disable_remote_ai:
             self.api_key = None
         else:
@@ -1098,6 +1344,12 @@ class AIClassifier:
         self.ownership_target_keywords = _as_taxonomy(config.get("ownership_target_keywords"))
         self.entity_type_keywords = _as_taxonomy(config.get("entity_type_keywords"))
         self.certification_keywords = _as_taxonomy(config.get("certification_keywords"))
+
+    def _document_headers(self) -> Dict[str, str]:
+        return {
+            "User-Agent": "Mozilla/5.0 (compatible; Scrapper/1.0; +https://example.org)",
+            "Accept": "*/*",
+        }
 
     def _artifact_slug(self, document: PageContentDocument) -> str:
         return re.sub(r"[^a-zA-Z0-9]+", "-", document.page_url.lower()).strip("-")[:120] or "page"
@@ -1116,11 +1368,251 @@ class AIClassifier:
             except Exception:
                 logger.debug("ai_artifact_write_failed", kind=kind, page_url=document.page_url)
 
+    def _should_skip_document_source(self, url: str, content_type: Optional[str]) -> bool:
+        lowered_url = (url or "").lower()
+        lowered_content_type = clean_text(content_type or "").lower()
+        if lowered_content_type and any(lowered_content_type.startswith(item) for item in self.document_ai_skip_content_types):
+            return True
+        if any(term and term in lowered_url for term in self.document_ai_skip_url_terms):
+            return True
+        return False
+
+    def _read_remote_document(self, url: str) -> tuple[Optional[bytes], Optional[str], List[str]]:
+        with httpx.Client(timeout=self.document_ai_timeout_seconds, follow_redirects=True) as client:
+            response = client.get(url, headers=self._document_headers())
+            response.raise_for_status()
+            return response.content, response.headers.get("content-type"), []
+
+    def _build_document_summary_prompt(
+        self,
+        url: str,
+        kind: str,
+        content_type: Optional[str],
+        source_kind: str,
+        *,
+        programme_context: Optional[Dict[str, str]] = None,
+    ) -> str:
+        programme_context = programme_context or {}
+        return (
+            "You are reading a funding-programme support document.\n"
+            "Return JSON only with keys: summary, key_points, confidence, notes.\n"
+            "Keep the summary short and factual.\n"
+            "Extract only evidence visible in the supplied document text or image.\n"
+            "Do not invent missing details.\n"
+            "Use the programme context only to interpret which programme the document belongs to; do not import facts that are not present in the document.\n"
+            f"Programme name: {programme_context.get('programme_name') or 'unknown'}\n"
+            f"Programme page title: {programme_context.get('page_title') or 'unknown'}\n"
+            f"Programme page URL: {programme_context.get('page_url') or 'unknown'}\n"
+            f"Programme source domain: {programme_context.get('source_domain') or 'unknown'}\n"
+            f"Document URL: {url}\n"
+            f"Document kind: {kind}\n"
+            f"Content type: {content_type or 'unknown'}\n"
+            f"Reading mode: {source_kind}\n"
+        )
+
+    def _parse_document_summary_response(self, raw: str) -> Dict[str, Any]:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{[\s\S]*\}", raw)
+            if not match:
+                raise
+            payload = json.loads(match.group(0))
+        if not isinstance(payload, dict):
+            raise ValueError("Document summary response must be a JSON object.")
+        return payload
+
+    def _summarize_document_with_openai(
+        self,
+        *,
+        document_url: str,
+        kind: str,
+        content_type: Optional[str],
+        extracted_text: str = "",
+        raw_bytes: Optional[bytes] = None,
+        programme_context: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        if not self.api_key or self.ai_provider != "openai":
+            return {}
+
+        client = OpenAI(api_key=self.api_key)
+        prompt = self._build_document_summary_prompt(
+            document_url,
+            kind,
+            content_type,
+            "openai",
+            programme_context=programme_context,
+        )
+        content: List[Dict[str, Any]] = [{"type": "input_text", "text": "Read this document and extract the useful programme evidence."}]
+
+        if extracted_text:
+            content.append(
+                {
+                    "type": "input_text",
+                    "text": compact_document_text(extracted_text, max_chars=self.document_ai_max_extracted_chars),
+                }
+            )
+        elif kind == "image":
+            content.append({"type": "input_image", "image_url": document_url, "detail": "high"})
+        elif raw_bytes:
+            content.append(
+                {
+                    "type": "input_file",
+                    "file_data": base64.b64encode(raw_bytes).decode("ascii"),
+                    "filename": document_url.rsplit("/", 1)[-1] or "document",
+                    "detail": "high",
+                }
+            )
+        else:
+            content.append({"type": "input_text", "text": "No machine-readable text was extracted. Read the document metadata and any visible text carefully."})
+
+        response = client.responses.create(
+            model=self.model,
+            instructions=prompt,
+            input=[{"role": "user", "content": content}],
+            temperature=0.1,
+            max_output_tokens=500,
+            text={"format": {"type": "json_object"}},
+        )
+        output_text = getattr(response, "output_text", "") or ""
+        if not output_text:
+            return {}
+        return self._parse_document_summary_response(output_text)
+
+    def _build_document_evidence_snapshot(
+        self,
+        *,
+        document_url: str,
+        content_type: Optional[str],
+        raw_bytes: Optional[bytes],
+        source_method: str,
+        existing_text: str = "",
+        programme_context: Optional[Dict[str, str]] = None,
+    ) -> Optional[DocumentEvidenceSnapshot]:
+        if self._should_skip_document_source(document_url, content_type):
+            return None
+        kind = infer_document_kind(document_url, content_type)
+        if kind == "unsupported":
+            return None
+
+        if existing_text:
+            text = compact_document_text(existing_text, max_chars=self.document_ai_max_extracted_chars)
+            notes = []
+        else:
+            local_result = extract_local_document_text(raw_bytes or b"", document_url, content_type)
+            text = compact_document_text(local_result.text, max_chars=self.document_ai_max_extracted_chars)
+            notes = list(local_result.notes)
+        summary_payload: Dict[str, Any] = {}
+        if self.api_key and self.ai_provider == "openai":
+            try:
+                summary_payload = self._summarize_document_with_openai(
+                    document_url=document_url,
+                    kind=kind,
+                    content_type=content_type,
+                    extracted_text=text,
+                    raw_bytes=raw_bytes if not text and kind != "image" else None,
+                    programme_context=programme_context,
+                )
+            except Exception as exc:
+                notes.append(f"OpenAI document read failed: {exc}")
+
+        summary = clean_text(str(summary_payload.get("summary") or "")) or None
+        key_points = summary_payload.get("key_points") or []
+        if isinstance(key_points, str):
+            key_points = [key_points]
+        if not summary and text:
+            summary = compact_document_text(text, max_chars=600)
+        if not key_points and text:
+            key_points = sentence_chunks(text)[:5]
+        extracted_text = text or None
+        if summary_payload.get("notes"):
+            notes.extend([clean_text(str(item)) for item in summary_payload.get("notes") or [] if clean_text(str(item))])
+        return DocumentEvidenceSnapshot(
+            document_url=document_url,
+            document_kind=kind,
+            content_type=content_type,
+            source_method=source_method,
+            summary=summary,
+            key_points=[clean_text(str(item)) for item in key_points if clean_text(str(item))],
+            extracted_text=extracted_text,
+            notes=notes,
+        )
+
+    def _prepare_document_context(self, document: PageContentDocument) -> PageContentDocument:
+        if document.document_evidence:
+            return document
+
+        programme_context = {
+            "programme_name": clean_text(document.title or document.page_title or "") or "",
+            "page_title": clean_text(document.page_title or document.title or "") or "",
+            "page_url": document.page_url or "",
+            "source_domain": document.source_domain or extract_domain(document.page_url) or "",
+        }
+        context_text = " ".join(
+            [
+                programme_context["programme_name"],
+                programme_context["page_title"],
+                document.page_url or "",
+                document.source_domain or "",
+                " ".join(document.headings[:8]),
+            ]
+        )
+
+        candidate_urls: List[str] = []
+        source_domain = extract_domain(document.page_url)
+        source_kind = infer_document_kind(document.page_url, document.source_content_type)
+        if source_kind in {"pdf", "docx", "xlsx", "image"}:
+            candidate_urls.append(document.page_url)
+
+        for link in document.document_links[: self.document_ai_max_documents_per_page]:
+            if extract_domain(link) != source_domain:
+                continue
+            if not document_link_matches_context(link, context_text=context_text):
+                continue
+            if link not in candidate_urls:
+                candidate_urls.append(link)
+
+        evidence: List[DocumentEvidenceSnapshot] = []
+        for document_url in candidate_urls[: self.document_ai_max_documents_per_page]:
+            if self._should_skip_document_source(document_url, None):
+                continue
+            try:
+                if document_url == document.page_url and source_kind in {"pdf", "docx", "xlsx"} and document.full_body_text:
+                    snapshot = self._build_document_evidence_snapshot(
+                        document_url=document_url,
+                        content_type=document.source_content_type,
+                        raw_bytes=None,
+                        source_method="page",
+                        existing_text=document.full_body_text,
+                        programme_context=programme_context,
+                    )
+                    if snapshot:
+                        evidence.append(snapshot)
+                    continue
+                raw_bytes, content_type, _notes = self._read_remote_document(document_url)
+            except Exception as exc:
+                logger.debug("document_read_failed", page_url=document.page_url, document_url=document_url, error=str(exc))
+                continue
+            snapshot = self._build_document_evidence_snapshot(
+                document_url=document_url,
+                content_type=content_type,
+                raw_bytes=raw_bytes,
+                source_method="page" if document_url == document.page_url else "linked_document",
+                existing_text=document.full_body_text if document_url == document.page_url and source_kind in {"pdf", "docx", "xlsx"} else "",
+                programme_context=programme_context,
+            )
+            if snapshot:
+                evidence.append(snapshot)
+
+        document.document_evidence = evidence
+        return document
+
     def _build_system_prompt(self) -> str:
         return (
             "You are a strict JSON classifier for funding programme pages.\n"
             "Return JSON only. Do not add markdown, comments, or explanations.\n"
             "Use only evidence present in the supplied page content.\n"
+            "Document evidence from linked or source files is supplemental: use it to fill gaps, but do not override clear page evidence unless the document is the source page itself.\n"
             "Existing extracted values are included in current_records; treat them as the starting record state and preserve any populated field unless the page evidence clearly supports a correction.\n"
             "Do not invent missing values. If a value is absent, use null, an empty array, or Unknown.\n"
             "Prefer exact wording for eligibility and requirements.\n"
@@ -1156,6 +1648,7 @@ class AIClassifier:
             "If the page is not a programme page, return {\"page_decision\": \"not_funding_program\", \"records\": [], \"notes\": [...]}.\n"
             "If the page is a sub-programme with its own name and terms, keep it as an independent programme record.\n"
             "Use the values already present under current_records as the baseline record state and only change them when the page evidence supports a better value.\n"
+            "Treat document evidence as supporting context; do not replace clear page facts unless the document is the page itself.\n"
             "Keep all extracted wording close to the source text.\n"
             "Return only JSON.\n\n"
             f"PAGE CONTENT:\n{prompt}"
@@ -1352,11 +1845,13 @@ class AIClassifier:
         return AIClassificationResponse.model_validate(payload)
 
     def _fallback_classify(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
+        document = self._prepare_document_context(document)
         page_decision, decision_reasons = _page_decision_hint(document)
         if page_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
             logger.info("fallback_rejected_non_program_page", page_url=document.page_url, reasons=decision_reasons)
             return []
         derived = _derive_page_evidence(document)
+        document_context = _document_evidence_context(document)
         title = document.title or document.page_title or ""
         title_candidate = strip_leading_numbered_prefix(title.split(" - ")[0].split(" | ")[0].strip() or "")
         heading_candidate = strip_leading_numbered_prefix(document.headings[0]) if document.headings else None
@@ -1366,7 +1861,8 @@ class AIClassifier:
         else:
             program_name = heading_candidate or title_candidate
         section_text = " ".join(section.content for section in document.structured_sections)
-        body = document.full_body_text or section_text
+        document_text = _document_evidence_text(document)
+        body = document.full_body_text or section_text or document_text
         source_domain = document.source_domain or extract_domain(document.page_url)
         funding_type = FundingType.UNKNOWN
         lowered = body.lower()
@@ -1379,16 +1875,16 @@ class AIClassifier:
         elif "guarantee" in lowered:
             funding_type = FundingType.GUARANTEE
 
-        combined_text = " ".join([title, body, section_text])
+        combined_text = " ".join([title, body, section_text, document_text])
         money_min, money_max, currency, _snippet, _confidence = extract_money_range(combined_text, default_currency=None)
         budget_total, budget_currency, _budget_snippet, _budget_confidence = extract_budget_total(combined_text)
         if not currency:
             currency = budget_currency
         deadline_info = parse_deadline_info(combined_text)
         eligibility_texts = list(derived["raw_eligibility_data"] or [])
-        funding_texts = list(derived["raw_funding_offer_data"] or [])
-        documents_texts = list(derived["raw_documents_data"] or [])
-        application_texts = list(derived["raw_application_data"] or [])
+        funding_texts = unique_preserve_order([*derived["raw_funding_offer_data"], *document_context["funding_lines"]])
+        documents_texts = unique_preserve_order([*derived["raw_documents_data"], *document_context["evidence_lines"]])
+        application_texts = unique_preserve_order([*derived["raw_application_data"], *document_context["application_lines"]])
         eligibility_profile = _derive_eligibility_profile(
             _combine_eligibility_text(document, eligibility_texts, funding_texts),
             industry_taxonomy=self.industry_taxonomy,
@@ -1400,11 +1896,14 @@ class AIClassifier:
 
         application_urls = [
             url
-            for url in unique_preserve_order([*document.application_links, *extract_urls(" ".join(application_texts))])
+            for url in unique_preserve_order(
+                [*document.application_links, *extract_urls(" ".join([*application_texts, document_context["combined_text"]]))]
+            )
             if any(term in url.lower() for term in ["apply", "application", "portal", "register"])
         ]
-        contact_emails = extract_emails(" ".join(application_texts) or combined_text)
-        contact_phones = extract_phone_numbers(" ".join(application_texts) or combined_text)
+        contact_source_text = " ".join([*application_texts, document_context["combined_text"]]) or combined_text
+        contact_emails = extract_emails(contact_source_text)
+        contact_phones = extract_phone_numbers(contact_source_text)
         geography_scope = GeographyScope.UNKNOWN
         if "national" in lowered:
             geography_scope = GeographyScope.NATIONAL
@@ -1421,6 +1920,16 @@ class AIClassifier:
         elif "apply" in lowered or "application" in lowered:
             application_channel = ApplicationChannel.MANUAL_CONTACT_FIRST
 
+        required_document_terms = ("document", "documents", "checklist", "certificate", "proof", "registration", "paperwork", "required")
+        required_document_sources = [*documents_texts, *document.document_links, *document_context["required_documents"]]
+        required_documents = unique_preserve_order(
+            [
+                clean_text(text)
+                for text in required_document_sources
+                if clean_text(text) and any(term in clean_text(text).lower() for term in required_document_terms)
+            ]
+        )
+
         page_type = classify_page_type(
             record_count=1,
             candidate_block_count=max(1, len(document.structured_sections) or len(document.headings) or 1),
@@ -1434,7 +1943,7 @@ class AIClassifier:
 
         record = FundingProgrammeRecord(
             program_name=program_name,
-            funder_name=(source_domain or "").replace(".", " ").title() or None,
+            funder_name=_infer_funder_name(document, {"source_domain": source_domain, "source_page_title": document.title}) or None,
             source_url=document.page_url,
             source_urls=[document.page_url],
             source_domain=source_domain,
@@ -1463,8 +1972,11 @@ class AIClassifier:
             ),
             deadline_date=deadline_info.get("deadline_date"),
             geography_scope=geography_scope,
-            related_documents=unique_preserve_order([*document.document_links]),
-            raw_text_snippets=derived["raw_text_snippets"],
+            related_documents=unique_preserve_order([*document.document_links, *document_context["urls"]]),
+            raw_text_snippets={
+                **derived["raw_text_snippets"],
+                "document_evidence": document_context["evidence_lines"],
+            },
             extraction_confidence=derived["extraction_confidence"],
             application_channel=application_channel,
             application_url=application_urls[0] if application_urls else None,
@@ -1484,14 +1996,13 @@ class AIClassifier:
             ownership_targets=eligibility_profile["ownership_targets"],
             entity_types_allowed=eligibility_profile["entity_types_allowed"],
             certifications_required=eligibility_profile["certifications_required"],
-            required_documents=unique_preserve_order(
+            required_documents=required_documents,
+            notes=unique_preserve_order(
                 [
-                    clean_text(re.split(r"(?i)\bapply\b.*", text)[0])
-                    for text in [*documents_texts, *document.document_links]
-                    if clean_text(re.split(r"(?i)\bapply\b.*", text)[0])
+                    *document_context["notes"],
+                    "Fallback classification used because no AI key was configured.",
                 ]
             ),
-            notes=["Fallback classification used because no AI key was configured."],
             ai_enriched=False,
         )
         return [FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))]
@@ -1499,6 +2010,7 @@ class AIClassifier:
     def classify_document(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
         if not document.page_url:
             return []
+        document = self._prepare_document_context(document)
         if not self.api_key:
             return self._fallback_classify(document)
 
@@ -1635,6 +2147,7 @@ class AIClassifier:
 
     def enrich_records(self, records: List[FundingProgrammeRecord], page_context: Any) -> List[FundingProgrammeRecord]:
         if isinstance(page_context, PageContentDocument):
+            page_context = self._prepare_document_context(page_context)
             if self.api_key:
                 record_snapshots = [
                     PageAIRecordSnapshot(

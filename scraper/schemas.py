@@ -21,6 +21,8 @@ from scraper.utils.text import (
     strip_leading_numbered_prefix,
     unique_preserve_order,
 )
+from scraper.utils.document_reader import document_type_label
+from scraper.utils.urls import is_probably_document_url
 
 
 APPROVED_PROVINCES = set(load_json_resource("provinces.json"))
@@ -164,11 +166,37 @@ class PageContentSection(BaseModel):
     content: str
 
 
+class DocumentEvidenceSnapshot(BaseModel):
+    """Compact evidence extracted from a linked or source document."""
+
+    document_url: str
+    document_kind: str
+    content_type: Optional[str] = None
+    source_method: str = "http"
+    summary: Optional[str] = None
+    key_points: List[str] = Field(default_factory=list)
+    extracted_text: Optional[str] = None
+    notes: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "DocumentEvidenceSnapshot":
+        self.document_url = clean_text(self.document_url)
+        self.document_kind = clean_text(self.document_kind) or document_type_label(self.document_url, self.content_type)
+        self.content_type = clean_text(self.content_type or "") or None
+        self.source_method = clean_text(self.source_method or "") or "http"
+        self.summary = clean_text(self.summary or "") or None
+        self.key_points = unique_preserve_order([clean_text(item) for item in self.key_points if clean_text(item)])
+        self.extracted_text = clean_text(self.extracted_text or "") or None
+        self.notes = unique_preserve_order([clean_text(item) for item in self.notes if clean_text(item)])
+        return self
+
+
 class PageContentDocument(BaseModel):
     """Raw, generic page content sent to the AI classifier."""
 
     page_url: str
     title: Optional[str] = None
+    source_content_type: Optional[str] = None
     headings: List[str] = Field(default_factory=list)
     full_body_text: str = ""
     structured_sections: List[PageContentSection] = Field(default_factory=list)
@@ -176,6 +204,7 @@ class PageContentDocument(BaseModel):
     internal_links: List[str] = Field(default_factory=list)
     application_links: List[str] = Field(default_factory=list)
     document_links: List[str] = Field(default_factory=list)
+    document_evidence: List[DocumentEvidenceSnapshot] = Field(default_factory=list)
     main_content_hint: Optional[str] = None
     source_domain: Optional[str] = None
     page_title: Optional[str] = None
@@ -186,6 +215,7 @@ class PageContentDocument(BaseModel):
         self.headings = unique_preserve_order([cleaned for cleaned in (clean_text(item) for item in self.headings) if cleaned])
         self.full_body_text = clean_text(self.full_body_text)
         self.title = clean_text(self.title) or None
+        self.source_content_type = clean_text(self.source_content_type or "") or None
         self.page_title = clean_text(self.page_title) or self.title
         self.structured_sections = [
             PageContentSection(
@@ -199,6 +229,7 @@ class PageContentDocument(BaseModel):
         self.internal_links = unique_preserve_order([clean_text(item) for item in self.internal_links if clean_text(item)])
         self.application_links = unique_preserve_order([clean_text(item) for item in self.application_links if clean_text(item)])
         self.document_links = unique_preserve_order([clean_text(item) for item in self.document_links if clean_text(item)])
+        self.document_evidence = [DocumentEvidenceSnapshot.model_validate(item) for item in self.document_evidence if item]
         self.main_content_hint = clean_text(self.main_content_hint or "") or None
         self.source_domain = clean_text(self.source_domain or "") or None
         return self
@@ -547,7 +578,23 @@ class PageFetchResult(BaseModel):
 
     @property
     def succeeded(self) -> bool:
-        return bool(self.status_code and 200 <= self.status_code < 400 and self.html)
+        if not self.status_code or not 200 <= self.status_code < 400:
+            return False
+        if self.html:
+            return True
+        lowered_content_type = (self.content_type or "").lower()
+        if lowered_content_type.startswith(
+            (
+                "image/",
+                "application/pdf",
+                "application/msword",
+                "application/vnd.ms-excel",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        ):
+            return True
+        return is_probably_document_url(self.url)
 
 
 class FundingProgrammeRecord(BaseModel):

@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup, Tag
 
 from scraper.schemas import SectionNode
 from scraper.utils.text import clean_text, split_lines, unique_preserve_order
-from scraper.utils.urls import canonicalize_url, is_internal_url, is_probably_document_url
+from scraper.utils.urls import canonicalize_url, document_link_matches_context, is_internal_url, is_probably_document_url
 
 
 PROGRAM_HEADING_HINTS = [
@@ -152,14 +152,21 @@ def _is_layout_noise(node: Tag) -> bool:
     return False
 
 
-def extract_document_links(soup: BeautifulSoup, base_url: str) -> List[str]:
+def extract_document_links(soup: BeautifulSoup, base_url: str, context_text: str = "") -> List[str]:
     documents: List[str] = []
     for anchor in soup.find_all("a", href=True):
-        if _has_noise_ancestor(anchor):
-            continue
         href = canonicalize_url(anchor["href"], base_url=base_url)
         label = clean_text(anchor.get_text(" ", strip=True)).lower()
-        if is_probably_document_url(href) or any(term in label for term in ["pdf", "application form", "download"]):
+        is_documentish = is_probably_document_url(href) or any(term in label for term in ["pdf", "application form", "download"])
+        if not is_documentish:
+            continue
+        if _has_noise_ancestor(anchor) and context_text and not document_link_matches_context(href, context_text=context_text, anchor_text=label):
+            continue
+        if context_text and not document_link_matches_context(href, context_text=context_text, anchor_text=label):
+            continue
+        if _has_noise_ancestor(anchor) and not context_text:
+            continue
+        if is_documentish:
             documents.append(href)
     return unique_preserve_order(documents)
 

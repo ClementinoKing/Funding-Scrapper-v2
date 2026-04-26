@@ -181,6 +181,7 @@ class GenericFundingParser:
                 page_url=page.canonical_url,
                 title=page.title,
                 page_title=page.title,
+                source_content_type=page.content_type,
                 source_domain=urlparse(page.canonical_url).netloc.lower(),
             )
 
@@ -196,6 +197,14 @@ class GenericFundingParser:
         structured_sections = _remove_duplicate_sections(_collect_sections(cleaned_root))
         full_body_text = _extract_text(cleaned_root)
         page_domain = urlparse(page.canonical_url).netloc.lower()
+        document_context_text = " ".join(
+            [
+                title or "",
+                page.title or "",
+                " ".join(headings[:8]),
+                page.canonical_url,
+            ]
+        )
 
         all_links = collect_anchor_candidates(soup, page.canonical_url)
         internal_links = [
@@ -210,7 +219,7 @@ class GenericFundingParser:
             relevant_keywords=self.settings.relevant_keywords,
             irrelevant_patterns=self.settings.irrelevant_url_patterns,
         )
-        document_links = extract_document_links(cleaned_root, page.canonical_url)
+        document_links = extract_document_links(cleaned_root, page.canonical_url, context_text=document_context_text)
         application_links = [
             link for link in extract_application_links(cleaned_root, page.canonical_url) if link not in document_links
         ]
@@ -222,6 +231,7 @@ class GenericFundingParser:
             page_url=page.canonical_url,
             title=title,
             page_title=title,
+            source_content_type=page.content_type,
             headings=headings,
             full_body_text=full_body_text,
             structured_sections=structured_sections,
