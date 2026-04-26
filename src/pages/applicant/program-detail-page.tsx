@@ -63,6 +63,12 @@ const getConfidenceTone = (value: number): string => {
   return "bg-rose-500";
 };
 
+const getAiEnrichmentLabel = (record?: FundingProgrammeRecord | null): string =>
+  record?.ai_enriched ? "AI enriched" : "Deterministic only";
+
+const getAiEnrichmentVariant = (record?: FundingProgrammeRecord | null): "success" | "secondary" =>
+  record?.ai_enriched ? "success" : "secondary";
+
 type ProgrammeEditDraft = {
   program_name: string;
   funder_name: string;
@@ -739,6 +745,9 @@ export function ProgramDetailPage() {
           <Badge variant={program.approvalStatus === "approved" ? "success" : program.approvalStatus === "pending" ? "warning" : "secondary"}>
             {program.approvalStatus}
           </Badge>
+          <Badge variant={getAiEnrichmentVariant(detailRecord)} className={detailRecord.ai_enriched ? "bg-emerald-500 text-white" : ""}>
+            {getAiEnrichmentLabel(detailRecord)}
+          </Badge>
           {isAdminRoute ? (
             <>
               <Button variant="outline" size="sm" onClick={() => setEditorOpen(true)}>
@@ -878,9 +887,29 @@ export function ProgramDetailPage() {
 
         <Card className="lg:col-span-2">
           <CardHeader>
-            <CardTitle>Traceability</CardTitle>
+            <div className="flex items-center justify-between gap-3">
+              <CardTitle>Traceability</CardTitle>
+              <Badge variant={getAiEnrichmentVariant(detailRecord)} className={detailRecord.ai_enriched ? "bg-emerald-500 text-white" : ""}>
+                {getAiEnrichmentLabel(detailRecord)}
+              </Badge>
+            </div>
           </CardHeader>
           <CardContent className="grid gap-4 md:grid-cols-2">
+            <DetailField
+              label="AI enrichment"
+              value={
+                <div className="space-y-2">
+                  <Badge variant={getAiEnrichmentVariant(detailRecord)} className={detailRecord.ai_enriched ? "bg-emerald-500 text-white" : ""}>
+                    {getAiEnrichmentLabel(detailRecord)}
+                  </Badge>
+                  <p className="text-xs text-muted-foreground">
+                    {detailRecord.ai_enriched
+                      ? "This record passed through the AI enhancement step before storage."
+                      : "This record was stored from deterministic scraping without AI enhancement."}
+                  </p>
+                </div>
+              }
+            />
             <DetailField label="Raw eligibility data" value={typeof detailRecord.raw_eligibility_data === "string" ? detailRecord.raw_eligibility_data : Array.isArray(detailRecord.raw_eligibility_data) ? detailRecord.raw_eligibility_data.join("\n") : "Not captured"} />
             <DetailField label="Notes" value={listOrFallback(detailRecord.notes)} />
             <DetailField label="Extraction confidence" value={<ConfidenceBreakdown values={detailRecord.extraction_confidence} />} />

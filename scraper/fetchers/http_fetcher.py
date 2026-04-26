@@ -14,7 +14,7 @@ from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait
 from scraper.config import ScraperSettings
 from scraper.schemas import PageFetchResult
 from scraper.utils.logging import get_logger
-from scraper.utils.pdf import extract_pdf_text
+from scraper.utils.document_reader import DOCUMENT_KIND_IMAGE, compact_document_text, extract_local_document_text, infer_document_kind
 from scraper.utils.urls import is_probably_document_url
 
 
@@ -92,25 +92,32 @@ class HttpFetcher:
                 with attempt:
                     response = self.client.get(url, headers=headers)
             assert response is not None
-            title_match = TITLE_RE.search(response.text or "")
-            title = " ".join(title_match.group(1).split()) if title_match else None
             content_type = response.headers.get("content-type")
             content_type_lower = (content_type or "").lower()
+            title = None
+            if content_type_lower.startswith(("text/html", "application/xhtml+xml", "text/xml")):
+                title_match = TITLE_RE.search(response.text or "")
+                title = " ".join(title_match.group(1).split()) if title_match else None
             html = response.text if content_type_lower.startswith(("text/html", "application/xhtml+xml", "text/xml")) else ""
-            if content_type_lower.startswith("application/pdf") or is_probably_document_url(url):
-                extracted_text = extract_pdf_text(response.content)
-                if extracted_text:
-                    html = extracted_text
+            document_kind = infer_document_kind(url, content_type)
+            if is_probably_document_url(url) or document_kind in {DOCUMENT_KIND_IMAGE, "pdf", "docx", "xlsx"}:
+                document_result = extract_local_document_text(response.content, url, content_type)
+                if document_result.text:
+                    html = compact_document_text(document_result.text, max_chars=12000)
+                elif document_result.kind == DOCUMENT_KIND_IMAGE:
+                    html = ""
                 elif not html:
                     html = ""
             notes = []
             if is_probably_document_url(url) or "pdf" in (content_type or "").lower():
                 notes.append("Fetched document-like URL.")
-            if content_type_lower.startswith("application/pdf"):
+            if document_kind == DOCUMENT_KIND_IMAGE:
+                notes.append("Image document detected; enhancement layer will read it with OpenAI.")
+            elif document_kind != "unsupported":
                 if html:
-                    notes.append("PDF text extracted.")
+                    notes.append(f"{document_kind.upper()} text extracted.")
                 else:
-                    notes.append("PDF text extraction yielded no readable text.")
+                    notes.append(f"{document_kind.upper()} text extraction yielded no readable text.")
             return PageFetchResult(
                 url=str(response.url),
                 requested_url=url,

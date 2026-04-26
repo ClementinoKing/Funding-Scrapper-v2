@@ -19,6 +19,7 @@ import { WebsiteDetailPage } from "@/pages/admin/website-detail-page";
 import { ScraperRunsPage } from "@/pages/admin/scraper-runs-page";
 import { ScrapeRunDetailPage } from "@/pages/admin/scrape-run-detail-page";
 import { MatchingRulesPage } from "@/pages/admin/matching-rules-page";
+import { AIRulesPage } from "@/pages/admin/ai-rules-page";
 import { InterventionsPage } from "@/pages/admin/interventions-page";
 import { ChangeLogPage } from "@/pages/admin/change-log-page";
 import { NotFoundPage } from "@/pages/not-found-page";
@@ -75,6 +76,7 @@ export const router = createBrowserRouter([
                 ]
               },
               { path: "/admin/matching-rules", element: <MatchingRulesPage /> },
+              { path: "/admin/ai-rules", element: <AIRulesPage /> },
               { path: "/admin/change-log", element: <ChangeLogPage /> },
               { path: "/admin/interventions", element: <InterventionsPage /> }
             ]

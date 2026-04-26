@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import posixpath
 from typing import Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urldefrag, urlparse, urlunparse
@@ -10,7 +11,42 @@ from scraper.utils.text import slugify
 
 
 TRACKING_PREFIXES = ("utm_", "fbclid", "gclid", "mc_", "mkt_")
-DOCUMENT_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
+DOCUMENT_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
+
+DOCUMENT_CONTEXT_MIN_SCORE = 8
+DOCUMENT_CONTEXT_STOPWORDS = {
+    "application",
+    "brochure",
+    "checklist",
+    "document",
+    "documents",
+    "download",
+    "form",
+    "forms",
+    "fund",
+    "funding",
+    "grant",
+    "guide",
+    "guideline",
+    "guidelines",
+    "investment",
+    "loan",
+    "media",
+    "offer",
+    "program",
+    "programme",
+    "project",
+    "services",
+    "support",
+}
+
+
+def _tokenize_url_text(text: str) -> List[str]:
+    return [
+        token
+        for token in re.split(r"[^a-z0-9]+", (text or "").lower())
+        if token and len(token) > 2
+    ]
 
 
 def canonicalize_url(url: str, base_url: Optional[str] = None) -> str:
@@ -45,6 +81,11 @@ def extract_domain(url: str) -> str:
     return parsed.netloc.lower().removeprefix("www.")
 
 
+def extract_host(url: str) -> str:
+    parsed = urlparse(url if "://" in url else "https://%s" % url)
+    return parsed.netloc.lower()
+
+
 def get_domain_slug(url_or_domain: str) -> str:
     domain = extract_domain(url_or_domain)
     return slugify(domain.replace(".", "-"), max_length=40)
@@ -53,10 +94,10 @@ def get_domain_slug(url_or_domain: str) -> str:
 def is_internal_url(url: str, allowed_domains: Sequence[str]) -> bool:
     if not allowed_domains:
         return True
-    domain = extract_domain(url)
+    host = extract_host(url)
     for allowed in allowed_domains:
-        normalized = extract_domain(allowed)
-        if domain == normalized or domain.endswith("." + normalized) or normalized.endswith("." + domain):
+        normalized = extract_host(allowed)
+        if host == normalized:
             return True
     return False
 
@@ -64,6 +105,37 @@ def is_internal_url(url: str, allowed_domains: Sequence[str]) -> bool:
 def is_probably_document_url(url: str) -> bool:
     lowered = url.lower()
     return any(lowered.endswith(extension) for extension in DOCUMENT_EXTENSIONS)
+
+
+def score_document_link_relevance(url: str, context_text: str = "", anchor_text: str = "") -> int:
+    """Score whether a document URL looks like it belongs to the current programme context."""
+    lowered_url = (url or "").lower()
+    lowered_anchor = (anchor_text or "").lower()
+    if not lowered_url:
+        return 0
+
+    score = 0
+    if is_probably_document_url(lowered_url):
+        score += 4
+
+    context_tokens = {token for token in _tokenize_url_text(context_text) if token not in DOCUMENT_CONTEXT_STOPWORDS}
+    anchor_tokens = {token for token in _tokenize_url_text(lowered_anchor) if token not in DOCUMENT_CONTEXT_STOPWORDS}
+    url_tokens = {token for token in _tokenize_url_text(urlparse(lowered_url).path) if token not in DOCUMENT_CONTEXT_STOPWORDS}
+    url_tokens.update(token for token in _tokenize_url_text(urlparse(lowered_url).query) if token not in DOCUMENT_CONTEXT_STOPWORDS)
+
+    overlap = (context_tokens & url_tokens) | (context_tokens & anchor_tokens)
+    score += len(overlap) * 4
+
+    if any(term in lowered_anchor for term in ("brochure", "checklist", "guidelines", "application form", "download")):
+        score += 2
+
+    return score
+
+
+def document_link_matches_context(url: str, context_text: str = "", anchor_text: str = "") -> bool:
+    if not context_text:
+        return is_probably_document_url(url)
+    return score_document_link_relevance(url, context_text=context_text, anchor_text=anchor_text) >= DOCUMENT_CONTEXT_MIN_SCORE
 
 
 def looks_irrelevant_url(url: str, irrelevant_patterns: Sequence[str]) -> bool:

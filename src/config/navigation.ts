@@ -21,6 +21,7 @@ export const navByRole: Record<Role, NavItem[]> = {
     { label: "Scraper Runs", path: "/admin/scraper-runs" },
     { label: "Change Log", path: "/admin/change-log" },
     { label: "Matching Rules", path: "/admin/matching-rules" },
+    { label: "AI Rules", path: "/admin/ai-rules" },
     { label: "Interventions", path: "/admin/interventions" }
   ]
 };

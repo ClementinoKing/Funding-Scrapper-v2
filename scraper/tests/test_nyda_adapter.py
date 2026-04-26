@@ -14,8 +14,10 @@ from scraper.utils.pdf import extract_pdf_text
 class FixtureFetcher:
     def __init__(self, pages):
         self.pages = pages
+        self.calls: list[str] = []
 
     def fetch(self, url: str) -> PageFetchResult:
+        self.calls.append(url)
         if url in self.pages:
             return self.pages[url]
         return PageFetchResult(
@@ -218,11 +220,12 @@ def test_generic_adapter_support_mode_can_be_driven_by_db_config(settings, monke
         },
     }
 
+    funding_only_fetcher = FixtureFetcher(pages)
     funding_only_pipeline = ScraperPipeline(
         settings=funding_only_settings,
         storage=LocalJsonStore(funding_only_settings.output_path),
         parser=GenericFundingParser(funding_only_settings),
-        http_fetcher=FixtureFetcher(pages),
+        http_fetcher=funding_only_fetcher,
         browser_fetcher=None,
     )
 
@@ -238,13 +241,15 @@ def test_generic_adapter_support_mode_can_be_driven_by_db_config(settings, monke
             )
         ]
     )
-    assert funding_only_summary.programmes_after_dedupe == 0
+    assert funding_only_summary.programmes_after_dedupe == 1
+    assert "https://erp.nyda.gov.za/register/mentorship" not in funding_only_fetcher.calls
 
+    support_fetcher = FixtureFetcher(pages)
     support_pipeline = ScraperPipeline(
         settings=support_settings,
         storage=LocalJsonStore(support_settings.output_path),
         parser=GenericFundingParser(support_settings),
-        http_fetcher=FixtureFetcher(pages),
+        http_fetcher=support_fetcher,
         browser_fetcher=None,
     )
 
@@ -261,6 +266,7 @@ def test_generic_adapter_support_mode_can_be_driven_by_db_config(settings, monke
         ]
     )
     assert support_summary.programmes_after_dedupe == 1
+    assert "https://erp.nyda.gov.za/register/mentorship" not in support_fetcher.calls
     payload = json.loads((support_settings.output_path / "normalized" / "funding_programmes.json").read_text(encoding="utf-8"))
     record = next(item for item in payload if item["program_name"] == "Mentorship Programme")
-    assert record["source_domain"] == "nyda.gov.za"
+    assert record["source_domain"].endswith("nyda.gov.za")

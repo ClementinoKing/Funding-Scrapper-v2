@@ -5,7 +5,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Protocol
 
-from scraper.schemas import CrawlState, CrawlTraceEntry, FundingProgrammeRecord, PageDebugPackage, PageFetchResult, RunSummary
+from scraper.schemas import (
+    CrawlState,
+    CrawlTraceEntry,
+    FundingProgrammeRecord,
+    PageContentDocument,
+    PageDebugPackage,
+    PageFetchResult,
+    RunSummary,
+)
 
 
 class StorageBackend(Protocol):
@@ -18,6 +26,9 @@ class StorageBackend(Protocol):
     def save_page_snapshot(self, page: PageFetchResult) -> Path:
         ...
 
+    def write_page_content_document(self, document: PageContentDocument) -> Path:
+        ...
+
     def write_page_debug_package(self, package: PageDebugPackage) -> Path:
         ...
 
@@ -25,6 +36,15 @@ class StorageBackend(Protocol):
         ...
 
     def append_extracted_record(self, record: FundingProgrammeRecord) -> None:
+        ...
+
+    def write_ai_input(self, document: PageContentDocument, payload: object) -> Path:
+        ...
+
+    def write_ai_output(self, document: PageContentDocument, payload: object) -> Path:
+        ...
+
+    def write_ai_error(self, document: PageContentDocument, payload: object) -> Path:
         ...
 
     def save_programmes(self, records: List[FundingProgrammeRecord]) -> Path:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
@@ -25,7 +25,7 @@ def _normalize_record_identity(record: FundingProgrammeRecord) -> FundingProgram
     return FundingProgrammeRecord.model_validate(normalized.model_dump(mode="python"))
 
 
-def _record_rank(record: FundingProgrammeRecord) -> Tuple[int, int, int, int, int, int]:
+def _record_rank(record: FundingProgrammeRecord) -> Tuple[int, int, int, int, int, int, int]:
     score, _reasons, blockers = score_programme_quality(record)
     program_name = clean_text(record.program_name or "")
     has_heading_like_title = looks_like_support_title(program_name) or program_name.endswith(":")
@@ -44,6 +44,7 @@ def _record_rank(record: FundingProgrammeRecord) -> Tuple[int, int, int, int, in
     )
     return (
         score,
+        1 if record.ai_enriched else 0,
         int(record.overall_confidence() * 100),
         supporting_signal_count,
         -len(blockers),
@@ -91,11 +92,58 @@ def _sanitize_records_for_upload(records: Any) -> Tuple[List[Dict[str, Any]], Di
     return payload, meta
 
 
+def _is_timeout_failure(exc: Exception) -> bool:
+    message = str(exc)
+    lowered = message.lower()
+    return "57014" in message or "statement timeout" in lowered or "canceling statement due to statement timeout" in lowered
+
+
+def _merge_upload_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not results:
+        return {}
+
+    merged: Dict[str, Any] = {}
+    numeric_keys = {
+        key
+        for result in results
+        for key, value in result.items()
+        if key != "_upload_meta" and isinstance(value, (int, float))
+    }
+
+    for key in numeric_keys:
+        merged[key] = sum(
+            result.get(key, 0)
+            for result in results
+            if isinstance(result.get(key, 0), (int, float))
+        )
+
+    for result in results:
+        for key, value in result.items():
+            if key == "_upload_meta":
+                continue
+            if key in numeric_keys:
+                continue
+            if key not in merged:
+                merged[key] = value
+            elif isinstance(merged[key], list) and isinstance(value, list):
+                merged[key].extend(item for item in value if item not in merged[key])
+
+    return merged
+
+
 class SupabaseUploader:
     """Push normalized scraper output into Supabase through an RPC function."""
 
-    def __init__(self, settings: SupabaseSettings) -> None:
+    def __init__(
+        self,
+        settings: SupabaseSettings,
+        *,
+        batch_size: int = 5,
+        client_factory: Callable[..., httpx.Client] = httpx.Client,
+    ) -> None:
         self.settings = settings
+        self.batch_size = max(1, int(batch_size))
+        self.client_factory = client_factory
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -105,30 +153,78 @@ class SupabaseUploader:
             "Prefer": "return=representation",
         }
 
-    def upload(self, records: Any, run_summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        prepared_records, upload_meta = _sanitize_records_for_upload(records)
+    def _post_batch(
+        self,
+        client: httpx.Client,
+        batch: List[Dict[str, Any]],
+        run_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         payload = {
-            "records": prepared_records,
+            "records": batch,
             "run_summary": run_summary or {},
         }
         url = "%s/rest/v1/rpc/%s" % (self.settings.url, self.settings.rpc_name)
-        with httpx.Client(timeout=60, follow_redirects=True) as client:
-            response = client.post(url, headers=self._headers(), json=payload)
+        response = client.post(url, headers=self._headers(), json=payload)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body = response.text.strip()
+            detail = body or "<empty response body>"
+            raise RuntimeError(
+                "Supabase RPC %s failed with HTTP %s. Response body: %s"
+                % (self.settings.rpc_name, response.status_code, detail)
+            ) from exc
+        if response.text.strip():
+            return response.json()
+        return {"status_code": response.status_code}
+
+    def _upload_prepared_batches(
+        self,
+        client: httpx.Client,
+        prepared_records: List[Dict[str, Any]],
+        run_summary: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not prepared_records:
+            return []
+        if len(prepared_records) <= self.batch_size:
             try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                body = response.text.strip()
-                detail = body or "<empty response body>"
-                raise RuntimeError(
-                    "Supabase RPC %s failed with HTTP %s. Response body: %s"
-                    % (self.settings.rpc_name, response.status_code, detail)
-                ) from exc
-            if response.text.strip():
-                result = response.json()
-            else:
-                result = {"status_code": response.status_code}
-            result["_upload_meta"] = upload_meta
-            return result
+                return [self._post_batch(client, prepared_records, run_summary)]
+            except RuntimeError as exc:
+                if len(prepared_records) > 1 and _is_timeout_failure(exc):
+                    midpoint = max(1, len(prepared_records) // 2)
+                    left = self._upload_prepared_batches(client, prepared_records[:midpoint], run_summary)
+                    right = self._upload_prepared_batches(client, prepared_records[midpoint:], run_summary)
+                    return left + right
+                raise
+
+        results: List[Dict[str, Any]] = []
+        for start in range(0, len(prepared_records), self.batch_size):
+            batch = prepared_records[start : start + self.batch_size]
+            try:
+                results.append(self._post_batch(client, batch, run_summary))
+            except RuntimeError as exc:
+                if len(batch) > 1 and _is_timeout_failure(exc):
+                    results.extend(self._upload_prepared_batches(client, batch, run_summary))
+                    continue
+                raise
+        return results
+
+    def upload(self, records: Any, run_summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        prepared_records, upload_meta = _sanitize_records_for_upload(records)
+        run_summary_payload = run_summary or {}
+        with self.client_factory(timeout=60, follow_redirects=True) as client:
+            batch_results = self._upload_prepared_batches(client, prepared_records, run_summary_payload)
+
+        result = _merge_upload_results(batch_results)
+        result["_upload_meta"] = {
+            **upload_meta,
+            "batch_size": self.batch_size,
+            "batch_count": len(batch_results),
+        }
+        result["batch_results"] = batch_results
+        if not result:
+            result = {"status_code": 200, "_upload_meta": upload_meta, "batch_results": batch_results}
+        return result
 
     def upload_from_files(self, normalized_json_path: Path, run_summary_path: Optional[Path] = None) -> Dict[str, Any]:
         records = json.loads(normalized_json_path.read_text(encoding="utf-8"))

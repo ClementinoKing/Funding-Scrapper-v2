@@ -71,6 +71,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_list(name: str, default: List[str]) -> List[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return list(default)
+    values = [item.strip() for item in raw.split("||") if item.strip()]
+    return values or list(default)
+
+
 def load_json_resource(filename: str) -> Any:
     path = RESOURCE_DIR / filename
     return json.loads(path.read_text(encoding="utf-8"))
@@ -86,6 +94,7 @@ class RuntimeOptions:
     headless: Optional[bool] = None
     browser_fallback: Optional[bool] = None
     respect_robots: Optional[bool] = None
+    ai_enrichment: Optional[bool] = None
 
 
 @dataclass
@@ -117,6 +126,23 @@ class ScraperSettings:
     ownership_target_keywords: Dict[str, List[str]] = field(default_factory=dict)
     entity_type_keywords: Dict[str, List[str]] = field(default_factory=dict)
     certification_keywords: Dict[str, List[str]] = field(default_factory=dict)
+    ai_enrichment: bool = False
+    ai_provider: str = "openai"
+    ai_model: Optional[str] = None
+    document_ai_max_documents_per_page: int = 4
+    document_ai_max_extracted_chars: int = 5000
+    document_ai_timeout_seconds: int = 45
+    document_ai_skip_content_types: List[str] = field(
+        default_factory=lambda: [
+            "application/zip",
+            "application/x-zip-compressed",
+            "application/x-rar-compressed",
+            "application/x-7z-compressed",
+            "application/octet-stream",
+            "application/x-msdownload",
+        ]
+    )
+    document_ai_skip_url_terms: List[str] = field(default_factory=lambda: [".zip", ".rar", ".7z", ".exe", ".bin", ".dll"])
 
     @classmethod
     def from_env(cls) -> "ScraperSettings":
@@ -153,6 +179,27 @@ class ScraperSettings:
             ownership_target_keywords=load_json_resource("ownership_target_keywords.json"),
             entity_type_keywords=load_json_resource("entity_type_keywords.json"),
             certification_keywords=load_json_resource("certification_keywords.json"),
+            ai_enrichment=_env_bool("SCRAPER_AI_ENRICHMENT", False),
+            ai_provider=os.getenv("AI_PROVIDER", "openai").strip() or "openai",
+            ai_model=os.getenv("SCRAPER_AI_MODEL", "").strip() or None,
+            document_ai_max_documents_per_page=_env_int("SCRAPER_DOCUMENT_AI_MAX_DOCUMENTS_PER_PAGE", 4),
+            document_ai_max_extracted_chars=_env_int("SCRAPER_DOCUMENT_AI_MAX_EXTRACTED_CHARS", 5000),
+            document_ai_timeout_seconds=_env_int("SCRAPER_DOCUMENT_AI_TIMEOUT_SECONDS", 45),
+            document_ai_skip_content_types=_env_list(
+                "SCRAPER_DOCUMENT_AI_SKIP_CONTENT_TYPES",
+                [
+                    "application/zip",
+                    "application/x-zip-compressed",
+                    "application/x-rar-compressed",
+                    "application/x-7z-compressed",
+                    "application/octet-stream",
+                    "application/x-msdownload",
+                ],
+            ),
+            document_ai_skip_url_terms=_env_list(
+                "SCRAPER_DOCUMENT_AI_SKIP_URL_TERMS",
+                [".zip", ".rar", ".7z", ".exe", ".bin", ".dll"],
+            ),
         )
 
     def with_overrides(self, options: RuntimeOptions) -> "ScraperSettings":
@@ -172,6 +219,7 @@ class ScraperSettings:
                 options.browser_fallback if options.browser_fallback is not None else self.browser_fallback
             ),
             respect_robots=options.respect_robots if options.respect_robots is not None else self.respect_robots,
+            ai_enrichment=options.ai_enrichment if options.ai_enrichment is not None else self.ai_enrichment,
             application_verification_timeout_seconds=self.application_verification_timeout_seconds,
             browser_wait_until=self.browser_wait_until,
             user_agents=list(self.user_agents),
@@ -184,6 +232,13 @@ class ScraperSettings:
             ownership_target_keywords=dict(self.ownership_target_keywords),
             entity_type_keywords=dict(self.entity_type_keywords),
             certification_keywords=dict(self.certification_keywords),
+            ai_provider=self.ai_provider,
+            ai_model=self.ai_model,
+            document_ai_max_documents_per_page=self.document_ai_max_documents_per_page,
+            document_ai_max_extracted_chars=self.document_ai_max_extracted_chars,
+            document_ai_timeout_seconds=self.document_ai_timeout_seconds,
+            document_ai_skip_content_types=list(self.document_ai_skip_content_types),
+            document_ai_skip_url_terms=list(self.document_ai_skip_url_terms),
         )
 
 

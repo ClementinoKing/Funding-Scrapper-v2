@@ -26,6 +26,18 @@ def test_extract_money_range_up_to() -> None:
     assert "up to" in snippet.lower()
 
 
+def test_extract_money_range_ignores_year_like_values() -> None:
+    minimum, maximum, currency, snippet, confidence = extract_money_range(
+        "Applications close in 2020.",
+        default_currency="ZAR",
+    )
+    assert minimum is None
+    assert maximum is None
+    assert currency is None
+    assert snippet is None
+    assert confidence == 0.0
+
+
 def test_extract_budget_total() -> None:
     amount, currency, snippet, confidence = extract_budget_total(
         "The programme budget totals ZAR 2 million for the 2026 intake.",
@@ -35,4 +47,3 @@ def test_extract_budget_total() -> None:
     assert currency == "ZAR"
     assert "budget" in snippet.lower()
     assert confidence > 0
-

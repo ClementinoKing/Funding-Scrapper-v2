@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 from urllib.parse import urlparse
 
 from scraper.schemas import FundingProgrammeRecord, PageFetchResult
-from scraper.utils.text import clean_text, unique_preserve_order
+from scraper.utils.text import clean_text, strip_leading_numbered_prefix, unique_preserve_order
 from scraper.utils.urls import extract_domain
 from scraper.parsers.normalization import classify_page_type
 
@@ -287,7 +287,7 @@ class SiteAdapter:
         # pass for cases where a support page still contains mixed-use content.
         if not self.should_promote_records(page_type):
             return False
-        if self.crawl_mode == "funding_only" and page_type == "application_support_page" and self.suppress_support_record_terms:
+        if self.crawl_mode == "funding_only" and page_type in {"application_support_page", "child"} and self.suppress_support_record_terms:
             combined = clean_text(
                 " ".join([record.program_name or "", record.source_page_title or "", " ".join(record.notes or [])])
             ).lower()
@@ -307,11 +307,13 @@ class SiteAdapter:
         # where site rows can clean up the output without a custom subclass.
         program_name = _apply_regex_patterns(record.program_name, self.program_name_strip_prefix_patterns)
         program_name = _apply_regex_patterns(program_name, self.program_name_strip_suffix_patterns)
+        program_name = strip_leading_numbered_prefix(program_name or "")
         if not program_name and page_title:
             program_name = _apply_regex_patterns(page_title, self.program_name_strip_prefix_patterns)
             program_name = _apply_regex_patterns(program_name, self.program_name_strip_suffix_patterns)
+            program_name = strip_leading_numbered_prefix(program_name or "")
         if not program_name and page_title:
-            program_name = clean_text(page_title)
+            program_name = strip_leading_numbered_prefix(page_title)
         parent_programme_name = _infer_parent_programme_name(
             record,
             page_type=page_type,
@@ -411,7 +413,7 @@ class SiteAdapter:
 
     def program_name_for_merge(self, program_name: Optional[str]) -> Optional[str]:
         # Dedupe works better when provider-specific aliases collapse to one name.
-        cleaned = clean_text(program_name or "")
+        cleaned = strip_leading_numbered_prefix(program_name or "")
         if not cleaned:
             return None
         merged = cleaned

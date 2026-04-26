@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, uuid5
-from typing import Dict, List, Optional, Tuple
 
 from rapidfuzz import fuzz
 
-from scraper.adapters.base import SiteAdapter
+from scraper.adapters.base import PARENT_HUB_SEGMENTS, PARENT_SUPPORT_SEGMENT_TERMS, SiteAdapter
 from scraper.schemas import FieldEvidence, FundingProgrammeRecord, FundingType, ProgrammeNature
-from scraper.utils.text import completeness_score, generate_program_id, slugify, unique_preserve_order
+from scraper.utils.text import clean_text, completeness_score, generate_program_id, slugify, strip_leading_numbered_prefix, unique_preserve_order
 from scraper.utils.urls import canonicalize_url
 
 
@@ -28,6 +29,90 @@ def _normalized_name(value: Optional[str], adapter: Optional[SiteAdapter] = None
 
 def _canonical_source_urls(record: FundingProgrammeRecord) -> List[str]:
     return unique_preserve_order([canonicalize_url(url) for url in record.source_urls if url])
+
+
+def _path_segments(url: str) -> List[str]:
+    return [segment for segment in urlparse(url).path.split("/") if segment]
+
+
+def _strip_support_suffix(segment: str) -> str:
+    cleaned = clean_text(segment or "").lower().replace("_", "-")
+    if not cleaned:
+        return ""
+    support_suffixes = {
+        "apply",
+        "application",
+        "applications",
+        "guidelines",
+        "eligibility",
+        "criteria",
+        "checklist",
+        "documents",
+        "required-documents",
+        "how-to-apply",
+        "application-form",
+        "overview",
+        "background",
+        "preamble",
+        "contact-details",
+        "disclaimer",
+        "other-conditions",
+        "adjudication-process",
+        "post-investment-monitoring",
+        "terms-and-structure",
+        "timing",
+        "deadline",
+        "terms",
+    }
+    for suffix in sorted(support_suffixes, key=len, reverse=True):
+        if cleaned == suffix:
+            return ""
+        if cleaned.endswith("-" + suffix):
+            return cleaned[: -(len(suffix) + 1)]
+    return cleaned
+
+
+def _leaf_base_slug(segment: str) -> str:
+    stripped = strip_leading_numbered_prefix(segment or "")
+    cleaned = clean_text(stripped).lower().replace("_", "-")
+    return _strip_support_suffix(cleaned)
+
+
+def _source_context_keys(record: FundingProgrammeRecord) -> Set[str]:
+    keys: Set[str] = set()
+    for url in _canonical_source_urls(record):
+        segments = [segment for segment in _path_segments(url) if segment]
+        if len(segments) < 3:
+            continue
+        parent_segment = clean_text(segments[-2]).lower().replace("_", "-")
+        leaf_segment = clean_text(segments[-1]).lower().replace("_", "-")
+        if not parent_segment or not leaf_segment:
+            continue
+        if parent_segment in PARENT_HUB_SEGMENTS:
+            continue
+        if any(term in leaf_segment for term in PARENT_SUPPORT_SEGMENT_TERMS):
+            keys.add(parent_segment)
+            continue
+        if _leaf_base_slug(leaf_segment):
+            keys.add(parent_segment)
+    return keys
+
+
+def _source_leaf_base_keys(record: FundingProgrammeRecord) -> Set[str]:
+    keys: Set[str] = set()
+    for url in _canonical_source_urls(record):
+        segments = [segment for segment in _path_segments(url) if segment]
+        if not segments:
+            continue
+        leaf_segment = segments[-1]
+        leaf_base = _leaf_base_slug(leaf_segment)
+        if leaf_base:
+            keys.add(leaf_base)
+    return keys
+
+
+def _normalized_parent_name(record: FundingProgrammeRecord, adapter: Optional[SiteAdapter] = None) -> str:
+    return _normalized_name(record.parent_programme_name, adapter=adapter, kind="program")
 
 
 def _record_completeness(record: FundingProgrammeRecord) -> int:
@@ -60,17 +145,51 @@ def _should_merge(
     right: FundingProgrammeRecord,
     fuzzy_threshold: int,
     adapter: Optional[SiteAdapter] = None,
+    merge_decider: Optional[Any] = None,
 ) -> bool:
+    left_sources = set(_canonical_source_urls(left))
+    right_sources = set(_canonical_source_urls(right))
+    if left_sources & right_sources:
+        return True
+
     left_program = _normalized_name(left.program_name, adapter=adapter, kind="program")
     right_program = _normalized_name(right.program_name, adapter=adapter, kind="program")
     left_funder = _normalized_name(left.funder_name, adapter=adapter, kind="funder")
     right_funder = _normalized_name(right.funder_name, adapter=adapter, kind="funder")
-    if left_program and right_program and left_funder and right_funder:
-        if left_program == right_program and left_funder == right_funder:
-            return True
 
     if left.source_domain != right.source_domain:
         return False
+
+    if (
+        merge_decider
+        and left_program
+        and right_program
+        and left_funder
+        and right_funder
+        and left_program == right_program
+        and left_funder == right_funder
+        and hasattr(merge_decider, "should_merge_records")
+    ):
+        ai_decision = merge_decider.should_merge_records(left, right)
+        if ai_decision is not None:
+            return bool(ai_decision)
+
+    left_parent = _normalized_parent_name(left, adapter=adapter)
+    right_parent = _normalized_parent_name(right, adapter=adapter)
+    if left_parent and right_parent and left_parent != right_parent:
+        return False
+
+    left_context_keys = _source_context_keys(left)
+    right_context_keys = _source_context_keys(right)
+    if left_context_keys and right_context_keys and not (left_context_keys & right_context_keys):
+        return False
+
+    if not (left_program and right_program and left_funder and right_funder):
+        return False
+    if left_program != right_program or left_funder != right_funder:
+        return False
+    if left_parent or right_parent:
+        return bool(left_parent) and bool(right_parent) and left_parent == right_parent
 
     if left_program and right_program:
         program_similarity = fuzz.token_sort_ratio(left_program, right_program)
@@ -207,6 +326,7 @@ def _dedupe_internal(
     records: List[FundingProgrammeRecord],
     fuzzy_threshold: int = 90,
     adapter: Optional[SiteAdapter] = None,
+    merge_decider: Optional[Any] = None,
 ) -> Tuple[List[FundingProgrammeRecord], List[Dict[str, object]]]:
     working = list(records)
     merged_records: List[FundingProgrammeRecord] = []
@@ -217,7 +337,13 @@ def _dedupe_internal(
         cluster = [base]
         remaining: List[FundingProgrammeRecord] = []
         for candidate in working:
-            if _should_merge(base, candidate, fuzzy_threshold=fuzzy_threshold, adapter=adapter):
+            if _should_merge(
+                base,
+                candidate,
+                fuzzy_threshold=fuzzy_threshold,
+                adapter=adapter,
+                merge_decider=merge_decider,
+            ):
                 cluster.append(candidate)
             else:
                 remaining.append(candidate)
@@ -242,8 +368,14 @@ def dedupe_records(
     records: List[FundingProgrammeRecord],
     fuzzy_threshold: int = 90,
     adapter: Optional[SiteAdapter] = None,
+    merge_decider: Optional[Any] = None,
 ) -> List[FundingProgrammeRecord]:
-    merged_records, _trace = _dedupe_internal(records, fuzzy_threshold=fuzzy_threshold, adapter=adapter)
+    merged_records, _trace = _dedupe_internal(
+        records,
+        fuzzy_threshold=fuzzy_threshold,
+        adapter=adapter,
+        merge_decider=merge_decider,
+    )
     return merged_records
 
 
@@ -251,5 +383,11 @@ def dedupe_records_with_trace(
     records: List[FundingProgrammeRecord],
     fuzzy_threshold: int = 90,
     adapter: Optional[SiteAdapter] = None,
+    merge_decider: Optional[Any] = None,
 ) -> Tuple[List[FundingProgrammeRecord], List[Dict[str, object]]]:
-    return _dedupe_internal(records, fuzzy_threshold=fuzzy_threshold, adapter=adapter)
+    return _dedupe_internal(
+        records,
+        fuzzy_threshold=fuzzy_threshold,
+        adapter=adapter,
+        merge_decider=merge_decider,
+    )

@@ -6,7 +6,15 @@ import json
 from pathlib import Path
 from typing import List
 
-from scraper.schemas import CrawlState, CrawlTraceEntry, FundingProgrammeRecord, PageDebugPackage, PageFetchResult, RunSummary
+from scraper.schemas import (
+    CrawlState,
+    CrawlTraceEntry,
+    FundingProgrammeRecord,
+    PageContentDocument,
+    PageDebugPackage,
+    PageFetchResult,
+    RunSummary,
+)
 from scraper.utils.text import slugify
 from scraper.utils.urls import get_domain_slug
 
@@ -18,6 +26,8 @@ class LocalJsonStore:
         self.output_root = output_root
         self.raw_dir = self.output_root / "raw"
         self.pages_dir = self.raw_dir / "pages"
+        self.content_dir = self.raw_dir / "content"
+        self.ai_dir = self.raw_dir / "ai"
         self.normalized_dir = self.output_root / "normalized"
         self.logs_dir = self.output_root / "logs"
         self.debug_dir = self.raw_dir / "debug"
@@ -32,6 +42,8 @@ class LocalJsonStore:
 
     def initialize_run(self, run_id: str) -> None:
         self.pages_dir.mkdir(parents=True, exist_ok=True)
+        self.content_dir.mkdir(parents=True, exist_ok=True)
+        self.ai_dir.mkdir(parents=True, exist_ok=True)
         self.debug_dir.mkdir(parents=True, exist_ok=True)
         self.normalized_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +77,13 @@ class LocalJsonStore:
         metadata_path.write_text(page.model_dump_json(indent=2), encoding="utf-8")
         return html_path
 
+    def write_page_content_document(self, document: PageContentDocument) -> Path:
+        basename = slugify(document.page_url, max_length=80)
+        path = self.content_dir / ("%s.json" % basename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(document.model_dump_json(indent=2), encoding="utf-8")
+        return path
+
     def write_page_debug_package(self, package: PageDebugPackage) -> Path:
         basename = slugify(package.final_url or package.page_url, max_length=80)
         path = self.debug_dir / ("%s.json" % basename)
@@ -76,6 +95,35 @@ class LocalJsonStore:
         with self.extracted_jsonl_path.open("a", encoding="utf-8") as handle:
             handle.write(record.model_dump_json())
             handle.write("\n")
+
+    def _write_ai_artifact(self, document: PageContentDocument, kind: str, payload: object) -> Path:
+        basename = slugify(document.page_url, max_length=80)
+        path = self.ai_dir / ("%s_%s.json" % (basename, kind))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(payload, str):
+            content = json.dumps({"page_url": document.page_url, kind: payload}, ensure_ascii=False, indent=2)
+        else:
+            content = json.dumps(
+                {
+                    "page_url": document.page_url,
+                    "kind": kind,
+                    "payload": payload,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        path.write_text(content + "\n", encoding="utf-8")
+        return path
+
+    def write_ai_input(self, document: PageContentDocument, payload: object) -> Path:
+        return self._write_ai_artifact(document, "input", payload)
+
+    def write_ai_output(self, document: PageContentDocument, payload: object) -> Path:
+        return self._write_ai_artifact(document, "output", payload)
+
+    def write_ai_error(self, document: PageContentDocument, payload: object) -> Path:
+        return self._write_ai_artifact(document, "error", payload)
 
     def append_crawl_trace(self, entry: CrawlTraceEntry) -> None:
         with self.crawl_trace_path.open("a", encoding="utf-8") as handle:
