@@ -202,6 +202,32 @@ export const mockNotificationEvents: NotificationEvent[] = [
 
 export const mockSystemChangeLog: SystemChangeLogEntry[] = [
   {
+    id: "chg_2026_04_26_document-aware-ai-readthrough",
+    title: "Document-aware AI now carries extracted evidence into funding records",
+    summary: "Linked PDFs, DOCX files, spreadsheets, and image documents now feed extracted evidence into the final programme record instead of stopping at the prompt stage.",
+    createdAt: "2026-04-26T09:15:00Z",
+    area: "scraper",
+    impact: "high",
+    highlights: [
+      "Document summaries now merge into raw_documents_data, required_documents, application_url, contact_email, and contact_phone",
+      "The AI reader now receives programme context so it stays tied to the correct funding page",
+      "The fallback path was hardened so extracted document evidence still appears when remote AI is unavailable"
+    ]
+  },
+  {
+    id: "chg_2026_04_26_nef-spaza-link-and-provider-fix",
+    title: "Spaza Shop pages now keep the right links and provider name",
+    summary: "The NEF Spaza Shop Support Fund now keeps its own brochure link instead of mixing in unrelated site-wide PDFs, and provider names are normalized from page context instead of raw domains.",
+    createdAt: "2026-04-26T09:00:00Z",
+    area: "scraper",
+    impact: "high",
+    highlights: [
+      "Context-aware document link scoring now filters unrelated same-domain PDFs out of the page",
+      "Program titles with a funder suffix now resolve to National Empowerment Fund instead of www.nefcorp.co.za",
+      "The crawler remains site-agnostic so the same rules can scale beyond NEF"
+    ]
+  },
+  {
     id: "chg_2026_04_24_ai-rules-console",
     title: "Admin sidebar now includes an AI Rules console",
     summary: "The admin sidebar now exposes a dedicated AI Rules workspace for managing prompt bundles, schema mappings, and future database-backed rule editing.",
