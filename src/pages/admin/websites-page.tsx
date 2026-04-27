@@ -393,7 +393,7 @@ export function WebsitesPage() {
               </DialogDescription>
             </DialogHeader>
 
-            <form className="space-y-4" onSubmit={handleCreateSubmit}>
+            <form id="website-create-form" className="space-y-4" onSubmit={handleCreateSubmit}>
               {createStep === 1 ? (
                 <div className="space-y-4">
                   <div className="grid gap-4 md:grid-cols-2">
@@ -641,32 +641,31 @@ export function WebsitesPage() {
                   </div>
                 </div>
               )}
-
-              <div className="flex flex-wrap items-center gap-3 pt-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    if (createStep === 1) {
-                      setCreateOpen(false);
-                      return;
-                    }
-                    setCreateStep(1);
-                  }}
-                >
-                  {createStep === 1 ? "Cancel" : "Back"}
-                </Button>
-                {createStep === 1 ? (
-                  <Button type="button" onClick={handleNextStep}>
-                    Next
-                  </Button>
-                ) : (
-                  <Button type="submit" disabled={createSiteMutation.isPending}>
-                    {createSiteMutation.isPending ? "Saving..." : "Save Website"}
-                  </Button>
-                )}
-              </div>
             </form>
+            <div className="flex flex-wrap items-center gap-3 pt-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  if (createStep === 1) {
+                    setCreateOpen(false);
+                    return;
+                  }
+                  setCreateStep(1);
+                }}
+              >
+                {createStep === 1 ? "Cancel" : "Back"}
+              </Button>
+              {createStep === 1 ? (
+                <Button type="button" onClick={handleNextStep}>
+                  Next
+                </Button>
+              ) : (
+                <Button type="submit" form="website-create-form" disabled={createSiteMutation.isPending}>
+                  {createSiteMutation.isPending ? "Saving..." : "Save Website"}
+                </Button>
+              )}
+            </div>
           </DialogContent>
         </Dialog>
       </div>

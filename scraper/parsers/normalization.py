@@ -10,7 +10,9 @@ from urllib.parse import urlparse
 from scraper.classifiers.funding_type import classify_funding_type
 from scraper.classifiers.geography import classify_geography
 from scraper.classifiers.industries import classify_industries
+from scraper.classifiers.eligibility import extract_eligibility_criteria
 from scraper.classifiers.ownership_targets import classify_ownership_targets
+from scraper.classifiers.repayment import extract_payback_details
 from scraper.classifiers.use_of_funds import classify_use_of_funds
 from scraper.config import ScraperSettings
 from scraper.parsers.extractor_rules import CandidateBlock, detect_archive_signals, find_section_values
@@ -73,7 +75,11 @@ INTEREST_PATTERNS = {
 REPAYMENT_PATTERNS = {
     RepaymentFrequency.MONTHLY: ["monthly instalments", "monthly installments", "monthly repayments", "repay monthly"],
     RepaymentFrequency.WEEKLY: ["weekly repayments", "repay weekly"],
-    RepaymentFrequency.VARIABLE: ["flexible schedule", "variable repayment", "case-by-case repayment"],
+    RepaymentFrequency.QUARTERLY: ["quarterly repayments", "repay quarterly", "every quarter"],
+    RepaymentFrequency.ANNUALLY: ["annual repayments", "annual instalments", "annually", "yearly", "per annum"],
+    RepaymentFrequency.ONCE_OFF: ["once-off", "once off", "bullet repayment", "balloon payment", "lump sum repayment"],
+    RepaymentFrequency.FLEXIBLE: ["flexible schedule", "variable repayment", "case-by-case repayment", "cash flow linked"],
+    RepaymentFrequency.VARIABLE: ["variable schedule", "tailored repayment", "negotiated repayment"],
 }
 
 APPLICATION_TEXT_PATTERNS = {
@@ -274,6 +280,34 @@ TERMS_SECTION_HINTS = (
     "collateral",
     "pricing",
     "tenor",
+    "loan term",
+    "payback",
+    "duration",
+    "moratorium",
+    "grace period",
+    "instalment",
+    "installment",
+)
+
+ELIGIBILITY_CRITERIA_SECTION_HINTS = (
+    "eligibility criteria",
+    "qualifying criteria",
+    "qualification criteria",
+    "who qualifies",
+    "who can apply",
+    "applicant requirements",
+    "funding requirements",
+    "minimum requirements",
+    "compliance requirements",
+    "mandatory requirements",
+    "requirements",
+    "criteria",
+    "conditions",
+    "terms and conditions",
+    "selection criteria",
+    "application criteria",
+    "funding criteria",
+    "investment criteria",
 )
 
 APPLICATION_SECTION_HINTS = (
@@ -517,6 +551,27 @@ def _extract_eligibility_items(block: CandidateBlock) -> List[str]:
         if len(items) >= 10:
             break
     return _split_section_items(items)
+
+
+def _extract_eligibility_criteria_items(block: CandidateBlock, eligibility_data: Sequence[str]) -> List[str]:
+    scoped_text = _scoped_section_text(block.section_map, ELIGIBILITY_CRITERIA_SECTION_HINTS)
+    source_text = clean_text(
+        " ".join(
+            unique_preserve_order(
+                [
+                    *block.section_bundle.eligibility,
+                    *find_section_values(block.section_map, "eligibility", block.section_aliases),
+                    scoped_text,
+                    *eligibility_data,
+                    block.text,
+                ]
+            )
+        )
+    )
+    criteria = extract_eligibility_criteria(source_text)
+    if not criteria and eligibility_data:
+        criteria = extract_eligibility_criteria(" ".join(eligibility_data))
+    return criteria
 
 
 def _extract_required_documents(block: CandidateBlock) -> List[str]:
@@ -1119,17 +1174,26 @@ def build_programme_record(
             method="deterministic_parser",
         )
 
-    payback_months_min, payback_months_max, payback_snippet, payback_confidence = _extract_month_range(
-        terms_text or combined_text,
-        ["repayment", "repayable", "loan term", "tenor", "repayment term"],
-    )
-    payback_months_min, payback_months_max, payback_swapped = _normalize_ordered_pair(payback_months_min, payback_months_max)
-    if payback_swapped:
-        notes.append("Payback range values were inverted in source text and were normalized.")
+    payback_details = extract_payback_details(terms_text or combined_text)
+    payback_months_min = payback_details.term_min_months
+    payback_months_max = payback_details.term_max_months
+    payback_snippet = payback_details.raw_text
+    payback_confidence = payback_details.confidence
+    if payback_months_min is None and payback_months_max is None:
+        payback_months_min, payback_months_max, payback_snippet_legacy, payback_confidence_legacy = _extract_month_range(
+            terms_text or combined_text,
+            ["repayment", "repayable", "loan term", "tenor", "repayment term", "payback", "moratorium", "grace period"],
+        )
+        payback_months_min, payback_months_max, payback_swapped = _normalize_ordered_pair(payback_months_min, payback_months_max)
+        if payback_swapped:
+            notes.append("Payback range values were inverted in source text and were normalized.")
+        if not payback_snippet:
+            payback_snippet = payback_snippet_legacy
+        payback_confidence = max(payback_confidence, payback_confidence_legacy)
     if payback_snippet:
         _add_evidence(
-            "payback_months",
-            {"min": payback_months_min, "max": payback_months_max},
+            "payback_raw_text",
+            payback_snippet,
             payback_snippet,
             payback_confidence,
             page_url,
@@ -1141,6 +1205,79 @@ def build_programme_record(
             source_scope=source_scope,
             method="deterministic_parser",
         )
+        _add_evidence(
+            "payback_term_min_months",
+            payback_months_min,
+            payback_snippet,
+            payback_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=payback_snippet,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="deterministic_parser",
+        )
+        _add_evidence(
+            "payback_term_max_months",
+            payback_months_max,
+            payback_snippet,
+            payback_confidence,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=payback_snippet,
+            source_section="terms_and_structure",
+            source_scope=source_scope,
+            method="deterministic_parser",
+        )
+        if payback_details.structure:
+            _add_evidence(
+                "payback_structure",
+                payback_details.structure,
+                payback_details.structure,
+                payback_confidence,
+                page_url,
+                evidence_store,
+                raw_text_snippets,
+                extraction_confidence,
+                raw_value=payback_details.structure,
+                source_section="terms_and_structure",
+                source_scope=source_scope,
+                method="regex_from_prose",
+            )
+        if payback_details.grace_period_months is not None:
+            _add_evidence(
+                "grace_period_months",
+                payback_details.grace_period_months,
+                payback_snippet,
+                payback_confidence,
+                page_url,
+                evidence_store,
+                raw_text_snippets,
+                extraction_confidence,
+                raw_value=payback_snippet,
+                source_section="terms_and_structure",
+                source_scope=source_scope,
+                method="regex_from_prose",
+            )
+        if payback_details.repayment_frequency != RepaymentFrequency.UNKNOWN:
+            _add_evidence(
+                "repayment_frequency",
+                payback_details.repayment_frequency.value,
+                payback_snippet,
+                payback_confidence,
+                page_url,
+                evidence_store,
+                raw_text_snippets,
+                extraction_confidence,
+                raw_value=payback_snippet,
+                source_section="terms_and_structure",
+                source_scope=source_scope,
+                method="regex_from_prose",
+            )
 
     raw_terms_data = _extract_raw_terms_data(block, combined_text)
     if raw_terms_data:
@@ -1213,7 +1350,7 @@ def build_programme_record(
     repayment_frequency, repayment_snippet, repayment_confidence = _classify_enum(
         terms_text or combined_text,
         REPAYMENT_PATTERNS,
-        RepaymentFrequency.UNKNOWN,
+        payback_details.repayment_frequency if payback_details.repayment_frequency != RepaymentFrequency.UNKNOWN else RepaymentFrequency.UNKNOWN,
     )
     if repayment_snippet:
         _add_evidence(
@@ -1246,6 +1383,22 @@ def build_programme_record(
             source_section="eligibility",
             source_scope=source_scope,
             method="direct_page_evidence",
+        )
+    raw_eligibility_criteria = _extract_eligibility_criteria_items(block, raw_eligibility_data or [])
+    if raw_eligibility_criteria:
+        _add_evidence(
+            "raw_eligibility_criteria",
+            raw_eligibility_criteria,
+            take_best_snippet(raw_eligibility_criteria),
+            0.88,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=raw_eligibility_criteria,
+            source_section="eligibility",
+            source_scope=source_scope,
+            method="deterministic_parser",
         )
 
     exclusions = _extract_exclusions(block)
@@ -1404,7 +1557,18 @@ def build_programme_record(
     if not industries and any(term in combined_text.lower() for term in ["sector", "industry", "focus areas"]):
         notes.append("Industry-specific wording detected but no taxonomy match was found.")
 
-    if not any([program_name, funding_lines, raw_eligibility_data, application_url, ticket_min, ticket_max, funding_type.value != "Unknown"]):
+    if not any(
+        [
+            program_name,
+            funding_lines,
+            raw_eligibility_data,
+            raw_eligibility_criteria,
+            application_url,
+            ticket_min,
+            ticket_max,
+            funding_type.value != "Unknown",
+        ]
+    ):
         support_programme_hint = any(
             term in combined_text.lower()
             for term in [
@@ -1448,6 +1612,7 @@ def build_programme_record(
         scraped_at=datetime.now(timezone.utc),
         last_scraped_at=datetime.now(timezone.utc),
         raw_eligibility_data=raw_eligibility_data or None,
+        raw_eligibility_criteria=raw_eligibility_criteria,
         raw_funding_offer_data=raw_funding_offer_data,
         raw_terms_data=raw_terms_data,
         raw_documents_data=raw_documents_data,
@@ -1487,8 +1652,14 @@ def build_programme_record(
         equity_required=equity_required,
         payback_months_min=payback_months_min,
         payback_months_max=payback_months_max,
+        payback_raw_text=payback_details.raw_text or payback_snippet,
+        payback_term_min_months=payback_details.term_min_months if payback_details.term_min_months is not None else payback_months_min,
+        payback_term_max_months=payback_details.term_max_months if payback_details.term_max_months is not None else payback_months_max,
+        payback_structure=payback_details.structure,
+        grace_period_months=payback_details.grace_period_months,
         interest_type=interest_type,
         repayment_frequency=repayment_frequency,
+        payback_confidence=payback_details.confidence or payback_confidence,
         exclusions=exclusions,
         required_documents=required_documents,
         application_channel=application_channel,

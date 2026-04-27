@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from scraper import __version__ as SCRAPER_VERSION
+from scraper.classifiers.eligibility import extract_eligibility_criteria
 from scraper.schemas import (
     CandidateBlockSnapshot,
     AIMergeDecisionResponse,
@@ -38,6 +39,7 @@ from scraper.schemas import (
     RepaymentFrequency,
     TriState,
 )
+from scraper.classifiers.repayment import extract_payback_details
 from scraper.utils.document_reader import compact_document_text, extract_local_document_text, infer_document_kind
 from scraper.utils.dates import parse_deadline_info
 from scraper.utils.money import extract_budget_total, extract_money_range, infer_default_currency
@@ -58,7 +60,7 @@ from scraper.utils.urls import canonicalize_url, document_link_matches_context, 
 
 logger = structlog.get_logger()
 
-PROMPT_KEYWORDS = ("fund", "eligibility", "criteria", "requirements", "investment", "loan")
+PROMPT_KEYWORDS = ("fund", "eligibility", "criteria", "requirements", "investment", "loan", "repayment", "payback", "tenor", "moratorium")
 MAX_SECTION_CHARS = 1800
 MAX_BODY_CHARS = 8000
 MAX_PROMPT_CHARS = 22000
@@ -297,6 +299,13 @@ def _coerce_enum(enum_cls, value: Any):
         RepaymentFrequency: {
             "weekly": RepaymentFrequency.WEEKLY,
             "monthly": RepaymentFrequency.MONTHLY,
+            "quarterly": RepaymentFrequency.QUARTERLY,
+            "annually": RepaymentFrequency.ANNUALLY,
+            "annual": RepaymentFrequency.ANNUALLY,
+            "once-off": RepaymentFrequency.ONCE_OFF,
+            "once off": RepaymentFrequency.ONCE_OFF,
+            "onceoff": RepaymentFrequency.ONCE_OFF,
+            "flexible": RepaymentFrequency.FLEXIBLE,
             "variable": RepaymentFrequency.VARIABLE,
             "unknown": RepaymentFrequency.UNKNOWN,
         },
@@ -423,7 +432,18 @@ def _compact_record_prompt_data(record_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _record_prompt_terms(record_data: Dict[str, Any]) -> List[str]:
     terms: List[str] = []
-    for field_name in ("program_name", "funder_name", "parent_programme_name", "source_page_title", "application_channel", "geography_scope"):
+    for field_name in (
+        "program_name",
+        "funder_name",
+        "parent_programme_name",
+        "source_page_title",
+        "application_channel",
+        "geography_scope",
+        "raw_eligibility_criteria",
+        "payback_raw_text",
+        "payback_structure",
+        "repayment_frequency",
+    ):
         value = record_data.get(field_name)
         if isinstance(value, str) and value.strip():
             terms.append(value.strip())
@@ -591,6 +611,31 @@ def _document_evidence_context(document: PageContentDocument) -> Dict[str, Any]:
     }
 
 
+def _payback_source_text(document: PageContentDocument, document_context: Dict[str, Any], derived: Dict[str, Any]) -> str:
+    parts: List[str] = [
+        document.title or "",
+        document.page_title or "",
+        document.full_body_text or "",
+        document_context.get("combined_text") or "",
+        " ".join(derived.get("raw_terms_data") or []),
+        " ".join(derived.get("raw_funding_offer_data") or []),
+        " ".join(derived.get("raw_application_data") or []),
+    ]
+    return " ".join(unique_preserve_order([clean_text(part) for part in parts if clean_text(part)]))
+
+
+def _eligibility_source_text(document: PageContentDocument, document_context: Dict[str, Any], derived: Dict[str, Any]) -> str:
+    parts: List[str] = [
+        document.title or "",
+        document.page_title or "",
+        document.full_body_text or "",
+        document_context.get("combined_text") or "",
+        " ".join(derived.get("raw_eligibility_data") or []),
+        " ".join(derived.get("raw_terms_data") or []),
+    ]
+    return " ".join(unique_preserve_order([clean_text(part) for part in parts if clean_text(part)]))
+
+
 def _looks_like_funder_name(candidate: str) -> bool:
     text = clean_text(candidate or "")
     if not text:
@@ -745,8 +790,42 @@ def _derive_page_evidence(document: PageContentDocument) -> Dict[str, Any]:
     )
     eligibility = _collect_section_snippets(
         document,
-        heading_terms=("eligibility", "criteria", "requirements", "who qualifies", "qualifies"),
-        body_terms=("eligibility", "criteria", "requirement", "qualify", "ownership", "stage"),
+        heading_terms=(
+            "eligibility",
+            "eligibility criteria",
+            "qualifying criteria",
+            "qualification criteria",
+            "who qualifies",
+            "who can apply",
+            "applicant requirements",
+            "funding requirements",
+            "minimum requirements",
+            "compliance requirements",
+            "mandatory requirements",
+            "requirements",
+            "criteria",
+            "conditions",
+            "terms and conditions",
+            "selection criteria",
+            "application criteria",
+            "funding criteria",
+            "investment criteria",
+        ),
+        body_terms=(
+            "eligibility",
+            "criteria",
+            "requirement",
+            "qualify",
+            "ownership",
+            "stage",
+            "compliance",
+            "condition",
+            "mandatory",
+            "selection",
+            "application criteria",
+            "funding criteria",
+            "investment criteria",
+        ),
     )
     terms = unique_preserve_order(
         [
@@ -791,6 +870,7 @@ def _derive_page_evidence(document: PageContentDocument) -> Dict[str, Any]:
             confidence[key] = min(0.95, 0.55 + min(len(values), 4) * 0.08)
     return {
         "raw_eligibility_data": eligibility or None,
+        "raw_eligibility_criteria": extract_eligibility_criteria(" ".join(eligibility)),
         "raw_funding_offer_data": funding_offer or [],
         "raw_terms_data": terms or [],
         "raw_documents_data": documents or [],
@@ -978,6 +1058,10 @@ def _normalize_draft(
         entity_type_keywords=entity_type_keywords,
         certification_keywords=certification_keywords,
     )
+    eligibility_criteria = extract_eligibility_criteria(
+        _eligibility_source_text(document, document_context, derived)
+    )
+    payback_profile = extract_payback_details(_payback_source_text(document, document_context, derived))
     payload["source_url"] = document.page_url
     payload["source_urls"] = [document.page_url]
     payload["source_page_title"] = _coerce_optional_text(payload.get("source_page_title")) or document.title
@@ -1003,6 +1087,7 @@ def _normalize_draft(
         [*base_funding_lines, *document_context["funding_lines"]]
     )
     payload["raw_eligibility_data"] = ai_eligibility_items or derived["raw_eligibility_data"]
+    payload["raw_eligibility_criteria"] = _coerce_list(payload.get("raw_eligibility_criteria")) or eligibility_criteria
     payload["provinces"] = _coerce_list(payload.get("provinces"))
     payload["municipalities"] = _coerce_list(payload.get("municipalities"))
     payload["postal_code_ranges"] = _coerce_list(payload.get("postal_code_ranges"))
@@ -1034,6 +1119,30 @@ def _normalize_draft(
     payload["employee_max"] = _coerce_int(payload.get("employee_max")) or eligibility_profile["employee_max"]
     payload["payback_months_min"] = _coerce_int(payload.get("payback_months_min"))
     payload["payback_months_max"] = _coerce_int(payload.get("payback_months_max"))
+    payload["payback_raw_text"] = _coerce_optional_text(payload.get("payback_raw_text")) or payback_profile.raw_text
+    payload["payback_term_min_months"] = _coerce_int(payload.get("payback_term_min_months"))
+    payload["payback_term_max_months"] = _coerce_int(payload.get("payback_term_max_months"))
+    if payload["payback_term_min_months"] is None:
+        payload["payback_term_min_months"] = payback_profile.term_min_months
+    if payload["payback_term_max_months"] is None:
+        payload["payback_term_max_months"] = payback_profile.term_max_months
+    if payload["payback_months_min"] is None:
+        payload["payback_months_min"] = payload["payback_term_min_months"]
+    if payload["payback_months_max"] is None:
+        payload["payback_months_max"] = payload["payback_term_max_months"]
+    payload["payback_structure"] = _coerce_optional_text(payload.get("payback_structure")) or payback_profile.structure
+    payload["grace_period_months"] = _coerce_int(payload.get("grace_period_months"))
+    if payload["grace_period_months"] is None:
+        payload["grace_period_months"] = payback_profile.grace_period_months
+    payload["payback_confidence"] = max(
+        payback_profile.confidence,
+        float(payload.get("payback_confidence") or 0.0),
+    )
+    payload["repayment_frequency"] = (
+        _coerce_enum(RepaymentFrequency, payload.get("repayment_frequency"))
+        or payback_profile.repayment_frequency
+        or RepaymentFrequency.UNKNOWN
+    ).value
     payload["application_url"] = _coerce_optional_text(payload.get("application_url"))
     payload["contact_email"] = _coerce_optional_text(payload.get("contact_email"))
     payload["contact_phone"] = _coerce_optional_text(payload.get("contact_phone"))
@@ -1050,6 +1159,9 @@ def _normalize_draft(
         for key, value in {
             **derived["raw_text_snippets"],
             **dict(payload.get("raw_text_snippets") or {}),
+            "raw_eligibility_criteria": payload.get("raw_eligibility_criteria") or [],
+            "payback_raw_text": [payload["payback_raw_text"]] if payload.get("payback_raw_text") else [],
+            "payback_structure": [payload["payback_structure"]] if payload.get("payback_structure") else [],
             "document_evidence": document_context["evidence_lines"],
         }.items()
     }
@@ -1058,6 +1170,16 @@ def _normalize_draft(
         for key, value in {**derived["extraction_confidence"], **dict(payload.get("extraction_confidence") or {})}.items()
         if value is not None
     }
+    if payload.get("payback_confidence") is not None:
+        payload["extraction_confidence"]["payback_confidence"] = max(
+            payload["extraction_confidence"].get("payback_confidence", 0.0),
+            float(payload["payback_confidence"]),
+        )
+    if payload.get("raw_eligibility_criteria"):
+        payload["extraction_confidence"]["raw_eligibility_criteria"] = max(
+            payload["extraction_confidence"].get("raw_eligibility_criteria", 0.0),
+            0.88,
+        )
     payload["approval_status"] = (
         _coerce_text(payload.get("approval_status")).casefold() if payload.get("approval_status") else ApprovalStatus.PENDING.value
     )
@@ -1124,6 +1246,10 @@ def _draft_to_record(
         entity_type_keywords=entity_type_keywords,
         certification_keywords=certification_keywords,
     )
+    eligibility_criteria = extract_eligibility_criteria(
+        _eligibility_source_text(document, document_context, derived)
+    )
+    payback_profile = extract_payback_details(_payback_source_text(document, document_context, derived))
     source_url = document.page_url
     source_domain = payload.get("source_domain") or extract_domain(source_url)
     funding_type = _coerce_enum(FundingType, payload.get("funding_type")) or FundingType.UNKNOWN
@@ -1137,6 +1263,7 @@ def _draft_to_record(
     approval_status = _coerce_enum(ApprovalStatus, payload.get("approval_status")) or ApprovalStatus.PENDING
 
     raw_eligibility_data = ai_eligibility_items or eligibility_profile["raw_eligibility_data"] or derived["raw_eligibility_data"]
+    raw_eligibility_criteria = _coerce_list(payload.get("raw_eligibility_criteria")) or eligibility_criteria
     base_funding_lines = _coerce_list(payload.get("funding_lines")) or list(derived["raw_funding_offer_data"])
     funding_lines = unique_preserve_order([*base_funding_lines, *document_context["funding_lines"]])
     provinces = _coerce_list(payload.get("provinces"))
@@ -1170,6 +1297,23 @@ def _draft_to_record(
     employee_max = _coerce_int(payload.get("employee_max")) or eligibility_profile["employee_max"]
     payback_months_min = _coerce_int(payload.get("payback_months_min"))
     payback_months_max = _coerce_int(payload.get("payback_months_max"))
+    payback_raw_text = _coerce_optional_text(payload.get("payback_raw_text")) or payback_profile.raw_text
+    payback_term_min_months = _coerce_int(payload.get("payback_term_min_months"))
+    payback_term_max_months = _coerce_int(payload.get("payback_term_max_months"))
+    if payback_term_min_months is None:
+        payback_term_min_months = payback_profile.term_min_months
+    if payback_term_max_months is None:
+        payback_term_max_months = payback_profile.term_max_months
+    if payback_months_min is None:
+        payback_months_min = payback_term_min_months
+    if payback_months_max is None:
+        payback_months_max = payback_term_max_months
+    payback_structure = _coerce_optional_text(payload.get("payback_structure")) or payback_profile.structure
+    grace_period_months = _coerce_int(payload.get("grace_period_months"))
+    if grace_period_months is None:
+        grace_period_months = payback_profile.grace_period_months
+    payback_confidence = max(payback_profile.confidence, float(payload.get("payback_confidence") or 0.0))
+    repayment_frequency = _coerce_enum(RepaymentFrequency, payload.get("repayment_frequency")) or payback_profile.repayment_frequency or RepaymentFrequency.UNKNOWN
     currency = _coerce_text(payload.get("currency")) or None
     if not currency:
         currency = infer_default_currency(
@@ -1203,6 +1347,9 @@ def _draft_to_record(
         for key, value in {
             **derived["raw_text_snippets"],
             **dict(payload.get("raw_text_snippets") or {}),
+            "raw_eligibility_criteria": raw_eligibility_criteria,
+            "payback_raw_text": [payback_raw_text] if payback_raw_text else [],
+            "payback_structure": [payback_structure] if payback_structure else [],
             "document_evidence": document_context["evidence_lines"],
         }.items()
     }
@@ -1231,6 +1378,16 @@ def _draft_to_record(
         for key, value in {**derived["extraction_confidence"], **dict(payload.get("extraction_confidence") or {})}.items()
         if value is not None
     }
+    if payback_confidence is not None:
+        extraction_confidence["payback_confidence"] = max(
+            extraction_confidence.get("payback_confidence", 0.0),
+            float(payback_confidence),
+        )
+    if raw_eligibility_criteria:
+        extraction_confidence["raw_eligibility_criteria"] = max(
+            extraction_confidence.get("raw_eligibility_criteria", 0.0),
+            0.88,
+        )
     if not extraction_confidence and _coerce_text(payload.get("program_name")):
         extraction_confidence["program_name"] = 0.65
 
@@ -1247,6 +1404,7 @@ def _draft_to_record(
         updated_at=now,
         last_scraped_at=now,
         raw_eligibility_data=raw_eligibility_data,
+        raw_eligibility_criteria=raw_eligibility_criteria,
         raw_funding_offer_data=unique_preserve_order([*derived["raw_funding_offer_data"], *document_context["funding_lines"]]),
         raw_terms_data=unique_preserve_order([*derived["raw_terms_data"], *document_context["eligibility_lines"]]),
         raw_documents_data=unique_preserve_order([*derived["raw_documents_data"], *document_context["evidence_lines"]]),
@@ -1283,8 +1441,14 @@ def _draft_to_record(
         equity_required=equity_required,
         payback_months_min=payback_months_min,
         payback_months_max=payback_months_max,
+        payback_raw_text=payback_raw_text,
+        payback_term_min_months=payback_term_min_months,
+        payback_term_max_months=payback_term_max_months,
+        payback_structure=payback_structure,
+        grace_period_months=grace_period_months,
         interest_type=interest_type,
         repayment_frequency=repayment_frequency,
+        payback_confidence=payback_confidence,
         exclusions=exclusions,
         required_documents=required_documents,
         application_channel=application_channel,
@@ -1616,6 +1780,9 @@ class AIClassifier:
             "Existing extracted values are included in current_records; treat them as the starting record state and preserve any populated field unless the page evidence clearly supports a correction.\n"
             "Do not invent missing values. If a value is absent, use null, an empty array, or Unknown.\n"
             "Prefer exact wording for eligibility and requirements.\n"
+            "Scan repayment wording carefully. Look for repayment, repay, repayable, pay back, payback, loan term, tenor, tenure, duration, period, months, years, instalments, installments, moratorium, grace period, deferred payment, repayment holiday, bullet repayment, monthly repayments, and quarterly repayments.\n"
+            "Preserve the original repayment wording in payback_raw_text, convert years to months where possible, keep payback_term_min_months and payback_term_max_months aligned with the wording, and summarize the structure in payback_structure.\n"
+            "If the page says up to a term, keep only payback_term_max_months. If it says between two periods, capture both bounds. If no repayment information is present, return null payback fields, repayment_frequency as Unknown, and payback_confidence as 0.\n"
             "Normalize money values to plain numbers.\n"
             "First decide whether the page is a real funding programme page.\n"
             "If the page is not a programme page, set page_decision to not_funding_program and return records as an empty array.\n"
@@ -1623,14 +1790,15 @@ class AIClassifier:
             "Use funding_program only when the page is clearly a programme page with substantive funding, eligibility, or application evidence.\n"
             "A child or sub-programme is still a real programme record if it has its own distinct name, rules, or funding terms.\n"
             "Do not collapse sibling programmes just because they share a parent fund or similar numbered naming.\n"
-            "When raw_eligibility_data is present, extract it into industries, use_of_funds, business_stage_eligibility, turnover_min/max, years_in_business_min/max, employee_min/max, ownership_targets, entity_types_allowed, and certifications_required whenever supported.\n"
+            "When raw_eligibility_data or raw_eligibility_criteria is present, extract it into industries, use_of_funds, business_stage_eligibility, turnover_min/max, years_in_business_min/max, employee_min/max, ownership_targets, entity_types_allowed, and certifications_required whenever supported.\n"
             "Prefer short list values for those fields and do not leave them blank if the eligibility text clearly supports them.\n"
+            "Always capture eligibility statements as a clean list in raw_eligibility_criteria, using headings such as Eligibility Criteria, Qualifying Criteria, Who can apply, Applicant Requirements, Funding Requirements, Minimum Requirements, Compliance Requirements, Mandatory Requirements, Requirements, Criteria, Conditions, Terms and Conditions, Selection Criteria, Application Criteria, Funding Criteria, and Investment Criteria.\n"
             "If the page is ambiguous, use unclear and keep records empty unless the page clearly supports a programme record.\n"
             "Return an object with keys: page_decision, page_decision_confidence, records, and notes.\n"
             "records must be an array of 0 or more programme objects.\n"
             "Set source_url and source_urls to the current page URL only unless the page clearly references another canonical source page.\n"
             "Each programme object may contain only funding-programme fields and must omit technical DB fields such as program_id, id, created_at, updated_at, scraped_at, source_domain, parser_version, approval_status, and ai_enriched.\n"
-            "Allowed business fields include program_name, funder_name, source_url, source_urls, source_page_title, raw_eligibility_data, raw_funding_offer_data, raw_terms_data, raw_documents_data, raw_application_data, funding_type, funding_lines, ticket_min, ticket_max, currency, program_budget_total, deadline_type, deadline_date, funding_speed_days_min, funding_speed_days_max, geography_scope, provinces, municipalities, postal_code_ranges, industries, use_of_funds, business_stage_eligibility, turnover_min, turnover_max, years_in_business_min, years_in_business_max, employee_min, employee_max, ownership_targets, entity_types_allowed, certifications_required, security_required, equity_required, payback_months_min, payback_months_max, interest_type, repayment_frequency, exclusions, required_documents, application_channel, application_url, contact_email, contact_phone, raw_text_snippets, extraction_confidence, related_documents, notes, status, country_code, and parent_programme_name."
+            "Allowed business fields include program_name, funder_name, source_url, source_urls, source_page_title, raw_eligibility_data, raw_eligibility_criteria, raw_funding_offer_data, raw_terms_data, raw_documents_data, raw_application_data, funding_type, funding_lines, ticket_min, ticket_max, currency, program_budget_total, deadline_type, deadline_date, funding_speed_days_min, funding_speed_days_max, geography_scope, provinces, municipalities, postal_code_ranges, industries, use_of_funds, business_stage_eligibility, turnover_min, turnover_max, years_in_business_min, years_in_business_max, employee_min, employee_max, ownership_targets, entity_types_allowed, certifications_required, security_required, equity_required, payback_months_min, payback_months_max, payback_raw_text, payback_term_min_months, payback_term_max_months, payback_structure, grace_period_months, payback_confidence, interest_type, repayment_frequency, exclusions, required_documents, application_channel, application_url, contact_email, contact_phone, raw_text_snippets, extraction_confidence, related_documents, notes, status, country_code, and parent_programme_name."
         )
 
     def _build_user_prompt(
@@ -1707,10 +1875,17 @@ class AIClassifier:
             "funding_type": record.funding_type.value if hasattr(record.funding_type, "value") else record.funding_type,
             "funding_lines": list(record.funding_lines),
             "raw_eligibility_data": list(record.raw_eligibility_data or []),
+            "raw_eligibility_criteria": list(record.raw_eligibility_criteria),
             "raw_funding_offer_data": list(record.raw_funding_offer_data),
             "raw_terms_data": list(record.raw_terms_data),
             "raw_documents_data": list(record.raw_documents_data),
             "raw_application_data": list(record.raw_application_data),
+            "payback_raw_text": record.payback_raw_text,
+            "payback_term_min_months": record.payback_term_min_months,
+            "payback_term_max_months": record.payback_term_max_months,
+            "payback_structure": record.payback_structure,
+            "grace_period_months": record.grace_period_months,
+            "payback_confidence": record.payback_confidence,
             "application_url": record.application_url,
             "contact_email": record.contact_email,
             "contact_phone": record.contact_phone,
@@ -1893,6 +2068,9 @@ class AIClassifier:
             entity_type_keywords=self.entity_type_keywords,
             certification_keywords=self.certification_keywords,
         )
+        eligibility_criteria = extract_eligibility_criteria(
+            _eligibility_source_text(document, document_context, derived)
+        )
 
         application_urls = [
             url
@@ -1954,6 +2132,7 @@ class AIClassifier:
             last_scraped_at=datetime.now(timezone.utc),
             funding_type=funding_type,
             raw_eligibility_data=eligibility_texts or eligibility_profile["raw_eligibility_data"] or None,
+            raw_eligibility_criteria=eligibility_criteria,
             raw_funding_offer_data=funding_texts,
             raw_terms_data=unique_preserve_order([*eligibility_texts, *funding_texts]),
             raw_documents_data=documents_texts,
@@ -1975,9 +2154,13 @@ class AIClassifier:
             related_documents=unique_preserve_order([*document.document_links, *document_context["urls"]]),
             raw_text_snippets={
                 **derived["raw_text_snippets"],
+                "raw_eligibility_criteria": eligibility_criteria,
                 "document_evidence": document_context["evidence_lines"],
             },
-            extraction_confidence=derived["extraction_confidence"],
+            extraction_confidence={
+                **derived["extraction_confidence"],
+                **({"raw_eligibility_criteria": 0.88} if eligibility_criteria else {}),
+            },
             application_channel=application_channel,
             application_url=application_urls[0] if application_urls else None,
             contact_email=contact_emails[0] if contact_emails else None,

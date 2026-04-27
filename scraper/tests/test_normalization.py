@@ -117,6 +117,74 @@ def test_build_programme_record_falls_back_to_body_text_for_ticket_range_when_fu
     assert record.currency == "ZAR"
 
 
+def test_build_programme_record_extracts_payback_terms(settings) -> None:
+    block = CandidateBlock(
+        heading="Growth Loan",
+        text=(
+            "Loan term of up to 5 years. A 3 month grace period applies and the facility is repaid in monthly instalments."
+        ),
+        source_url="https://example.org/programmes/growth-loan",
+    )
+    record, _evidence = build_programme_record(
+        block=block,
+        page_url="https://example.org/programmes/growth-loan",
+        page_title="Growth Loan - Example Funder",
+        settings=settings,
+    )
+
+    assert record is not None
+    assert record.payback_raw_text is not None
+    assert "5 years" in record.payback_raw_text
+    assert record.payback_months_min is None
+    assert record.payback_months_max == 60
+    assert record.payback_term_min_months is None
+    assert record.payback_term_max_months == 60
+    assert record.payback_structure == "monthly instalments"
+    assert record.grace_period_months == 3
+    assert record.repayment_frequency.value == "Monthly"
+    assert record.payback_confidence > 0
+
+
+def test_build_programme_record_extracts_clean_eligibility_criteria(settings) -> None:
+    block = CandidateBlock(
+        heading="Growth Loan",
+        text=(
+            "Eligibility Criteria: The business must be majority black-owned; the applicant must submit a completed application form. "
+            "The enterprise must demonstrate commercial viability and sustainability. "
+            "Loan term of up to 60 months. Contact us on email."
+        ),
+        source_url="https://example.org/programmes/growth-loan",
+        section_map={
+            "Eligibility Criteria": [
+                "The business must be majority black-owned; the applicant must submit a completed application form.",
+                "The enterprise must demonstrate commercial viability and sustainability.",
+            ],
+            "Compliance Requirements": [
+                "The applicant must provide valid registration documents and tax clearance.",
+            ],
+            "Terms and Conditions": [
+                "Loan term of up to 60 months.",
+                "Contact us on email.",
+            ],
+        },
+    )
+    record, _evidence = build_programme_record(
+        block=block,
+        page_url="https://example.org/programmes/growth-loan",
+        page_title="Growth Loan - Example Funder",
+        settings=settings,
+    )
+
+    assert record is not None
+    assert record.raw_eligibility_criteria == [
+        "The business must be majority black-owned",
+        "the applicant must submit a completed application form.",
+        "The enterprise must demonstrate commercial viability and sustainability.",
+        "The applicant must provide valid registration documents and tax clearance.",
+    ]
+    assert "Loan term of up to 60 months" not in " ".join(record.raw_eligibility_criteria)
+
+
 def test_extract_application_links_ignores_document_downloads() -> None:
     soup = BeautifulSoup(
         """

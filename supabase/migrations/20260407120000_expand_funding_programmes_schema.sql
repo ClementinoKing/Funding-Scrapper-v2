@@ -55,6 +55,7 @@ alter table public.funding_programmes
   add column if not exists country_code text,
   add column if not exists status text,
   add column if not exists raw_funding_offer_data jsonb,
+  add column if not exists raw_eligibility_criteria jsonb default '[]'::jsonb,
   add column if not exists raw_terms_data jsonb,
   add column if not exists raw_documents_data jsonb,
   add column if not exists raw_application_data jsonb,
@@ -65,7 +66,13 @@ alter table public.funding_programmes
   add column if not exists validation_errors jsonb,
   add column if not exists last_scraped_at timestamptz,
   add column if not exists last_verified_at date,
-  add column if not exists deleted_at timestamptz;
+  add column if not exists deleted_at timestamptz,
+  add column if not exists payback_raw_text text,
+  add column if not exists payback_term_min_months integer,
+  add column if not exists payback_term_max_months integer,
+  add column if not exists payback_structure text,
+  add column if not exists grace_period_months integer,
+  add column if not exists payback_confidence numeric;
 
 alter table public.final_funding_programmes
   add column if not exists id uuid,
@@ -74,6 +81,7 @@ alter table public.final_funding_programmes
   add column if not exists country_code text,
   add column if not exists status text,
   add column if not exists raw_funding_offer_data jsonb,
+  add column if not exists raw_eligibility_criteria jsonb default '[]'::jsonb,
   add column if not exists raw_terms_data jsonb,
   add column if not exists raw_documents_data jsonb,
   add column if not exists raw_application_data jsonb,
@@ -84,7 +92,40 @@ alter table public.final_funding_programmes
   add column if not exists validation_errors jsonb,
   add column if not exists last_scraped_at timestamptz,
   add column if not exists last_verified_at date,
-  add column if not exists deleted_at timestamptz;
+  add column if not exists deleted_at timestamptz,
+  add column if not exists payback_raw_text text,
+  add column if not exists payback_term_min_months integer,
+  add column if not exists payback_term_max_months integer,
+  add column if not exists payback_structure text,
+  add column if not exists grace_period_months integer,
+  add column if not exists payback_confidence numeric;
+
+do $$
+declare
+  constraint_rec record;
+begin
+  for constraint_rec in
+    select c.conrelid::regclass as table_name, c.conname
+    from pg_constraint c
+    join pg_class rel on rel.oid = c.conrelid
+    join pg_namespace nsp on nsp.oid = rel.relnamespace
+    where nsp.nspname = 'public'
+      and rel.relname in ('funding_programmes', 'final_funding_programmes')
+      and c.contype = 'c'
+      and pg_get_constraintdef(c.oid) ilike '%repayment_frequency%'
+  loop
+    execute format('alter table %s drop constraint if exists %I', constraint_rec.table_name, constraint_rec.conname);
+  end loop;
+end
+$$;
+
+alter table public.funding_programmes
+  add constraint funding_programmes_repayment_frequency_check
+  check (repayment_frequency in ('Weekly', 'Monthly', 'Quarterly', 'Annually', 'Once-off', 'Flexible', 'Variable', 'Unknown'));
+
+alter table public.final_funding_programmes
+  add constraint final_funding_programmes_repayment_frequency_check
+  check (repayment_frequency in ('Weekly', 'Monthly', 'Quarterly', 'Annually', 'Once-off', 'Flexible', 'Variable', 'Unknown'));
 
 create or replace function public.sync_final_funding_programme()
 returns trigger
@@ -113,6 +154,7 @@ begin
       source_page_title,
       scraped_at,
       raw_eligibility_data,
+      raw_eligibility_criteria,
       funding_type,
       funding_lines,
       ticket_min,
@@ -143,6 +185,12 @@ begin
       equity_required,
       payback_months_min,
       payback_months_max,
+      payback_raw_text,
+      payback_term_min_months,
+      payback_term_max_months,
+      payback_structure,
+      grace_period_months,
+      payback_confidence,
       interest_type,
       repayment_frequency,
       exclusions,
@@ -192,6 +240,7 @@ begin
       new.source_page_title,
       new.scraped_at,
       new.raw_eligibility_data,
+      new.raw_eligibility_criteria,
       new.funding_type,
       new.funding_lines,
       new.ticket_min,
@@ -222,6 +271,12 @@ begin
       new.equity_required,
       new.payback_months_min,
       new.payback_months_max,
+      new.payback_raw_text,
+      new.payback_term_min_months,
+      new.payback_term_max_months,
+      new.payback_structure,
+      new.grace_period_months,
+      new.payback_confidence,
       new.interest_type,
       new.repayment_frequency,
       new.exclusions,
@@ -278,6 +333,30 @@ set
     raw_funding_offer_data,
     case when funding_lines <> '[]'::jsonb then funding_lines else null end
   ),
+  raw_eligibility_criteria = coalesce(
+    raw_eligibility_criteria,
+    raw_text_snippets->'raw_eligibility_criteria',
+    raw_eligibility_data
+  ),
+  payback_raw_text = coalesce(
+    payback_raw_text,
+    nullif((raw_text_snippets->'payback_raw_text'->>0), ''),
+    nullif((raw_text_snippets->'payback_months'->>0), '')
+  ),
+  payback_term_min_months = coalesce(payback_term_min_months, payback_months_min),
+  payback_term_max_months = coalesce(payback_term_max_months, payback_months_max),
+  payback_structure = coalesce(
+    payback_structure,
+    nullif((raw_text_snippets->'payback_structure'->>0), '')
+  ),
+  grace_period_months = coalesce(
+    grace_period_months,
+    nullif((raw_text_snippets->'grace_period_months'->>0), '')::integer
+  ),
+  payback_confidence = coalesce(
+    payback_confidence,
+    nullif((extraction_confidence->>'payback_confidence'), '')::numeric
+  ),
   raw_terms_data = coalesce(
     raw_terms_data,
     case
@@ -285,6 +364,12 @@ set
         or equity_required <> 'Unknown'
         or payback_months_min is not null
         or payback_months_max is not null
+        or payback_raw_text is not null
+        or payback_term_min_months is not null
+        or payback_term_max_months is not null
+        or payback_structure is not null
+        or grace_period_months is not null
+        or payback_confidence is not null
         or interest_type <> 'Unknown'
         or repayment_frequency <> 'Unknown'
       then jsonb_strip_nulls(
@@ -293,8 +378,14 @@ set
           'equity_required', nullif(equity_required, 'Unknown'),
           'payback_months_min', payback_months_min,
           'payback_months_max', payback_months_max,
+          'payback_raw_text', payback_raw_text,
+          'payback_term_min_months', payback_term_min_months,
+          'payback_term_max_months', payback_term_max_months,
+          'payback_structure', payback_structure,
+          'grace_period_months', grace_period_months,
           'interest_type', nullif(interest_type, 'Unknown'),
-          'repayment_frequency', nullif(repayment_frequency, 'Unknown')
+          'repayment_frequency', nullif(repayment_frequency, 'Unknown'),
+          'payback_confidence', payback_confidence
         )
       )
       else null
@@ -365,6 +456,30 @@ set
     raw_funding_offer_data,
     case when funding_lines <> '[]'::jsonb then funding_lines else null end
   ),
+  payback_raw_text = coalesce(
+    payback_raw_text,
+    nullif((raw_text_snippets->'payback_raw_text'->>0), ''),
+    nullif((raw_text_snippets->'payback_months'->>0), '')
+  ),
+  payback_term_min_months = coalesce(payback_term_min_months, payback_months_min),
+  payback_term_max_months = coalesce(payback_term_max_months, payback_months_max),
+  payback_structure = coalesce(
+    payback_structure,
+    nullif((raw_text_snippets->'payback_structure'->>0), '')
+  ),
+  grace_period_months = coalesce(
+    grace_period_months,
+    nullif((raw_text_snippets->'grace_period_months'->>0), '')::integer
+  ),
+  payback_confidence = coalesce(
+    payback_confidence,
+    nullif((extraction_confidence->>'payback_confidence'), '')::numeric
+  ),
+  raw_eligibility_criteria = coalesce(
+    raw_eligibility_criteria,
+    raw_text_snippets->'raw_eligibility_criteria',
+    raw_eligibility_data
+  ),
   raw_terms_data = coalesce(
     raw_terms_data,
     case
@@ -372,6 +487,12 @@ set
         or equity_required <> 'Unknown'
         or payback_months_min is not null
         or payback_months_max is not null
+        or payback_raw_text is not null
+        or payback_term_min_months is not null
+        or payback_term_max_months is not null
+        or payback_structure is not null
+        or grace_period_months is not null
+        or payback_confidence is not null
         or interest_type <> 'Unknown'
         or repayment_frequency <> 'Unknown'
       then jsonb_strip_nulls(
@@ -380,8 +501,14 @@ set
           'equity_required', nullif(equity_required, 'Unknown'),
           'payback_months_min', payback_months_min,
           'payback_months_max', payback_months_max,
+          'payback_raw_text', payback_raw_text,
+          'payback_term_min_months', payback_term_min_months,
+          'payback_term_max_months', payback_term_max_months,
+          'payback_structure', payback_structure,
+          'grace_period_months', grace_period_months,
           'interest_type', nullif(interest_type, 'Unknown'),
-          'repayment_frequency', nullif(repayment_frequency, 'Unknown')
+          'repayment_frequency', nullif(repayment_frequency, 'Unknown'),
+          'payback_confidence', payback_confidence
         )
       )
       else null
@@ -562,6 +689,7 @@ begin
       last_scraped_at,
       last_verified_at,
       raw_eligibility_data,
+      raw_eligibility_criteria,
       raw_funding_offer_data,
       raw_terms_data,
       raw_documents_data,
@@ -637,6 +765,11 @@ begin
       nullif(rec->>'last_verified_at', '')::date,
       case when rec ? 'raw_eligibility_data' then rec->'raw_eligibility_data' else null end,
       case
+        when rec ? 'raw_eligibility_criteria' then rec->'raw_eligibility_criteria'
+        when rec ? 'raw_eligibility_data' then rec->'raw_eligibility_data'
+        else null
+      end,
+      case
         when rec ? 'raw_funding_offer_data' then rec->'raw_funding_offer_data'
         when coalesce(rec->'funding_lines', '[]'::jsonb) <> '[]'::jsonb then rec->'funding_lines'
         else null
@@ -688,6 +821,12 @@ begin
       coalesce(nullif(rec->>'equity_required', ''), 'Unknown'),
       nullif(rec->>'payback_months_min', '')::integer,
       nullif(rec->>'payback_months_max', '')::integer,
+      nullif(rec->>'payback_raw_text', ''),
+      nullif(rec->>'payback_term_min_months', '')::integer,
+      nullif(rec->>'payback_term_max_months', '')::integer,
+      nullif(rec->>'payback_structure', ''),
+      nullif(rec->>'grace_period_months', '')::integer,
+      nullif(rec->>'payback_confidence', '')::numeric,
       coalesce(nullif(rec->>'interest_type', ''), 'Unknown'),
       coalesce(nullif(rec->>'repayment_frequency', ''), 'Unknown'),
       coalesce(rec->'exclusions', '[]'::jsonb),
@@ -727,6 +866,7 @@ begin
       last_scraped_at = excluded.last_scraped_at,
       last_verified_at = excluded.last_verified_at,
       raw_eligibility_data = excluded.raw_eligibility_data,
+      raw_eligibility_criteria = excluded.raw_eligibility_criteria,
       raw_funding_offer_data = excluded.raw_funding_offer_data,
       raw_terms_data = excluded.raw_terms_data,
       raw_documents_data = excluded.raw_documents_data,
@@ -761,6 +901,12 @@ begin
       equity_required = excluded.equity_required,
       payback_months_min = excluded.payback_months_min,
       payback_months_max = excluded.payback_months_max,
+      payback_raw_text = excluded.payback_raw_text,
+      payback_term_min_months = excluded.payback_term_min_months,
+      payback_term_max_months = excluded.payback_term_max_months,
+      payback_structure = excluded.payback_structure,
+      grace_period_months = excluded.grace_period_months,
+      payback_confidence = excluded.payback_confidence,
       interest_type = excluded.interest_type,
       repayment_frequency = excluded.repayment_frequency,
       exclusions = excluded.exclusions,

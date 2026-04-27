@@ -72,6 +72,10 @@ class InterestType(str, Enum):
 class RepaymentFrequency(str, Enum):
     WEEKLY = "Weekly"
     MONTHLY = "Monthly"
+    QUARTERLY = "Quarterly"
+    ANNUALLY = "Annually"
+    ONCE_OFF = "Once-off"
+    FLEXIBLE = "Flexible"
     VARIABLE = "Variable"
     UNKNOWN = "Unknown"
 
@@ -331,6 +335,7 @@ class AIProgrammeDraft(BaseModel):
     source_urls: List[str] = Field(default_factory=list)
     source_page_title: Optional[str] = None
     raw_eligibility_data: Optional[List[str]] = None
+    raw_eligibility_criteria: List[str] = Field(default_factory=list)
     raw_funding_offer_data: List[str] = Field(default_factory=list)
     raw_terms_data: List[str] = Field(default_factory=list)
     raw_documents_data: List[str] = Field(default_factory=list)
@@ -365,8 +370,14 @@ class AIProgrammeDraft(BaseModel):
     equity_required: Optional[str] = None
     payback_months_min: Optional[int] = None
     payback_months_max: Optional[int] = None
+    payback_raw_text: Optional[str] = None
+    payback_term_min_months: Optional[int] = None
+    payback_term_max_months: Optional[int] = None
+    payback_structure: Optional[str] = None
+    grace_period_months: Optional[int] = None
     interest_type: Optional[str] = None
     repayment_frequency: Optional[str] = None
+    payback_confidence: Optional[float] = None
     exclusions: List[str] = Field(default_factory=list)
     required_documents: List[str] = Field(default_factory=list)
     application_channel: Optional[str] = None
@@ -387,6 +398,7 @@ class AIProgrammeDraft(BaseModel):
     @field_validator(
         "source_urls",
         "raw_funding_offer_data",
+        "raw_eligibility_criteria",
         "raw_terms_data",
         "raw_documents_data",
         "raw_application_data",
@@ -419,6 +431,48 @@ class AIProgrammeDraft(BaseModel):
             if text:
                 cleaned.append(text)
         return unique_preserve_order(cleaned)
+
+    @field_validator(
+        "payback_raw_text",
+        "payback_structure",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_optional_text_fields(cls, value: Any) -> Optional[str]:
+        text = clean_text(str(value)) if value is not None else ""
+        return text or None
+
+    @field_validator(
+        "payback_months_min",
+        "payback_months_max",
+        "payback_term_min_months",
+        "payback_term_max_months",
+        "grace_period_months",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_optional_int_fields(cls, value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        try:
+            return int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("payback_confidence", mode="before")
+    @classmethod
+    def _normalize_payback_confidence(cls, value: Any) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, min(confidence, 1.0))
 
     @field_validator("funding_lines", mode="before")
     @classmethod
@@ -454,6 +508,24 @@ class AIProgrammeDraft(BaseModel):
                 if text:
                     cleaned.append(text)
         return unique_preserve_order(cleaned) or None
+
+    @field_validator("raw_eligibility_criteria", mode="before")
+    @classmethod
+    def _normalize_raw_eligibility_criteria(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        cleaned: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            fragments = sentence_chunks(str(item)) or split_lines(str(item))
+            for fragment in fragments:
+                text = clean_text(str(fragment))
+                if text:
+                    cleaned.append(text)
+        return unique_preserve_order(cleaned)
 
     @field_validator("raw_text_snippets", "extraction_confidence", mode="before")
     @classmethod
@@ -626,6 +698,7 @@ class FundingProgrammeRecord(BaseModel):
     last_scraped_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_verified_at: Optional[date] = None
     raw_eligibility_data: Optional[List[str]] = None
+    raw_eligibility_criteria: List[str] = Field(default_factory=list)
     raw_funding_offer_data: List[str] = Field(default_factory=list)
     raw_terms_data: List[str] = Field(default_factory=list)
     raw_documents_data: List[str] = Field(default_factory=list)
@@ -668,8 +741,14 @@ class FundingProgrammeRecord(BaseModel):
     equity_required: TriState = TriState.UNKNOWN
     payback_months_min: Optional[int] = None
     payback_months_max: Optional[int] = None
+    payback_raw_text: Optional[str] = None
+    payback_term_min_months: Optional[int] = None
+    payback_term_max_months: Optional[int] = None
+    payback_structure: Optional[str] = None
+    grace_period_months: Optional[int] = None
     interest_type: InterestType = InterestType.UNKNOWN
     repayment_frequency: RepaymentFrequency = RepaymentFrequency.UNKNOWN
+    payback_confidence: float = 0.0
 
     exclusions: List[str] = Field(default_factory=list)
     required_documents: List[str] = Field(default_factory=list)
@@ -698,6 +777,7 @@ class FundingProgrammeRecord(BaseModel):
         "industries",
         "use_of_funds",
         "business_stage_eligibility",
+        "raw_eligibility_criteria",
         "ownership_targets",
         "entity_types_allowed",
         "certifications_required",
@@ -726,6 +806,48 @@ class FundingProgrammeRecord(BaseModel):
             if text:
                 cleaned.append(text)
         return unique_preserve_order(cleaned)
+
+    @field_validator(
+        "payback_raw_text",
+        "payback_structure",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_optional_text_fields(cls, value: Any) -> Optional[str]:
+        text = clean_text(str(value)) if value is not None else ""
+        return text or None
+
+    @field_validator(
+        "payback_months_min",
+        "payback_months_max",
+        "payback_term_min_months",
+        "payback_term_max_months",
+        "grace_period_months",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_optional_int_fields(cls, value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        try:
+            return int(float(str(value).strip()))
+        except (TypeError, ValueError):
+            return None
+
+    @field_validator("payback_confidence", mode="before")
+    @classmethod
+    def _normalize_payback_confidence(cls, value: Any) -> float:
+        if value is None or value == "":
+            return 0.0
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(confidence, 1.0))
 
     @field_validator("funding_lines", mode="before")
     @classmethod
@@ -772,6 +894,24 @@ class FundingProgrammeRecord(BaseModel):
                     cleaned.append(text)
         cleaned = unique_preserve_order(cleaned)
         return cleaned or None
+
+    @field_validator("raw_eligibility_criteria", mode="before")
+    @classmethod
+    def _normalize_raw_eligibility_criteria(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        cleaned: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            fragments = sentence_chunks(str(item)) or split_lines(str(item))
+            for fragment in fragments:
+                text = clean_text(str(fragment))
+                if text:
+                    cleaned.append(text)
+        return unique_preserve_order(cleaned)
 
     @field_validator("field_evidence", mode="before")
     @classmethod
@@ -908,11 +1048,29 @@ class FundingProgrammeRecord(BaseModel):
     def _validate_ranges(self) -> "FundingProgrammeRecord":
         self.program_name = strip_leading_numbered_prefix(self.program_name or "") or self.program_name
         self.parent_programme_name = strip_leading_numbered_prefix(self.parent_programme_name or "") or self.parent_programme_name
+        if self.payback_term_min_months is None and self.payback_months_min is not None:
+            self.payback_term_min_months = self.payback_months_min
+        if self.payback_term_max_months is None and self.payback_months_max is not None:
+            self.payback_term_max_months = self.payback_months_max
+        if self.payback_months_min is None and self.payback_term_min_months is not None:
+            self.payback_months_min = self.payback_term_min_months
+        if self.payback_months_max is None and self.payback_term_max_months is not None:
+            self.payback_months_max = self.payback_term_max_months
         self.ticket_min, self.ticket_max = self._normalize_order(self.ticket_min, self.ticket_max)
         self.payback_months_min, self.payback_months_max = self._normalize_order(
             self.payback_months_min,
             self.payback_months_max,
         )
+        self.payback_term_min_months, self.payback_term_max_months = self._normalize_order(
+            self.payback_term_min_months,
+            self.payback_term_max_months,
+        )
+        if self.payback_raw_text and not self.raw_text_snippets.get("payback_raw_text"):
+            self.raw_text_snippets["payback_raw_text"] = [self.payback_raw_text]
+        if self.payback_structure and not self.raw_text_snippets.get("payback_structure"):
+            self.raw_text_snippets["payback_structure"] = [self.payback_structure]
+        if self.raw_eligibility_criteria and not self.raw_text_snippets.get("raw_eligibility_criteria"):
+            self.raw_text_snippets["raw_eligibility_criteria"] = list(self.raw_eligibility_criteria)
         self.years_in_business_min, self.years_in_business_max = self._normalize_order(
             self.years_in_business_min,
             self.years_in_business_max,
@@ -974,6 +1132,13 @@ class FundingProgrammeRecord(BaseModel):
             self.field_confidence = dict(self.extraction_confidence)
         if not self.extraction_confidence and self.field_confidence:
             self.extraction_confidence = dict(self.field_confidence)
+        if self.payback_confidence is not None and "payback_confidence" not in self.extraction_confidence:
+            self.extraction_confidence["payback_confidence"] = self.payback_confidence
+        if self.raw_eligibility_criteria and "raw_eligibility_criteria" not in self.extraction_confidence:
+            self.extraction_confidence["raw_eligibility_criteria"] = max(
+                self.extraction_confidence.get("raw_eligibility_criteria", 0.0),
+                0.88,
+            )
         if not self.evidence_by_field and self.field_evidence:
             flattened: Dict[str, List[str]] = {}
             for field_name, items in self.field_evidence.items():
