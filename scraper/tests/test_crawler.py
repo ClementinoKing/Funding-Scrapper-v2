@@ -261,3 +261,133 @@ def test_crawler_uses_browser_fallback_on_forbidden_response(settings) -> None:
     assert browser_fetcher.calls == ["https://example.org/programmes/youth-growth-loan"]
     trace = (settings.output_path / "logs" / "crawl_trace.jsonl").read_text(encoding="utf-8")
     assert '"event":"content_extracted"' in trace
+
+
+def test_crawler_discovers_programme_routes_from_rendered_homepage(settings) -> None:
+    http_home = PageFetchResult(
+        url="https://www.pic.gov.za/",
+        requested_url="https://www.pic.gov.za/",
+        canonical_url="https://www.pic.gov.za/",
+        final_url="https://www.pic.gov.za/",
+        status_code=200,
+        content_type="text/html",
+        html="""
+        <html>
+          <head>
+            <title>Public Investment Corporation</title>
+            <script src="/assets/app.js"></script>
+            <script src="/assets/vendor.js"></script>
+            <script src="/assets/runtime.js"></script>
+          </head>
+          <body>
+            <div id="root"></div>
+          </body>
+        </html>
+        """,
+        title="Public Investment Corporation",
+        fetch_method="http",
+        headers={},
+        js_rendered=False,
+        notes=[],
+    )
+    browser_home = _page(
+        "https://www.pic.gov.za/",
+        """
+        <html>
+          <head><title>Public Investment Corporation</title></head>
+          <body>
+            <main>
+              <nav class="site-nav">
+                <button data-href="/early-stage-fund">Early Stage Fund</button>
+                <button onclick="window.location='/isibaya'">Isibaya</button>
+                <a href="/properties">Properties</a>
+              </nav>
+              <section class="card-grid">
+                <article class="card">
+                  <h2>Early Stage Fund</h2>
+                  <p>Backing young companies through targeted investment.</p>
+                </article>
+              </section>
+            </main>
+          </body>
+        </html>
+        """,
+        "Public Investment Corporation",
+    )
+    early_stage = _page(
+        "https://www.pic.gov.za/early-stage-fund",
+        """
+        <html>
+          <head><title>Early Stage Fund</title></head>
+          <body>
+            <main>
+              <article>
+                <h1>Early Stage Fund</h1>
+                <p>Investment for early-stage companies.</p>
+              </article>
+            </main>
+          </body>
+        </html>
+        """,
+        "Early Stage Fund",
+    )
+    isibaya = _page(
+        "https://www.pic.gov.za/isibaya",
+        """
+        <html>
+          <head><title>Isibaya</title></head>
+          <body>
+            <main>
+              <article>
+                <h1>Isibaya</h1>
+                <p>Local development investment initiative.</p>
+              </article>
+            </main>
+          </body>
+        </html>
+        """,
+        "Isibaya",
+    )
+    properties = _page(
+        "https://www.pic.gov.za/properties",
+        """
+        <html>
+          <head><title>Properties</title></head>
+          <body>
+            <main>
+              <article>
+                <h1>Properties</h1>
+                <p>Commercial property portfolio and investment assets.</p>
+              </article>
+            </main>
+          </body>
+        </html>
+        """,
+        "Properties",
+    )
+
+    fetcher = FixtureFetcher(
+        {
+            "https://www.pic.gov.za/": http_home,
+            "https://www.pic.gov.za/early-stage-fund": early_stage,
+            "https://www.pic.gov.za/isibaya": isibaya,
+            "https://www.pic.gov.za/properties": properties,
+        }
+    )
+    browser_fetcher = TrackingBrowserFetcher(browser_home)
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=fetcher,
+        browser_fetcher=browser_fetcher,
+    )
+
+    summary = pipeline.run(["https://www.pic.gov.za/"])
+
+    assert summary.pages_fetched_successfully == 4
+    assert browser_fetcher.calls[0] == "https://www.pic.gov.za/"
+    assert browser_fetcher.calls.count("https://www.pic.gov.za/") == 1
+    assert "https://www.pic.gov.za/early-stage-fund" in fetcher.calls
+    assert "https://www.pic.gov.za/isibaya" in fetcher.calls
+    assert "https://www.pic.gov.za/properties" in fetcher.calls

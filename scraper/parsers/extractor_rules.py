@@ -39,6 +39,32 @@ NOISE_CONTAINER_HINTS = (
     "masthead",
     "site-nav",
 )
+ROUTE_LINK_ATTRIBUTES = (
+    "href",
+    "data-href",
+    "data-url",
+    "data-link",
+    "data-route",
+    "data-path",
+    "data-to",
+    "to",
+)
+ROUTE_CONTROL_SELECTORS = (
+    "button",
+    "[role='button']",
+    "[role='link']",
+    "[onclick]",
+    "[data-href]",
+    "[data-url]",
+    "[data-link]",
+    "[data-route]",
+    "[data-path]",
+    "[data-to]",
+)
+ONCLICK_ROUTE_RE = re.compile(
+    r"""(?:window\.location(?:\.href)?|document\.location(?:\.href)?|location(?:\.href)?|window\.open)\s*(?:=|\()\s*['"]([^'"]+)['"]""",
+    re.I,
+)
 SECTION_KEYWORDS: Dict[str, Sequence[str]] = {
     "eligibility": [
         "eligibility",
@@ -134,6 +160,68 @@ def collect_anchor_candidates(soup: BeautifulSoup, base_url: str) -> List[Tuple[
     return candidates
 
 
+def _route_candidate_label(node: Tag) -> str:
+    for attribute in ("aria-label", "title", "data-label", "data-title"):
+        value = clean_text(str(node.get(attribute, "")))
+        if value:
+            return value
+    return clean_text(node.get_text(" ", strip=True))
+
+
+def _route_candidate_href(raw_value: str, base_url: str) -> Optional[str]:
+    candidate = clean_text(raw_value)
+    if not candidate:
+        return None
+    lowered = candidate.lower()
+    if lowered.startswith(("#", "javascript:", "mailto:", "tel:")):
+        return None
+    href = canonicalize_url(candidate, base_url=base_url)
+    if not href or href.endswith("#"):
+        return None
+    if href == canonicalize_url(base_url):
+        return None
+    return href
+
+
+def collect_route_candidates(soup: BeautifulSoup, base_url: str) -> List[Tuple[str, str]]:
+    candidates: List[Tuple[str, str]] = []
+    for node in soup.select(",".join(ROUTE_CONTROL_SELECTORS)):
+        if not isinstance(node, Tag):
+            continue
+        label = _route_candidate_label(node)
+        if node.name == "a" and node.get("href"):
+            # Anchors are already covered by collect_anchor_candidates.
+            continue
+        for attribute in ROUTE_LINK_ATTRIBUTES:
+            if not node.has_attr(attribute):
+                continue
+            raw_value = node.get(attribute)
+            if isinstance(raw_value, (list, tuple, set)):
+                raw_text = " ".join(str(item) for item in raw_value)
+            else:
+                raw_text = str(raw_value)
+            href = _route_candidate_href(raw_text, base_url)
+            if href:
+                candidates.append((href, label))
+        onclick = clean_text(str(node.get("onclick", "")))
+        if onclick:
+            for match in ONCLICK_ROUTE_RE.finditer(onclick):
+                href = _route_candidate_href(match.group(1), base_url)
+                if href:
+                    candidates.append((href, label))
+    deduped: List[Tuple[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+    for href, label in candidates:
+        if not href:
+            continue
+        key = (href.casefold(), clean_text(label).casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((href, label))
+    return deduped
+
+
 def collect_internal_anchor_candidates(
     soup: BeautifulSoup,
     base_url: str,
@@ -174,17 +262,12 @@ def _is_layout_noise(node: Tag) -> bool:
 
 def extract_document_links(soup: BeautifulSoup, base_url: str, context_text: str = "") -> List[str]:
     documents: List[str] = []
-    for anchor in soup.find_all("a", href=True):
-        href = canonicalize_url(anchor["href"], base_url=base_url)
-        label = clean_text(anchor.get_text(" ", strip=True)).lower()
+    for href, label_text in collect_anchor_candidates(soup, base_url) + collect_route_candidates(soup, base_url):
+        label = clean_text(label_text).lower()
         is_documentish = is_probably_document_url(href) or any(term in label for term in ["pdf", "application form", "download"])
         if not is_documentish:
             continue
-        if _has_noise_ancestor(anchor) and context_text and not document_link_matches_context(href, context_text=context_text, anchor_text=label):
-            continue
         if context_text and not document_link_matches_context(href, context_text=context_text, anchor_text=label):
-            continue
-        if _has_noise_ancestor(anchor) and not context_text:
             continue
         if is_documentish:
             documents.append(href)
@@ -193,11 +276,8 @@ def extract_document_links(soup: BeautifulSoup, base_url: str, context_text: str
 
 def extract_application_links(soup: BeautifulSoup, base_url: str) -> List[str]:
     links: List[str] = []
-    for anchor in soup.find_all("a", href=True):
-        label = clean_text(anchor.get_text(" ", strip=True)).lower()
-        href = canonicalize_url(anchor["href"], base_url=base_url)
-        if not href:
-            continue
+    for href, label_text in collect_anchor_candidates(soup, base_url) + collect_route_candidates(soup, base_url):
+        label = clean_text(label_text).lower()
         lowered_href = href.lower()
         if is_probably_document_url(href):
             continue
@@ -453,7 +533,7 @@ def extract_candidate_blocks(
         node_soup = BeautifulSoup(str(node), "html.parser")
         detail_links = []
         application_links = []
-        for href, label in collect_anchor_candidates(node_soup, base_url):
+        for href, label in collect_anchor_candidates(node_soup, base_url) + collect_route_candidates(node_soup, base_url):
             if is_probably_document_url(href):
                 detail_links.append(href)
                 continue

@@ -24,6 +24,21 @@ from scraper.utils.urls import canonicalize_url, extract_host, is_internal_url, 
 from scraper.utils.quality import score_programme_quality
 
 
+DISCOVERY_URL_HINTS = (
+    "fund",
+    "funding",
+    "investment",
+    "portfolio",
+    "properties",
+    "isibaya",
+    "early-stage",
+    "early stage",
+    "unlisted",
+    "development",
+    "procurement",
+)
+
+
 class Crawler:
     """Breadth-first crawler tuned for funding pages within allowed domains."""
 
@@ -61,7 +76,21 @@ class Crawler:
         lowered = (page.html or "").lower()
         if "enable javascript" in lowered or "requires javascript" in lowered:
             return True
-        if self._stripped_text_length(page.html) < 300 and lowered.count("<script") >= 5:
+        stripped_length = self._stripped_text_length(page.html)
+        shell_signals = (
+            "data-reactroot",
+            'id="root"',
+            "id='root'",
+            'id="app"',
+            "id='app'",
+            "ng-app",
+            "__next",
+            "gatsby",
+            "vue",
+        )
+        if stripped_length < 220:
+            return True
+        if stripped_length < 450 and (lowered.count("<script") >= 2 or any(signal in lowered for signal in shell_signals)):
             return True
         return False
 
@@ -146,6 +175,8 @@ class Crawler:
             score += 6
         if any(term in url.lower() for term in ["fund", "grant", "loan", "finance", "apply", "program", "programme"]):
             score += 8
+        if any(term in "%s %s" % (url.lower(), anchor_text.lower()) for term in DISCOVERY_URL_HINTS):
+            score += 7
         if source == "page-link" and depth == 0:
             score += 3
 

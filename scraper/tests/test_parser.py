@@ -65,6 +65,38 @@ def test_generic_parser_keeps_listing_pages_generic(settings, fixture_dir: Path)
     assert "https://example.org/programmes/asset-finance-facility" in result.discovered_links
 
 
+def test_generic_parser_discovers_route_like_internal_links(settings) -> None:
+    parser = GenericFundingParser(settings)
+    html = """
+    <html>
+      <body>
+        <main>
+          <nav class="site-nav">
+            <button data-href="/early-stage-fund">Early Stage Fund</button>
+            <button onclick="window.location='/isibaya'">Isibaya</button>
+            <a href="/properties">Properties</a>
+            <button data-href="/apply/early-stage-fund">Apply now</button>
+          </nav>
+        </main>
+      </body>
+    </html>
+    """
+    page = _page(
+        "https://www.pic.gov.za/",
+        html,
+        "Public Investment Corporation",
+    )
+
+    result = parser.parse(page, allowed_domains=["www.pic.gov.za"])
+
+    assert "https://www.pic.gov.za/early-stage-fund" in result.discovered_links
+    assert "https://www.pic.gov.za/early-stage-fund" in result.internal_links
+    assert "https://www.pic.gov.za/isibaya" in result.internal_links
+    assert "https://www.pic.gov.za/properties" in result.internal_links
+    assert "https://www.pic.gov.za/apply/early-stage-fund" not in result.internal_links
+    assert "https://www.pic.gov.za/apply/early-stage-fund" in result.application_links
+
+
 def test_generic_parser_extracts_interactive_sections(settings) -> None:
     parser = GenericFundingParser(settings)
     html = """

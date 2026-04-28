@@ -14,6 +14,7 @@ from scraper.parsers.extractor_rules import (
     APPLICATION_HINTS,
     NOISE_CONTAINER_HINTS,
     collect_anchor_candidates,
+    collect_route_candidates,
     extract_application_links,
     extract_document_links,
 )
@@ -450,7 +451,7 @@ class GenericFundingParser:
             ]
         )
 
-        all_links = collect_anchor_candidates(soup, page.canonical_url)
+        all_links = collect_anchor_candidates(soup, page.canonical_url) + collect_route_candidates(soup, page.canonical_url)
         internal_links = [
             href
             for href, _label in all_links
@@ -463,10 +464,8 @@ class GenericFundingParser:
             relevant_keywords=self.settings.relevant_keywords,
             irrelevant_patterns=self.settings.irrelevant_url_patterns,
         )
-        document_links = extract_document_links(cleaned_root, page.canonical_url, context_text=document_context_text)
-        application_links = [
-            link for link in extract_application_links(cleaned_root, page.canonical_url) if link not in document_links
-        ]
+        document_links = extract_document_links(soup, page.canonical_url, context_text=document_context_text)
+        application_links = [link for link in extract_application_links(soup, page.canonical_url) if link not in document_links]
         internal_links = [link for link in internal_links if link not in application_links and link not in document_links]
         discovered_links = [link for link in discovered_links if link not in application_links and link not in document_links]
         internal_links = unique_preserve_order([*internal_links, *discovered_links, *document_links])
