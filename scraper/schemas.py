@@ -170,6 +170,21 @@ class PageContentSection(BaseModel):
     content: str
 
 
+class PageInteractiveSection(BaseModel):
+    """A semantic section extracted from an interactive page container."""
+
+    type: str
+    label: str
+    content: str
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "PageInteractiveSection":
+        self.type = clean_text(self.type) or "interactive"
+        self.label = clean_text(self.label)
+        self.content = clean_text(self.content)
+        return self
+
+
 class DocumentEvidenceSnapshot(BaseModel):
     """Compact evidence extracted from a linked or source document."""
 
@@ -204,6 +219,7 @@ class PageContentDocument(BaseModel):
     headings: List[str] = Field(default_factory=list)
     full_body_text: str = ""
     structured_sections: List[PageContentSection] = Field(default_factory=list)
+    interactive_sections: List[PageInteractiveSection] = Field(default_factory=list)
     discovered_links: List[str] = Field(default_factory=list)
     internal_links: List[str] = Field(default_factory=list)
     application_links: List[str] = Field(default_factory=list)
@@ -228,6 +244,15 @@ class PageContentDocument(BaseModel):
             )
             for section in self.structured_sections
             if clean_text(section.heading) or clean_text(section.content)
+        ]
+        self.interactive_sections = [
+            PageInteractiveSection(
+                type=clean_text(section.type),
+                label=clean_text(section.label),
+                content=clean_text(section.content),
+            )
+            for section in self.interactive_sections
+            if clean_text(section.label) or clean_text(section.content)
         ]
         self.discovered_links = unique_preserve_order([clean_text(item) for item in self.discovered_links if clean_text(item)])
         self.internal_links = unique_preserve_order([clean_text(item) for item in self.internal_links if clean_text(item)])
@@ -271,7 +296,22 @@ class PageContentDocument(BaseModel):
                         document_links=list(self.document_links),
                     )
                 )
-        else:
+        for interactive_section in self.interactive_sections:
+            candidate_blocks.append(
+                CandidateBlockSnapshot(
+                    heading=interactive_section.label or interactive_section.type,
+                    text=interactive_section.content,
+                    source_url=self.page_url,
+                    section_map={interactive_section.label or interactive_section.type: [interactive_section.content]},
+                    section_tree=[],
+                    section_bundle={},
+                    section_aliases={},
+                    detail_links=list(self.internal_links),
+                    application_links=list(self.application_links),
+                    document_links=list(self.document_links),
+                )
+            )
+        if not candidate_blocks:
             candidate_blocks.append(
                 CandidateBlockSnapshot(
                     heading=self.title or self.page_title or "",

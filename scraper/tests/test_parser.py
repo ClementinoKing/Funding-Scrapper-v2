@@ -65,6 +65,52 @@ def test_generic_parser_keeps_listing_pages_generic(settings, fixture_dir: Path)
     assert "https://example.org/programmes/asset-finance-facility" in result.discovered_links
 
 
+def test_generic_parser_extracts_interactive_sections(settings) -> None:
+    parser = GenericFundingParser(settings)
+    html = """
+    <html>
+      <body>
+        <h1>National Youth Services Programme</h1>
+        <div class="tabs">
+          <button role="tab" aria-controls="overview-panel">About the Programme</button>
+          <button role="tab" aria-controls="eligibility-panel">Eligibility Criteria</button>
+        </div>
+        <div id="overview-panel" role="tabpanel" class="tab-pane">
+          <p>The programme builds service skills and community participation.</p>
+        </div>
+        <div id="eligibility-panel" role="tabpanel" class="tab-pane">
+          <p>Applicants must be South African youth aged 18 to 35.</p>
+        </div>
+        <div class="accordion">
+          <button class="accordion-button" data-bs-toggle="collapse" data-bs-target="#how-apply">
+            How to Apply
+          </button>
+          <div id="how-apply" class="accordion-collapse collapse">
+            <div class="accordion-body">
+              <p>Apply online through the NYDA portal.</p>
+            </div>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    page = _page(
+        "https://www.nyda.gov.za/Products-Services/National-Youth-Services-Programme.html",
+        html,
+        "National Youth Services Programme",
+    )
+
+    result = parser.parse(page, allowed_domains=["nyda.gov.za"])
+
+    assert any(section.type == "tab" and section.label == "About the Programme" for section in result.interactive_sections)
+    assert any("south african youth" in section.content.lower() for section in result.interactive_sections)
+    assert any(section.type == "accordion" and section.label == "How to Apply" for section in result.interactive_sections)
+    assert any(
+        block.heading == "About the Programme" and "service skills" in block.text.lower()
+        for block in result.page_ai_context.candidate_blocks
+    )
+
+
 def test_extract_document_links_includes_office_and_image_files() -> None:
     soup = BeautifulSoup(
         """

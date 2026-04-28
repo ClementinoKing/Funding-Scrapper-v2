@@ -148,16 +148,19 @@ ELIGIBILITY_STAGE_PATTERNS = {
     "established business": ("established business", "existing business", "trading for"),
 }
 
-
+# Normalization helpers convert loose upstream values into compact text, numeric,
+# and enum shapes before any AI prompt or record payload is assembled.
 def _coerce_text(value: Any) -> str:
     return clean_text(str(value)) if value is not None else ""
 
-
+# Optional text fields collapse to None instead of empty strings so the rest of
+# the pipeline can treat "missing" consistently.
 def _coerce_optional_text(value: Any) -> Optional[str]:
     text = _coerce_text(value)
     return text or None
 
-
+# List-like inputs are normalized through the same cleaning path regardless of
+# whether the caller passed a scalar, list, tuple, set, or dict.
 def _coerce_list(value: Any) -> List[str]:
     if value is None:
         return []
@@ -170,7 +173,8 @@ def _coerce_list(value: Any) -> List[str]:
     cleaned = [clean_text(str(item)) for item in value if clean_text(str(item))]
     return unique_preserve_order(cleaned)
 
-
+# Taxonomy configuration can arrive in several shapes; this flattens it into a
+# stable mapping of label -> terms.
 def _as_taxonomy(value: Any) -> Dict[str, List[str]]:
     if not isinstance(value, dict):
         return {}
@@ -189,6 +193,8 @@ def _as_taxonomy(value: Any) -> Dict[str, List[str]]:
     return taxonomy
 
 
+# Numeric coercion first tries direct parsing, then falls back to money parsing
+# when the text looks like a currency or amount phrase.
 def _coerce_float(value: Any) -> Optional[float]:
     if value is None or value == "":
         return None
@@ -209,6 +215,8 @@ def _coerce_float(value: Any) -> Optional[float]:
     return None
 
 
+# Integers are derived from the float coercion path to keep the parsing rules
+# identical for values that may include currency or formatting noise.
 def _coerce_int(value: Any) -> Optional[int]:
     float_value = _coerce_float(value)
     if float_value is None:
@@ -216,6 +224,8 @@ def _coerce_int(value: Any) -> Optional[int]:
     return int(float_value)
 
 
+# Range extraction scans sentence-by-sentence so the first relevant term wins
+# instead of pulling unrelated numbers from the same page.
 def _extract_number_range_from_text(text: str, *, terms: Sequence[str]) -> Tuple[Optional[float], Optional[float]]:
     patterns = [
         re.compile(r"(\d+(?:\.\d+)?)\s*(?:to|-|and)\s*(\d+(?:\.\d+)?)", re.I),
@@ -244,6 +254,8 @@ def _extract_number_range_from_text(text: str, *, terms: Sequence[str]) -> Tuple
     return None, None
 
 
+# Eligibility stage labels are derived from keyword clusters rather than asking
+# the model to infer the business maturity bucket.
 def _extract_stage_labels(text: str) -> List[str]:
     lowered = (text or "").lower()
     labels: List[str] = []
@@ -253,6 +265,8 @@ def _extract_stage_labels(text: str) -> List[str]:
     return unique_preserve_order(labels)
 
 
+# Enum coercion maps loose human language onto the strict schema values used by
+# the records that leave this module.
 def _coerce_enum(enum_cls, value: Any):
     text = _coerce_text(value).casefold()
     if not text:
@@ -328,12 +342,16 @@ def _coerce_enum(enum_cls, value: Any):
     return None
 
 
+# Line trimming keeps the prompt compact while preserving the order of distinct
+# lines that matter.
 def _trim_lines(text: str, max_lines: int = 120) -> str:
     lines = [clean_text(line) for line in (text or "").splitlines()]
     deduped = unique_preserve_order([line for line in lines if line])
     return "\n".join(deduped[:max_lines])
 
 
+# Only sections with funding-related signals are kept for the prompt; the
+# fallback uses a small trimmed sample when no obvious signal is found.
 def _keyword_section_filter(sections: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
     selected: List[Dict[str, str]] = []
     for section in sections:
@@ -355,6 +373,8 @@ def _keyword_section_filter(sections: Sequence[Dict[str, str]]) -> List[Dict[str
     return trimmed
 
 
+# Prompt content is built from the page metadata, selected sections, and a
+# coarse decision hint so the model sees the page in a compact shape.
 def _build_prompt_content(document: PageContentDocument) -> Dict[str, Any]:
     sections = [
         {"heading": section.heading, "content": section.content}
@@ -374,6 +394,10 @@ def _build_prompt_content(document: PageContentDocument) -> Dict[str, Any]:
         "source_content_type": document.source_content_type,
         "headings": document.headings,
         "structured_sections": selected_sections,
+        "interactive_sections": [
+            {"type": section.type, "label": section.label, "content": section.content}
+            for section in document.interactive_sections
+        ],
         "full_body_text": body_excerpt,
         "source_domain": document.source_domain,
         "main_content_hint": document.main_content_hint,
@@ -385,6 +409,8 @@ def _build_prompt_content(document: PageContentDocument) -> Dict[str, Any]:
     return {key: value for key, value in prompt_payload.items() if value not in (None, "", [], {})}
 
 
+# Fields in an existing record that should never be sent back into the prompt
+# are technical bookkeeping rather than business facts.
 PROMPT_RECORD_FIELD_EXCLUSIONS = {
     "id",
     "program_id",
@@ -402,6 +428,8 @@ PROMPT_RECORD_FIELD_EXCLUSIONS = {
 }
 
 
+# Prompt values are recursively compacted so nested empties do not bloat the
+# JSON handed to the model.
 def _compact_prompt_value(value: Any) -> Any:
     if value is None or value == "" or value == [] or value == {}:
         return None
@@ -419,6 +447,8 @@ def _compact_prompt_value(value: Any) -> Any:
     return value
 
 
+# Existing record data is filtered through the exclusion list before it is fed
+# back into the prompt as current state.
 def _compact_record_prompt_data(record_data: Dict[str, Any]) -> Dict[str, Any]:
     prompt_data: Dict[str, Any] = {}
     for key, value in record_data.items():
@@ -430,6 +460,8 @@ def _compact_record_prompt_data(record_data: Dict[str, Any]) -> Dict[str, Any]:
     return prompt_data
 
 
+# Current record state is summarized into a small term list that the block
+# scorer can use to pick the most relevant evidence block.
 def _record_prompt_terms(record_data: Dict[str, Any]) -> List[str]:
     terms: List[str] = []
     for field_name in (
@@ -456,6 +488,8 @@ def _record_prompt_terms(record_data: Dict[str, Any]) -> List[str]:
     return unique_preserve_order([clean_text(term) for term in terms if clean_text(term)])
 
 
+# Candidate blocks are scored against the record terms so the most relevant
+# section is surfaced to the model.
 def _score_candidate_block(block: CandidateBlockSnapshot, prompt_terms: Sequence[str]) -> int:
     haystack = " ".join(
         [
@@ -480,6 +514,8 @@ def _score_candidate_block(block: CandidateBlockSnapshot, prompt_terms: Sequence
     return score
 
 
+# The highest-scoring candidate block is selected and compacted into a small
+# prompt-friendly payload.
 def _select_candidate_block(blocks: Sequence[CandidateBlockSnapshot], record_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not blocks:
         return None
@@ -503,6 +539,8 @@ def _select_candidate_block(blocks: Sequence[CandidateBlockSnapshot], record_dat
     return {key: value for key, value in compact_block.items() if value not in (None, "", [], {})}
 
 
+# Record snapshots are converted into a prompt payload that keeps the current
+# field values plus the best matching evidence block.
 def _build_record_context_prompt(snapshot: PageAIRecordSnapshot | Dict[str, Any] | Any, blocks: Sequence[CandidateBlockSnapshot]) -> Dict[str, Any]:
     if isinstance(snapshot, PageAIRecordSnapshot):
         record_index = snapshot.record_index
@@ -523,6 +561,8 @@ def _build_record_context_prompt(snapshot: PageAIRecordSnapshot | Dict[str, Any]
     return {key: value for key, value in prompt_record.items() if value not in (None, "", [], {})}
 
 
+# The full prompt payload combines the page content, current records, and any
+# linked document evidence into the JSON body sent to the model.
 def _build_context_prompt_payload(
     document: PageContentDocument,
     *,
@@ -560,7 +600,23 @@ def _document_evidence_text(document: PageContentDocument) -> str:
     return _document_evidence_context(document)["combined_text"]
 
 
+def _interactive_sections_text(document: PageContentDocument) -> str:
+    return " ".join(
+        unique_preserve_order(
+            [
+                clean_text(part)
+                for section in document.interactive_sections
+                for part in (section.label, section.content)
+                if clean_text(part)
+            ]
+        )
+    )
+
+# Evidence context groups support-document content into categories that the
+# prompt and fallback extractors can reuse without re-reading each file.
 def _document_evidence_context(document: PageContentDocument) -> Dict[str, Any]:
+    # Evidence from linked documents is flattened into one summary plus a few
+    # targeted buckets so downstream steps can re-use it cheaply.
     evidence_lines: List[str] = []
     funding_lines: List[str] = []
     eligibility_lines: List[str] = []
@@ -568,6 +624,8 @@ def _document_evidence_context(document: PageContentDocument) -> Dict[str, Any]:
     required_documents: List[str] = []
     notes: List[str] = []
     for item in document.document_evidence:
+        # Each evidence item is summarized once, then tagged into the buckets
+        # that match the phrases it contains.
         fragments = [item.summary, *item.key_points, item.extracted_text]
         cleaned_fragments = unique_preserve_order([clean_text(fragment) for fragment in fragments if clean_text(fragment)])
         if not cleaned_fragments:
@@ -585,6 +643,8 @@ def _document_evidence_context(document: PageContentDocument) -> Dict[str, Any]:
             required_documents.append(tagged)
         notes.append(f"Document evidence read from {item.document_url}")
 
+    # The combined text is the compact summary used by prompt builders and
+    # deterministic fallback extractors.
     combined_text = compact_document_text("\n".join(evidence_lines), max_chars=MAX_DOCUMENT_SUMMARY_CHARS)
     combined_for_extraction = " ".join(
         [
@@ -612,10 +672,13 @@ def _document_evidence_context(document: PageContentDocument) -> Dict[str, Any]:
 
 
 def _payback_source_text(document: PageContentDocument, document_context: Dict[str, Any], derived: Dict[str, Any]) -> str:
+    # Payback extraction looks across the main page, the document evidence, and
+    # the already-derived raw text fields so repayment wording is not missed.
     parts: List[str] = [
         document.title or "",
         document.page_title or "",
         document.full_body_text or "",
+        _interactive_sections_text(document),
         document_context.get("combined_text") or "",
         " ".join(derived.get("raw_terms_data") or []),
         " ".join(derived.get("raw_funding_offer_data") or []),
@@ -625,10 +688,13 @@ def _payback_source_text(document: PageContentDocument, document_context: Dict[s
 
 
 def _eligibility_source_text(document: PageContentDocument, document_context: Dict[str, Any], derived: Dict[str, Any]) -> str:
+    # Eligibility extraction reuses the broadest relevant text surface so the
+    # structured criteria extractor sees the same wording the AI would see.
     parts: List[str] = [
         document.title or "",
         document.page_title or "",
         document.full_body_text or "",
+        _interactive_sections_text(document),
         document_context.get("combined_text") or "",
         " ".join(derived.get("raw_eligibility_data") or []),
         " ".join(derived.get("raw_terms_data") or []),
@@ -637,6 +703,8 @@ def _eligibility_source_text(document: PageContentDocument, document_context: Di
 
 
 def _looks_like_funder_name(candidate: str) -> bool:
+    # A funder name needs to look like an organization, not a navigation label
+    # or other generic site text.
     text = clean_text(candidate or "")
     if not text:
         return False
@@ -649,6 +717,8 @@ def _looks_like_funder_name(candidate: str) -> bool:
 
 
 def _extract_funder_name_from_title(title: Optional[str]) -> Optional[str]:
+    # Some titles encode "page title - funder name"; this pulls the likely
+    # organization part off the right side of the separator.
     cleaned = clean_text(title or "")
     if not cleaned:
         return None
@@ -660,6 +730,8 @@ def _extract_funder_name_from_title(title: Optional[str]) -> Optional[str]:
 
 
 def _humanize_source_domain(domain: Optional[str]) -> Optional[str]:
+    # When no explicit funder is available, the source domain is used as a
+    # human-readable fallback.
     cleaned = clean_text(domain or "")
     if not cleaned:
         return None
@@ -676,6 +748,8 @@ def _humanize_source_domain(domain: Optional[str]) -> Optional[str]:
 
 
 def _infer_funder_name(document: PageContentDocument, payload: Dict[str, Any]) -> Optional[str]:
+    # Funder inference prefers explicit extracted text, then title patterns, then
+    # a cleaned-up domain fallback.
     explicit = _coerce_optional_text(payload.get("funder_name"))
     if explicit and not re.fullmatch(r"(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\.[a-z]{2,})*", explicit.casefold() or ""):
         return explicit
@@ -693,10 +767,13 @@ def _infer_funder_name(document: PageContentDocument, payload: Dict[str, Any]) -
 
 
 def _estimate_prompt_size(payload: Dict[str, Any]) -> int:
+    # The size estimate is intentionally approximate; it is only used for guardrails.
     return len(json.dumps(payload, ensure_ascii=False)) // 4
 
 
 def _normalize_page_decision(value: Any) -> str:
+    # The model can phrase the page decision several ways, so normalize them to
+    # the small enum the rest of the code expects.
     text = _coerce_text(value).casefold().replace("-", "_").replace(" ", "_")
     if text in {
         PAGE_DECISION_FUNDING_PROGRAM,
@@ -728,6 +805,8 @@ def _normalize_page_decision(value: Any) -> str:
 
 
 def _page_decision_hint(document: PageContentDocument) -> Tuple[str, List[str]]:
+    # This is the cheap pre-model heuristic that guesses whether the page is a
+    # real funding programme or just generic site content.
     text = " ".join(
         [
             document.page_url or "",
@@ -736,18 +815,26 @@ def _page_decision_hint(document: PageContentDocument) -> Tuple[str, List[str]]:
             " ".join(document.headings or []),
             document.main_content_hint or "",
             (document.full_body_text or "")[:2000],
+            _interactive_sections_text(document),
         ]
     ).casefold()
     program_hits = [term for term in PROGRAMME_SIGNAL_TERMS if term in text]
     non_program_hits = [term for term in NON_PROGRAMME_SIGNAL_TERMS if term in text]
     file_like = bool(re.search(r"\bimg[-_ ]?\d|\.(?:jpe?g|png|gif|webp|pdf)(?:\b|$)", text))
     if file_like and len(program_hits) < 2:
+        # File-like URLs without enough programme evidence are treated as
+        # non-program pages because they are usually attachments or media.
         return PAGE_DECISION_NOT_FUNDING_PROGRAM, ["title or URL looks like a file or media asset"]
     if len(non_program_hits) >= 2 and len(program_hits) == 0:
+        # Generic article/news/privacy signals override weak funding language.
         return PAGE_DECISION_NOT_FUNDING_PROGRAM, ["page matches generic article/media/policy signals"]
     if len(program_hits) >= 2:
+        # Multiple programme signals are enough to treat the page as a likely
+        # funding page even before the model sees it.
         return PAGE_DECISION_FUNDING_PROGRAM, [f"contains programme signals: {', '.join(program_hits[:4])}"]
     if len(program_hits) == 1 and len(non_program_hits) == 0 and len((document.full_body_text or "").strip()) >= 600:
+        # A single strong funding signal can still be enough if the page body is
+        # substantial and otherwise clean.
         return PAGE_DECISION_FUNDING_PROGRAM, [f"contains funding signal: {program_hits[0]}"]
     return PAGE_DECISION_UNCLEAR, []
 
@@ -760,6 +847,8 @@ def _collect_section_snippets(
     fallback_chars: int = 1200,
     max_sentences: int = 4,
 ) -> List[str]:
+    # This helper pulls sentence-sized snippets from the sections most likely to
+    # contain the requested terms, then falls back to the body text if needed.
     snippets: List[str] = []
     for section in document.structured_sections:
         heading = clean_text(section.heading).lower()
@@ -783,6 +872,8 @@ def _collect_section_snippets(
 
 
 def _derive_page_evidence(document: PageContentDocument) -> Dict[str, Any]:
+    # This is the deterministic evidence extractor: it scans the page body and
+    # grouped sections for funding, eligibility, document, and application text.
     funding_offer = _collect_section_snippets(
         document,
         heading_terms=("fund", "funding", "finance", "loan", "grant", "offer", "investment"),
@@ -847,6 +938,8 @@ def _derive_page_evidence(document: PageContentDocument) -> Dict[str, Any]:
         heading_terms=("apply", "application", "portal", "register", "how to apply", "submission"),
         body_terms=("apply", "application", "portal", "register", "submit", "submission"),
     )
+    # The raw snippet groups are kept separate so later stages can reuse the
+    # exact supporting text they need without rescanning the page.
     snippets: Dict[str, List[str]] = {
         "title": [document.title] if document.title else [],
         "full_body_text": [document.full_body_text[:MAX_BODY_CHARS]] if document.full_body_text else [],
@@ -889,6 +982,8 @@ def _derive_eligibility_profile(
     entity_type_keywords: Dict[str, List[str]],
     certification_keywords: Dict[str, List[str]],
 ) -> Dict[str, Any]:
+    # This function turns plain eligibility text into structured schema fields
+    # without relying on the AI model to infer obvious eligibility constraints.
     lowered = (text or "").lower()
     industries = unique_preserve_order(match_keyword_map(text, industry_taxonomy)[0]) if industry_taxonomy else []
     use_of_funds = unique_preserve_order(match_keyword_map(text, use_of_funds_taxonomy)[0]) if use_of_funds_taxonomy else []
@@ -898,6 +993,8 @@ def _derive_eligibility_profile(
     business_stage_eligibility = _extract_stage_labels(text)
     turnover_min = turnover_max = None
     for sentence in sentence_chunks(text):
+        # Turnover is extracted sentence-by-sentence so unrelated amounts do not
+        # leak into the eligibility profile.
         lowered_sentence = sentence.lower()
         if not any(term in lowered_sentence for term in ("turnover", "revenue", "sales", "annual turnover", "annual revenue")):
             continue
@@ -918,6 +1015,8 @@ def _derive_eligibility_profile(
         re.compile(r"(\d+(?:\.\d+)?)\s*(?:employees|staff|workers|headcount)", re.I),
     ]
     for sentence in sentence_chunks(text):
+        # Business age and staff-count requirements follow the same targeted
+        # sentence scan as turnover.
         lowered_sentence = sentence.lower()
         if years_in_business_min is None and any(term in lowered_sentence for term in ("years in business", "trading for", "in operation for", "operating for", "established for", "business age")):
             for pattern in years_patterns:
@@ -973,10 +1072,13 @@ def _combine_eligibility_text(
     eligibility_items: Sequence[str],
     extra_items: Sequence[str] = (),
 ) -> str:
+    # Combine every eligibility-adjacent source into one deduplicated string so
+    # the extractor sees a single coherent evidence surface.
     parts = [
         *[clean_text(item) for item in eligibility_items if clean_text(item)],
         *[clean_text(item) for item in extra_items if clean_text(item)],
         *[section.content for section in document.structured_sections if clean_text(section.content)],
+        _interactive_sections_text(document),
         document.full_body_text or "",
         document.title or "",
     ]
@@ -984,6 +1086,8 @@ def _combine_eligibility_text(
 
 
 def _merge_drafts(drafts: Sequence[AIProgrammeDraft]) -> List[AIProgrammeDraft]:
+    # Duplicated AI drafts are merged by normalized program name plus source URL
+    # so repeated model output does not create duplicate records.
     merged: Dict[Tuple[str, str], AIProgrammeDraft] = {}
     fallback: List[AIProgrammeDraft] = []
     for draft in drafts:
@@ -1002,6 +1106,8 @@ def _merge_drafts(drafts: Sequence[AIProgrammeDraft]) -> List[AIProgrammeDraft]:
 
 
 def _merge_two_drafts(left: AIProgrammeDraft, right: AIProgrammeDraft) -> AIProgrammeDraft:
+    # Draft merge favors the left-hand record and only fills gaps from the right
+    # unless the field is a list or evidence map that should be unioned.
     payload = left.model_dump(mode="python")
     candidate = right.model_dump(mode="python")
     for key, value in candidate.items():
@@ -1021,6 +1127,8 @@ def _merge_two_drafts(left: AIProgrammeDraft, right: AIProgrammeDraft) -> AIProg
 
 
 def _is_missing_required_fields(draft: AIProgrammeDraft) -> List[str]:
+    # The classifier only insists on a small core of fields; this check reports
+    # which of those are still empty after normalization.
     missing: List[str] = []
     if not _coerce_text(draft.program_name):
         missing.append("program_name")
@@ -1041,10 +1149,14 @@ def _normalize_draft(
     entity_type_keywords: Dict[str, List[str]],
     certification_keywords: Dict[str, List[str]],
 ) -> AIProgrammeDraft:
+    # Normalization is the last deterministic pass before a draft becomes a
+    # FundingProgrammeRecord: it fills gaps, fixes types, and merges evidence.
     derived = _derive_page_evidence(document)
     document_context = _document_evidence_context(document)
     payload = draft.model_dump(mode="python")
     ai_eligibility_items = _coerce_list(payload.get("raw_eligibility_data"))
+    # Eligibility text is rebuilt from the page evidence so structured fields can
+    # be derived consistently even when the model omits some detail.
     eligibility_text = _combine_eligibility_text(
         document,
         ai_eligibility_items or derived["raw_eligibility_data"] or [],
@@ -1062,6 +1174,8 @@ def _normalize_draft(
         _eligibility_source_text(document, document_context, derived)
     )
     payback_profile = extract_payback_details(_payback_source_text(document, document_context, derived))
+    # Source fields are anchored to the current page, not to whatever the model
+    # guessed, because this function is normalizing output rather than rethinking it.
     payload["source_url"] = document.page_url
     payload["source_urls"] = [document.page_url]
     payload["source_page_title"] = _coerce_optional_text(payload.get("source_page_title")) or document.title
@@ -1070,6 +1184,8 @@ def _normalize_draft(
         payload["program_name"] = strip_leading_numbered_prefix(document.title)
     payload["funder_name"] = _infer_funder_name(document, payload) or _coerce_optional_text(payload.get("funder_name"))
     payload["parent_programme_name"] = _coerce_optional_text(payload.get("parent_programme_name"))
+    # All enum-like fields are normalized to schema values so the downstream
+    # record validator receives exactly one representation.
     payload["funding_type"] = (_coerce_enum(FundingType, payload.get("funding_type")) or FundingType.UNKNOWN).value
     payload["deadline_type"] = (_coerce_enum(DeadlineType, payload.get("deadline_type")) or DeadlineType.UNKNOWN).value
     payload["geography_scope"] = (_coerce_enum(GeographyScope, payload.get("geography_scope")) or GeographyScope.UNKNOWN).value
@@ -1082,6 +1198,7 @@ def _normalize_draft(
     payload["application_channel"] = (
         _coerce_enum(ApplicationChannel, payload.get("application_channel")) or ApplicationChannel.UNKNOWN
     ).value
+    # The record keeps both AI-provided and deterministic evidence lines.
     base_funding_lines = _coerce_list(payload.get("funding_lines")) or list(derived["raw_funding_offer_data"])
     payload["funding_lines"] = unique_preserve_order(
         [*base_funding_lines, *document_context["funding_lines"]]
@@ -1134,6 +1251,8 @@ def _normalize_draft(
     payload["grace_period_months"] = _coerce_int(payload.get("grace_period_months"))
     if payload["grace_period_months"] is None:
         payload["grace_period_months"] = payback_profile.grace_period_months
+    # Payback confidence should reflect the strongest trustworthy signal from
+    # either the AI output or the deterministic extractor.
     payload["payback_confidence"] = max(
         payback_profile.confidence,
         float(payload.get("payback_confidence") or 0.0),
@@ -1154,6 +1273,8 @@ def _normalize_draft(
     payload["raw_terms_data"] = unique_preserve_order([*base_raw_terms_data, *document_context["eligibility_lines"]])
     payload["raw_documents_data"] = unique_preserve_order([*base_raw_documents_data, *document_context["evidence_lines"]])
     payload["raw_application_data"] = unique_preserve_order([*base_raw_application_data, *document_context["application_lines"]])
+    # Raw snippets preserve the exact evidence fragments that justified the
+    # normalized fields.
     payload["raw_text_snippets"] = {
         key: _coerce_list(value)
         for key, value in {
@@ -1165,6 +1286,8 @@ def _normalize_draft(
             "document_evidence": document_context["evidence_lines"],
         }.items()
     }
+    # Confidence values are clamped to [0, 1] so the record cannot carry invalid
+    # scores into storage.
     payload["extraction_confidence"] = {
         str(key): max(0.0, min(float(value), 1.0))
         for key, value in {**derived["extraction_confidence"], **dict(payload.get("extraction_confidence") or {})}.items()
@@ -1180,11 +1303,14 @@ def _normalize_draft(
             payload["extraction_confidence"].get("raw_eligibility_criteria", 0.0),
             0.88,
         )
+    # Approval status is sanitized to a known enum member before the final model
+    # validation call.
     payload["approval_status"] = (
         _coerce_text(payload.get("approval_status")).casefold() if payload.get("approval_status") else ApprovalStatus.PENDING.value
     )
     if payload["approval_status"] not in {member.value for member in ApprovalStatus}:
         payload["approval_status"] = ApprovalStatus.PENDING.value
+    # The default country remains ZA unless the model or source says otherwise.
     payload["country_code"] = _coerce_text(payload.get("country_code")) or "ZA"
     payload["status"] = _coerce_text(payload.get("status")) or "unknown"
     payload["ai_enriched"] = True
@@ -1194,6 +1320,8 @@ def _normalize_draft(
     )
     payload["funder_name"] = payload["funder_name"] or _infer_funder_name(document, payload)
 
+    # Money values are backfilled from the combined document evidence when the
+    # model did not provide clear amounts.
     if not payload["ticket_min"] or not payload["ticket_max"] or not payload["program_budget_total"]:
         doc_money_min, doc_money_max, doc_currency, _snippet, _confidence = extract_money_range(
             document_context["combined_text"],
@@ -1207,6 +1335,8 @@ def _normalize_draft(
             payload["program_budget_total"] = doc_money_max or doc_money_min
         if not payload.get("currency"):
             payload["currency"] = doc_currency
+    # Application/contact details are filled from the linked evidence when the
+    # model leaves them blank.
     if not payload["application_url"]:
         application_urls = [url for url in document_context["urls"] if any(term in url.lower() for term in ["apply", "application", "portal", "register"])]
         payload["application_url"] = application_urls[0] if application_urls else None
@@ -1228,11 +1358,15 @@ def _draft_to_record(
     entity_type_keywords: Dict[str, List[str]],
     certification_keywords: Dict[str, List[str]],
 ) -> FundingProgrammeRecord:
+    # This is the final normalization step: it turns the draft plus supporting
+    # evidence into the canonical FundingProgrammeRecord object.
     now = datetime.now(timezone.utc)
     derived = _derive_page_evidence(document)
     document_context = _document_evidence_context(document)
     payload = draft.model_dump(mode="python")
     ai_eligibility_items = _coerce_list(payload.get("raw_eligibility_data"))
+    # Rebuild eligibility text from the current page so deterministic extraction
+    # can supplement or override incomplete model output.
     eligibility_text = _combine_eligibility_text(
         document,
         ai_eligibility_items or derived["raw_eligibility_data"] or [],
@@ -1250,6 +1384,8 @@ def _draft_to_record(
         _eligibility_source_text(document, document_context, derived)
     )
     payback_profile = extract_payback_details(_payback_source_text(document, document_context, derived))
+    # Pull the basic schema enums out first so the rest of the field population
+    # can rely on stable values.
     source_url = document.page_url
     source_domain = payload.get("source_domain") or extract_domain(source_url)
     funding_type = _coerce_enum(FundingType, payload.get("funding_type")) or FundingType.UNKNOWN
@@ -1262,6 +1398,8 @@ def _draft_to_record(
     application_channel = _coerce_enum(ApplicationChannel, payload.get("application_channel")) or ApplicationChannel.UNKNOWN
     approval_status = _coerce_enum(ApprovalStatus, payload.get("approval_status")) or ApprovalStatus.PENDING
 
+    # Lists are merged from AI output, deterministic extraction, and linked
+    # evidence so the final record keeps the richest available source text.
     raw_eligibility_data = ai_eligibility_items or eligibility_profile["raw_eligibility_data"] or derived["raw_eligibility_data"]
     raw_eligibility_criteria = _coerce_list(payload.get("raw_eligibility_criteria")) or eligibility_criteria
     base_funding_lines = _coerce_list(payload.get("funding_lines")) or list(derived["raw_funding_offer_data"])
@@ -1281,6 +1419,7 @@ def _draft_to_record(
     notes = unique_preserve_order([*_coerce_list(payload.get("notes")), *document_context["notes"]])
     source_urls = [source_url]
 
+    # Amount fields are normalized before any backfill logic runs.
     ticket_min = _coerce_float(payload.get("ticket_min"))
     ticket_max = _coerce_float(payload.get("ticket_max"))
     if ticket_min is not None and ticket_max is not None and ticket_min > ticket_max:
@@ -1295,6 +1434,8 @@ def _draft_to_record(
     years_in_business_max = _coerce_float(payload.get("years_in_business_max")) or eligibility_profile["years_in_business_max"]
     employee_min = _coerce_int(payload.get("employee_min")) or eligibility_profile["employee_min"]
     employee_max = _coerce_int(payload.get("employee_max")) or eligibility_profile["employee_max"]
+    # Repayment fields are populated from the model first, then from the
+    # deterministic repayment extractor where the model left gaps.
     payback_months_min = _coerce_int(payload.get("payback_months_min"))
     payback_months_max = _coerce_int(payload.get("payback_months_max"))
     payback_raw_text = _coerce_optional_text(payload.get("payback_raw_text")) or payback_profile.raw_text
@@ -1323,6 +1464,8 @@ def _draft_to_record(
     if not currency and any(text for text in (ticket_min, ticket_max, program_budget_total) if text is not None):
         currency = "ZAR" if (source_domain or "").endswith(".za") else None
 
+    # Deadline parsing is recomputed from the full page and document evidence so
+    # the record does not depend entirely on the model's interpretation.
     deadline_info = parse_deadline_info(
         " ".join(
             [
@@ -1342,6 +1485,7 @@ def _draft_to_record(
     if deadline_date is None and deadline_info.get("deadline_date"):
         deadline_date = deadline_info.get("deadline_date")
 
+    # Keep the exact supporting fragments around for debugging and later review.
     raw_text_snippets = {
         key: _coerce_list(value)
         for key, value in {
@@ -1373,6 +1517,7 @@ def _draft_to_record(
     contact_email = _coerce_optional_text(payload.get("contact_email")) or (document_context["emails"][0] if document_context["emails"] else None)
     contact_phone = _coerce_optional_text(payload.get("contact_phone")) or (document_context["phones"][0] if document_context["phones"] else None)
 
+    # Confidence scores are merged from all sources and clamped to a valid range.
     extraction_confidence = {
         str(key): max(0.0, min(float(value), 1.0))
         for key, value in {**derived["extraction_confidence"], **dict(payload.get("extraction_confidence") or {})}.items()
@@ -1391,6 +1536,7 @@ def _draft_to_record(
     if not extraction_confidence and _coerce_text(payload.get("program_name")):
         extraction_confidence["program_name"] = 0.65
 
+    # Build the final record with every normalized and backfilled field in place.
     record = FundingProgrammeRecord(
         program_name=_coerce_optional_text(payload.get("program_name")) or None,
         funder_name=_coerce_optional_text(payload.get("funder_name")) or None,
@@ -1474,6 +1620,8 @@ class AIClassifier:
     """Classify cleaned page content into the funding-programme schema."""
 
     def __init__(self, config: Dict[str, Any], storage: Optional[Any] = None) -> None:
+        # Configuration is split between runtime flags, model/provider selection,
+        # and optional extraction limits for linked support documents.
         self.config = config
         self.storage = storage
         self.disable_remote_ai = bool(config.get("disableRemoteAi") or config.get("offline"))
@@ -1510,15 +1658,19 @@ class AIClassifier:
         self.certification_keywords = _as_taxonomy(config.get("certification_keywords"))
 
     def _document_headers(self) -> Dict[str, str]:
+        # Remote document requests use a simple browser-like header set.
         return {
             "User-Agent": "Mozilla/5.0 (compatible; Scrapper/1.0; +https://example.org)",
             "Accept": "*/*",
         }
 
     def _artifact_slug(self, document: PageContentDocument) -> str:
+        # Artifact filenames are derived from the URL so each page gets a stable
+        # storage key.
         return re.sub(r"[^a-zA-Z0-9]+", "-", document.page_url.lower()).strip("-")[:120] or "page"
 
     def _write_artifact(self, kind: str, document: PageContentDocument, payload: Any) -> None:
+        # If storage is configured, persist the prompt or response for debugging.
         if not self.storage:
             return
         method_name = {
@@ -1533,6 +1685,8 @@ class AIClassifier:
                 logger.debug("ai_artifact_write_failed", kind=kind, page_url=document.page_url)
 
     def _should_skip_document_source(self, url: str, content_type: Optional[str]) -> bool:
+        # Some document types and URL patterns are intentionally skipped because
+        # they are noisy, unsupported, or not useful as AI evidence.
         lowered_url = (url or "").lower()
         lowered_content_type = clean_text(content_type or "").lower()
         if lowered_content_type and any(lowered_content_type.startswith(item) for item in self.document_ai_skip_content_types):
@@ -1542,6 +1696,8 @@ class AIClassifier:
         return False
 
     def _read_remote_document(self, url: str) -> tuple[Optional[bytes], Optional[str], List[str]]:
+        # Linked support files are fetched over HTTP so they can be read locally
+        # and summarized into evidence snapshots.
         with httpx.Client(timeout=self.document_ai_timeout_seconds, follow_redirects=True) as client:
             response = client.get(url, headers=self._document_headers())
             response.raise_for_status()
@@ -1556,6 +1712,8 @@ class AIClassifier:
         *,
         programme_context: Optional[Dict[str, str]] = None,
     ) -> str:
+        # The document summary prompt tells the model to summarize support files
+        # without inventing facts or overriding the page itself.
         programme_context = programme_context or {}
         return (
             "You are reading a funding-programme support document.\n"
@@ -1575,6 +1733,8 @@ class AIClassifier:
         )
 
     def _parse_document_summary_response(self, raw: str) -> Dict[str, Any]:
+        # The summary response is parsed as strict JSON, with a small fallback for
+        # models that wrap the object in extra text.
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
@@ -1596,6 +1756,8 @@ class AIClassifier:
         raw_bytes: Optional[bytes] = None,
         programme_context: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
+        # OpenAI-only summary mode is used when the linked document itself needs a
+        # compact evidence summary before the classifier sees it.
         if not self.api_key or self.ai_provider != "openai":
             return {}
 
@@ -1610,6 +1772,8 @@ class AIClassifier:
         content: List[Dict[str, Any]] = [{"type": "input_text", "text": "Read this document and extract the useful programme evidence."}]
 
         if extracted_text:
+            # If text extraction worked, send the cleaned text instead of the raw
+            # binary file so the response stays focused.
             content.append(
                 {
                     "type": "input_text",
@@ -1617,8 +1781,10 @@ class AIClassifier:
                 }
             )
         elif kind == "image":
+            # Images are sent directly when no text layer is available.
             content.append({"type": "input_image", "image_url": document_url, "detail": "high"})
         elif raw_bytes:
+            # Binary documents are embedded as a file payload when supported.
             content.append(
                 {
                     "type": "input_file",
@@ -1630,6 +1796,8 @@ class AIClassifier:
         else:
             content.append({"type": "input_text", "text": "No machine-readable text was extracted. Read the document metadata and any visible text carefully."})
 
+        # The response is forced to JSON so the summary payload can be parsed
+        # deterministically.
         response = client.responses.create(
             model=self.model,
             instructions=prompt,
@@ -1653,6 +1821,8 @@ class AIClassifier:
         existing_text: str = "",
         programme_context: Optional[Dict[str, str]] = None,
     ) -> Optional[DocumentEvidenceSnapshot]:
+        # Each linked file is converted into a compact evidence snapshot that
+        # carries both a summary and the cleaned text that was actually read.
         if self._should_skip_document_source(document_url, content_type):
             return None
         kind = infer_document_kind(document_url, content_type)
@@ -1660,15 +1830,20 @@ class AIClassifier:
             return None
 
         if existing_text:
+            # When the page itself already contains text, use it directly instead
+            # of fetching the source again.
             text = compact_document_text(existing_text, max_chars=self.document_ai_max_extracted_chars)
             notes = []
         else:
+            # Otherwise read the remote file and run local text extraction.
             local_result = extract_local_document_text(raw_bytes or b"", document_url, content_type)
             text = compact_document_text(local_result.text, max_chars=self.document_ai_max_extracted_chars)
             notes = list(local_result.notes)
         summary_payload: Dict[str, Any] = {}
         if self.api_key and self.ai_provider == "openai":
             try:
+                # A second AI pass can summarize the file when OpenAI is the
+                # configured provider.
                 summary_payload = self._summarize_document_with_openai(
                     document_url=document_url,
                     kind=kind,
@@ -1691,6 +1866,8 @@ class AIClassifier:
         extracted_text = text or None
         if summary_payload.get("notes"):
             notes.extend([clean_text(str(item)) for item in summary_payload.get("notes") or [] if clean_text(str(item))])
+        # The final snapshot keeps the summary, short key points, cleaned text,
+        # and any notes about how the file was processed.
         return DocumentEvidenceSnapshot(
             document_url=document_url,
             document_kind=kind,
@@ -1703,6 +1880,8 @@ class AIClassifier:
         )
 
     def _prepare_document_context(self, document: PageContentDocument) -> PageContentDocument:
+        # This enriches the main page with linked PDFs/docs/images so the model
+        # can use supporting evidence without replacing the page's own facts.
         if document.document_evidence:
             return document
 
@@ -1772,6 +1951,8 @@ class AIClassifier:
         return document
 
     def _build_system_prompt(self) -> str:
+        # The system prompt defines the strict contract: JSON only, conservative
+        # extraction, and explicit rules for page classification and repayment fields.
         return (
             "You are a strict JSON classifier for funding programme pages.\n"
             "Return JSON only. Do not add markdown, comments, or explanations.\n"
@@ -1807,6 +1988,8 @@ class AIClassifier:
         *,
         record_snapshots: Optional[Sequence[PageAIRecordSnapshot | Dict[str, Any] | Any]] = None,
     ) -> str:
+        # The user prompt sends a compact JSON payload so the model sees only
+        # the fields relevant to the current page and any current record state.
         payload = _build_context_prompt_payload(document, record_snapshots=record_snapshots)
         prompt = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if len(prompt) > MAX_PROMPT_CHARS:
@@ -1829,6 +2012,8 @@ class AIClassifier:
         *,
         record_snapshots: Optional[Sequence[PageAIRecordSnapshot | Dict[str, Any] | Any]] = None,
     ) -> str:
+        # When the model omits required fields, this follow-up prompt narrows the
+        # correction request to only the missing pieces.
         payload = _build_context_prompt_payload(document, record_snapshots=record_snapshots)
         payload["missing_fields"] = list(missing_fields)
         prompt = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
@@ -1847,6 +2032,8 @@ class AIClassifier:
         *,
         record_snapshots: Optional[Sequence[PageAIRecordSnapshot | Dict[str, Any] | Any]] = None,
     ) -> str:
+        # If the classifier is uncertain, this prompt asks only for the page
+        # decision before trying to fill record fields again.
         payload = _build_context_prompt_payload(document, record_snapshots=record_snapshots)
         prompt = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
         if len(prompt) > MAX_PROMPT_CHARS:
@@ -1860,6 +2047,8 @@ class AIClassifier:
         )
 
     def _merge_record_payload(self, record: FundingProgrammeRecord) -> Dict[str, Any]:
+        # Merge decisions need a concise record view, so this strips each record
+        # down to the fields that matter for deduplication.
         parsed_url = urlparse(record.source_url or "")
         source_path = parsed_url.path or ""
         return {
@@ -1894,6 +2083,8 @@ class AIClassifier:
         }
 
     def _build_merge_decision_prompt(self, left: FundingProgrammeRecord, right: FundingProgrammeRecord) -> str:
+        # The merge prompt compares two compact record payloads and asks the model
+        # to decide whether they describe the same underlying programme.
         payload = {
             "left_record": self._merge_record_payload(left),
             "right_record": self._merge_record_payload(right),
@@ -1916,6 +2107,8 @@ class AIClassifier:
         )
 
     def _normalize_merge_decision(self, value: Any) -> str:
+        # Merge decisions can come back in several phrasing variants, so they are
+        # normalized before the confidence threshold is applied.
         text = _coerce_text(value).casefold().replace("-", "_").replace(" ", "_")
         if text in {"merge", "same", "same_program", "same_programme", "duplicate", "duplicates"}:
             return "merge"
@@ -1924,12 +2117,16 @@ class AIClassifier:
         return "unclear"
 
     def should_merge_records(self, left: FundingProgrammeRecord, right: FundingProgrammeRecord) -> Optional[bool]:
+        # The merge judge is only invoked for records that already look like the
+        # same programme by name and funder.
         if not self.api_key:
             return None
         same_name = clean_text(left.program_name or "").casefold() == clean_text(right.program_name or "").casefold()
         same_funder = clean_text(left.funder_name or "").casefold() == clean_text(right.funder_name or "").casefold()
         if not (same_name and same_funder):
             return None
+        # The judge prompt is intentionally conservative because sibling
+        # programmes should stay separate unless the evidence is clear.
         system_prompt = (
             "You are a strict JSON judge for funding programme deduplication.\n"
             "Return JSON only.\n"
@@ -1965,6 +2162,8 @@ class AIClassifier:
         return None
 
     def _call_openai(self, system_prompt: str, user_prompt: str) -> str:
+        # OpenAI is called through the chat completions API with JSON output
+        # forced at the transport layer.
         client = OpenAI(api_key=self.api_key)
         response = client.chat.completions.create(
             model=self.model,
@@ -1978,6 +2177,7 @@ class AIClassifier:
         return response.choices[0].message.content or "{}"
 
     def _call_groq(self, system_prompt: str, user_prompt: str) -> str:
+        # Groq uses the OpenAI-compatible HTTP endpoint directly.
         with httpx.Client(timeout=45.0) as client:
             response = client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -1999,6 +2199,8 @@ class AIClassifier:
             return response.json()["choices"][0]["message"]["content"]
 
     def _call_model(self, system_prompt: str, user_prompt: str) -> str:
+        # Route the request to the configured provider and fail fast if no key is
+        # available.
         if not self.api_key:
             raise RuntimeError("Missing AI API key.")
         if self.ai_provider == "openai":
@@ -2008,6 +2210,8 @@ class AIClassifier:
         raise ValueError(f"Unsupported AI provider: {self.ai_provider}")
 
     def _parse_response(self, raw: str) -> AIClassificationResponse:
+        # The classifier response must be strict JSON; a small regex fallback is
+        # used when the model wraps the object in extra text.
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
@@ -2020,6 +2224,8 @@ class AIClassifier:
         return AIClassificationResponse.model_validate(payload)
 
     def _fallback_classify(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
+        # If remote AI is unavailable, fall back to deterministic heuristics so
+        # the pipeline still produces a best-effort record instead of failing.
         document = self._prepare_document_context(document)
         page_decision, decision_reasons = _page_decision_hint(document)
         if page_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
@@ -2037,7 +2243,8 @@ class AIClassifier:
             program_name = heading_candidate or title_candidate
         section_text = " ".join(section.content for section in document.structured_sections)
         document_text = _document_evidence_text(document)
-        body = document.full_body_text or section_text or document_text
+        interactive_text = _interactive_sections_text(document)
+        body = document.full_body_text or section_text or interactive_text or document_text
         source_domain = document.source_domain or extract_domain(document.page_url)
         funding_type = FundingType.UNKNOWN
         lowered = body.lower()
@@ -2050,7 +2257,7 @@ class AIClassifier:
         elif "guarantee" in lowered:
             funding_type = FundingType.GUARANTEE
 
-        combined_text = " ".join([title, body, section_text, document_text])
+        combined_text = " ".join([title, body, section_text, interactive_text, document_text])
         money_min, money_max, currency, _snippet, _confidence = extract_money_range(combined_text, default_currency=None)
         budget_total, budget_currency, _budget_snippet, _budget_confidence = extract_budget_total(combined_text)
         if not currency:
@@ -2191,6 +2398,8 @@ class AIClassifier:
         return [FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))]
 
     def classify_document(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
+        # This is the main AI path: prepare context, call the model, retry on
+        # malformed or incomplete responses, and fall back if everything fails.
         if not document.page_url:
             return []
         document = self._prepare_document_context(document)
@@ -2301,9 +2510,13 @@ class AIClassifier:
         return records
 
     def classify_page(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
+        # Public wrapper kept for callers that still use the older page-oriented
+        # name.
         return self.classify_document(document)
 
     def classify_documents(self, documents: Sequence[PageContentDocument]) -> List[FundingProgrammeRecord]:
+        # Batch classification simply runs the single-document path for each page
+        # and concatenates the results.
         records: List[FundingProgrammeRecord] = []
         for document in documents:
             records.extend(self.classify_document(document))
@@ -2311,6 +2524,8 @@ class AIClassifier:
 
     # Compatibility shims for the older enrichment interface.
     def enrich_record(self, record: FundingProgrammeRecord, page_text_or_context: Any) -> FundingProgrammeRecord:
+        # Older callers can still provide a page document or raw text and get a
+        # single best-effort record back.
         if isinstance(page_text_or_context, PageContentDocument):
             classified = self.classify_document(page_text_or_context)
             return classified[0] if classified else record
@@ -2329,9 +2544,13 @@ class AIClassifier:
         return classified[0] if classified else record
 
     def enrich_records(self, records: List[FundingProgrammeRecord], page_context: Any) -> List[FundingProgrammeRecord]:
+        # Compatibility layer for older callers that still expect an "enrich"
+        # style API rather than the newer classify-first flow.
         if isinstance(page_context, PageContentDocument):
             page_context = self._prepare_document_context(page_context)
             if self.api_key:
+                # When AI is available, the existing records are re-evaluated
+                # against the page context as a batch.
                 record_snapshots = [
                     PageAIRecordSnapshot(
                         record_index=index,
@@ -2350,6 +2569,8 @@ class AIClassifier:
                         return []
                     updated_records: List[FundingProgrammeRecord] = []
                     for draft in _merge_drafts(parsed.records):
+                        # Each draft is normalized back into the canonical record
+                        # shape before being returned to the caller.
                         normalized = _normalize_draft(
                             draft,
                             page_context,
@@ -2379,4 +2600,5 @@ class AIClassifier:
         return list(records)
 
 
+# Backwards-compatible alias used by older code paths.
 AIEnhancer = AIClassifier
