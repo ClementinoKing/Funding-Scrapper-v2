@@ -31,6 +31,139 @@ def _build_generic_adapter() -> SiteAdapter:
     )
 
 
+def _build_sharepoint_portal_adapter() -> SiteAdapter:
+    # Public institutions often expose programme content through SharePoint or
+    # ShortPoint-style shells. This profile keeps the crawl generic while
+    # widening the selectors and route hints for that CMS shape.
+    return SiteAdapter(
+        key="sharepoint_portal",
+        domain="*",
+        allowed_path_prefixes=("/Pages/", "/pic/", "/apply-for-funding/"),
+        include_url_terms=(
+            "fund",
+            "funding",
+            "investment",
+            "portfolio",
+            "properties",
+            "isibaya",
+            "early-stage",
+            "programme",
+            "program",
+            "apply",
+            "site map",
+            "sitemap",
+        ),
+        exclude_url_terms=("news", "media", "press", "blog", "careers", "privacy", "terms", "login", "sign in", "cookie"),
+        discovery_terms=("fund", "funding", "investment", "portfolio", "properties", "isibaya", "early-stage", "apply"),
+        content_selectors=(
+            "main",
+            "article",
+            ".content",
+            ".programme-content",
+            ".entry-content",
+            ".ms-rtestate-field",
+            ".spPageContent",
+            ".shortpoint-content",
+            ".shortpoint-block",
+            ".shortpoint-section",
+        ),
+        candidate_selectors=(
+            "article",
+            "section",
+            "section.card",
+            ".card",
+            ".tile",
+            ".panel",
+            ".accordion",
+            ".tab-content",
+            ".tab-pane",
+            "[role='tabpanel']",
+            ".ms-rtestate-field",
+            ".shortpoint-content",
+            ".shortpoint-block",
+        ),
+        content_exclude_selectors=(
+            "nav",
+            "footer",
+            "header",
+            "aside",
+            ".sidebar",
+            ".breadcrumbs",
+            ".breadcrumb",
+            ".cookie",
+            ".cookie-banner",
+            ".ms-ToolPane",
+            ".ribbon",
+            ".search",
+            ".social",
+        ),
+        section_heading_selectors=(
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            ".accordion-title",
+            ".tab-title",
+            ".panel-title",
+            ".shortpoint-title",
+        ),
+        site_profile=SiteExtractionProfile(
+            content_scope_selectors=(
+                "main",
+                "article",
+                ".content",
+                ".programme-content",
+                ".entry-content",
+                ".ms-rtestate-field",
+                ".spPageContent",
+                ".shortpoint-content",
+                ".shortpoint-block",
+                ".shortpoint-section",
+            ),
+            content_exclude_selectors=(
+                "nav",
+                "footer",
+                "header",
+                "aside",
+                ".sidebar",
+                ".breadcrumbs",
+                ".breadcrumb",
+                ".cookie",
+                ".cookie-banner",
+                ".ms-ToolPane",
+                ".ribbon",
+                ".search",
+                ".social",
+            ),
+            candidate_selectors=(
+                "article",
+                "section",
+                "section.card",
+                ".card",
+                ".tile",
+                ".panel",
+                ".accordion",
+                ".tab-content",
+                ".tab-pane",
+                "[role='tabpanel']",
+                ".ms-rtestate-field",
+                ".shortpoint-content",
+                ".shortpoint-block",
+            ),
+            section_heading_selectors=(
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                ".accordion-title",
+                ".tab-title",
+                ".panel-title",
+                ".shortpoint-title",
+            ),
+        ),
+    )
+
+
 @dataclass
 class SiteAdapterRegistry:
     """Compatibility wrapper around the generic adapter.
@@ -53,9 +186,9 @@ class SiteAdapterRegistry:
 
     @classmethod
     def default(cls) -> "SiteAdapterRegistry":
-        # The default registry intentionally starts empty apart from the generic
-        # adapter. That makes the DB the source of truth for site-specific rules.
-        return cls()
+        # The default registry keeps the generic adapter and a reusable portal
+        # profile available for site rows that need SharePoint-style crawling.
+        return cls(adapters_by_key={"sharepoint_portal": _build_sharepoint_portal_adapter()})
 
     def register(self, adapter: SiteAdapter) -> None:
         # Still supported for tests or edge cases, but not used by the normal

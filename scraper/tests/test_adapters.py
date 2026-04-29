@@ -312,6 +312,30 @@ def test_generic_adapter_infers_parent_programme_name_from_support_child_url() -
     assert normalized.parent_programme_name == "Tourism Transformation Fund"
 
 
+def test_sharepoint_portal_profile_resolves_relative_seed_urls() -> None:
+    registry = build_default_registry()
+    adapter = registry.get_by_key("sharepoint_portal")
+
+    assert adapter.key == "sharepoint_portal"
+    assert ".shortpoint-content" in adapter.extraction_profile().content_scope_selectors
+
+    configured = adapter.configured(
+        {
+            "default_seed_urls": [
+                "/pic/site/site-map",
+                "/apply-for-funding/isibaya",
+                "https://www.pic.gov.za/apply-for-funding/properties",
+            ]
+        }
+    )
+
+    assert configured.default_seed_urls_for_domain("www.pic.gov.za") == [
+        "https://www.pic.gov.za/pic/site/site-map",
+        "https://www.pic.gov.za/apply-for-funding/isibaya",
+        "https://www.pic.gov.za/apply-for-funding/properties",
+    ]
+
+
 def test_pipeline_applies_site_adapter_config_to_narrow_crawls(settings, monkeypatch) -> None:
     monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
 

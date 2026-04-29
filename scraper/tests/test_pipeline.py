@@ -416,6 +416,60 @@ def test_ai_classifier_strips_numbered_titles_and_keeps_page_source_only(setting
     assert records[0].source_urls == [document.page_url]
 
 
+def test_ai_classifier_routes_interactive_content_into_field_evidence(settings, tmp_path: Path) -> None:
+    document = PageContentDocument(
+        page_url="https://www.pic.gov.za/early-stage-fund",
+        title="Early Stage Fund - Public Investment Corporation",
+        headings=["Early Stage Fund", "Eligibility Criteria", "How to Apply"],
+        full_body_text="",
+        structured_sections=[
+            {"heading": "Overview", "content": "Targeted investment support for early-stage businesses."},
+        ],
+        interactive_sections=[
+            {
+                "type": "tab",
+                "label": "Eligibility Criteria",
+                "content": "Applicants must be South African SMEs trading for at least 2 years with turnover below R5 million.",
+            },
+            {
+                "type": "accordion",
+                "label": "How to Apply",
+                "content": "Apply online at https://www.pic.gov.za/apply/early-stage-fund or email pic@example.org. Applications close on 30 June 2026.",
+            },
+            {
+                "type": "card",
+                "label": "Funding Terms",
+                "content": "Loans from R250 000 to R2 million repayable over 36 months with monthly instalments.",
+            },
+            {
+                "type": "table",
+                "label": "Required Documents",
+                "content": "Completed application form | Latest bank statements | Company registration documents",
+            },
+        ],
+        document_links=["https://www.pic.gov.za/docs/early-stage-fund-brochure.pdf"],
+        application_links=["https://www.pic.gov.za/apply/early-stage-fund"],
+        internal_links=["https://www.pic.gov.za/isibaya"],
+        discovered_links=["https://www.pic.gov.za/early-stage-fund"],
+        source_domain="pic.gov.za",
+    )
+
+    classifier = AIClassifier({"disableRemoteAi": True}, storage=LocalJsonStore(tmp_path))
+    records = classifier.classify_document(document)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.application_url == "https://www.pic.gov.za/apply/early-stage-fund"
+    assert record.contact_email == "pic@example.org"
+    assert record.payback_term_max_months == 36
+    assert record.required_documents
+    assert "raw_application_data" in record.evidence_by_field
+    assert "raw_eligibility_data" in record.evidence_by_field
+    assert record.field_confidence.get("application_url", 0.0) > 0.5
+    assert record.field_confidence.get("payback_term_max_months", 0.0) > 0.5
+    assert not record.validation_errors
+
+
 def test_schema_keeps_funding_lists_as_arrays() -> None:
     record = FundingProgrammeRecord(
         program_name="Expansion Capital",

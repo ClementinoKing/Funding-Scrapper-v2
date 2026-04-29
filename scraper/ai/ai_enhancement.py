@@ -7,6 +7,7 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -147,6 +148,203 @@ ELIGIBILITY_STAGE_PATTERNS = {
     "expansion": ("expansion", "expanding", "expand your business"),
     "established business": ("established business", "existing business", "trading for"),
 }
+
+CONTENT_BUCKET_TERMS = {
+    "program": (
+        "about",
+        "overview",
+        "summary",
+        "programme",
+        "program",
+        "what is",
+        "who we are",
+    ),
+    "eligibility": (
+        "eligibility",
+        "criteria",
+        "requirements",
+        "who can apply",
+        "who qualifies",
+        "qualifying",
+        "applicant requirements",
+        "funding requirements",
+        "selection criteria",
+    ),
+    "funding": (
+        "funding",
+        "fund",
+        "grant",
+        "loan",
+        "equity",
+        "investment",
+        "finance",
+        "offer",
+        "budget",
+        "amount",
+        "capital",
+    ),
+    "terms": (
+        "terms",
+        "conditions",
+        "repayment",
+        "payback",
+        "interest",
+        "tenor",
+        "term",
+        "moratorium",
+        "grace period",
+        "security",
+        "collateral",
+    ),
+    "documents": (
+        "document",
+        "documents",
+        "checklist",
+        "guidelines",
+        "brochure",
+        "download",
+        "certificate",
+        "proof",
+        "registration",
+    ),
+    "application": (
+        "apply",
+        "application",
+        "portal",
+        "submit",
+        "submission",
+        "register",
+        "how to apply",
+        "application process",
+    ),
+    "deadline": (
+        "deadline",
+        "closing date",
+        "opening date",
+        "intake",
+        "applications close",
+        "closing",
+    ),
+    "contact": (
+        "contact",
+        "email",
+        "phone",
+        "telephone",
+        "whatsapp",
+        "call us",
+    ),
+    "geography": (
+        "national",
+        "province",
+        "municipality",
+        "local",
+        "south africa",
+        "regional",
+    ),
+}
+
+FIELD_EVIDENCE_SKIP_FIELDS = {
+    "id",
+    "program_id",
+    "program_slug",
+    "funder_slug",
+    "created_at",
+    "updated_at",
+    "last_scraped_at",
+    "last_verified_at",
+    "scraped_at",
+    "parser_version",
+    "deleted_at",
+    "field_evidence",
+    "evidence_by_field",
+    "extraction_confidence_by_field",
+    "raw_text_snippets",
+    "field_confidence",
+    "validation_errors",
+    "needs_review",
+    "ai_enriched",
+}
+
+FIELD_EVIDENCE_CORE_FIELDS = {
+    "program_name",
+    "funder_name",
+    "source_url",
+    "source_urls",
+    "source_domain",
+    "source_page_title",
+    "page_type",
+    "source_scope",
+    "funding_type",
+    "geography_scope",
+    "application_channel",
+    "application_url",
+    "contact_email",
+    "contact_phone",
+    "deadline_type",
+    "deadline_date",
+    "ticket_min",
+    "ticket_max",
+    "program_budget_total",
+    "payback_raw_text",
+    "payback_structure",
+    "payback_term_min_months",
+    "payback_term_max_months",
+    "payback_months_min",
+    "payback_months_max",
+    "grace_period_months",
+    "interest_type",
+    "repayment_frequency",
+    "security_required",
+    "equity_required",
+    "required_documents",
+    "related_documents",
+    "raw_eligibility_data",
+    "raw_eligibility_criteria",
+    "raw_funding_offer_data",
+    "raw_terms_data",
+    "raw_documents_data",
+    "raw_application_data",
+    "funding_lines",
+    "industries",
+    "use_of_funds",
+    "business_stage_eligibility",
+    "turnover_min",
+    "turnover_max",
+    "years_in_business_min",
+    "years_in_business_max",
+    "employee_min",
+    "employee_max",
+    "ownership_targets",
+    "entity_types_allowed",
+    "certifications_required",
+    "exclusions",
+}
+
+
+@dataclass(frozen=True)
+class ContentItem:
+    """One normalized text block extracted from the page payload."""
+
+    item_type: str
+    label: str
+    content: str
+    source_url: str
+    source_section: Optional[str] = None
+    source_scope: Optional[str] = None
+    confidence_hint: float = 0.0
+    order: int = 0
+
+
+@dataclass
+class FieldEvidenceBundle:
+    """Aggregated field evidence collected from routed content items."""
+
+    evidence_by_field: Dict[str, List[str]] = field(default_factory=dict)
+    raw_text_snippets: Dict[str, List[str]] = field(default_factory=dict)
+    field_confidence: Dict[str, float] = field(default_factory=dict)
+    field_values: Dict[str, Any] = field(default_factory=dict)
+    validation_errors: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
 
 # Normalization helpers convert loose upstream values into compact text, numeric,
 # and enum shapes before any AI prompt or record payload is assembled.
@@ -381,6 +579,8 @@ def _build_prompt_content(document: PageContentDocument) -> Dict[str, Any]:
         for section in document.structured_sections
     ]
     selected_sections = _keyword_section_filter(sections)
+    content_items = _build_content_items_from_document(document)
+    field_bundle = _build_field_evidence_map(content_items)
     full_body_text = _trim_lines(document.full_body_text, max_lines=160)
     body_excerpt = full_body_text[:MAX_BODY_CHARS]
     if len(body_excerpt) < 150 and selected_sections:
@@ -398,6 +598,22 @@ def _build_prompt_content(document: PageContentDocument) -> Dict[str, Any]:
             {"type": section.type, "label": section.label, "content": section.content}
             for section in document.interactive_sections
         ],
+        "content_items": [
+            {
+                "item_type": item.item_type,
+                "label": item.label,
+                "content": compact_document_text(item.content, max_chars=900),
+                "source_scope": item.source_scope,
+                "source_section": item.source_section,
+                "confidence_hint": item.confidence_hint,
+            }
+            for item in content_items[:12]
+        ],
+        "field_evidence_map": {
+            field_name: snippets[:2]
+            for field_name, snippets in field_bundle.evidence_by_field.items()
+            if field_name in FIELD_EVIDENCE_CORE_FIELDS or field_name in {"raw_eligibility_data", "raw_funding_offer_data", "raw_terms_data", "raw_documents_data", "raw_application_data"}
+        },
         "full_body_text": body_excerpt,
         "source_domain": document.source_domain,
         "main_content_hint": document.main_content_hint,
@@ -611,6 +827,527 @@ def _interactive_sections_text(document: PageContentDocument) -> str:
             ]
         )
     )
+
+
+def _content_item_signature(item: ContentItem) -> tuple[str, str, str]:
+    return (
+        clean_text(item.item_type).casefold(),
+        clean_text(item.label).casefold(),
+        compact_document_text(item.content or "", max_chars=240).casefold(),
+    )
+
+
+def _build_content_items_from_document(document: PageContentDocument) -> List[ContentItem]:
+    """Flatten the scraped page into the text blocks the AI layer can route."""
+    items: List[ContentItem] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_item(
+        item_type: str,
+        label: str,
+        content: str,
+        *,
+        source_scope: Optional[str],
+        source_section: Optional[str] = None,
+        confidence_hint: float = 0.0,
+    ) -> None:
+        cleaned_label = clean_text(label)
+        cleaned_content = clean_text(content)
+        if not cleaned_label and not cleaned_content:
+            return
+        candidate = ContentItem(
+            item_type=clean_text(item_type) or "content",
+            label=cleaned_label,
+            content=cleaned_content,
+            source_url=document.page_url,
+            source_section=cleaned_label if source_section is None else clean_text(source_section),
+            source_scope=clean_text(source_scope or "") or None,
+            confidence_hint=max(0.0, min(float(confidence_hint), 1.0)),
+            order=len(items),
+        )
+        signature = _content_item_signature(candidate)
+        if signature in seen:
+            return
+        seen.add(signature)
+        items.append(candidate)
+
+    if document.title:
+        add_item("title", "title", document.title, source_scope="metadata", confidence_hint=0.95)
+    if document.page_title and document.page_title != document.title:
+        add_item("page_title", "page_title", document.page_title, source_scope="metadata", confidence_hint=0.92)
+    for index, heading in enumerate(document.headings[:8]):
+        add_item("heading", f"heading_{index + 1}", heading, source_scope="headings", confidence_hint=0.85)
+    for section in document.structured_sections:
+        add_item(
+            "structured_section",
+            section.heading,
+            section.content,
+            source_scope="structured_sections",
+            source_section=section.heading,
+            confidence_hint=0.88,
+        )
+    for section in document.interactive_sections:
+        add_item(
+            section.type or "interactive",
+            section.label or section.type,
+            section.content,
+            source_scope="interactive_sections",
+            source_section=section.label or section.type,
+            confidence_hint=0.86,
+        )
+    for evidence in document.document_evidence:
+        evidence_text = " ".join(
+            unique_preserve_order(
+                [
+                    compact_document_text(evidence.summary or "", max_chars=600),
+                    *[compact_document_text(point, max_chars=300) for point in evidence.key_points],
+                    compact_document_text(evidence.extracted_text or "", max_chars=900),
+                ]
+            )
+        )
+        add_item(
+            "document_evidence",
+            evidence.document_kind or evidence.document_url,
+            evidence_text or evidence.document_url,
+            source_scope="document_evidence",
+            source_section=evidence.document_kind,
+            confidence_hint=0.76,
+        )
+    if document.full_body_text:
+        add_item(
+            "body",
+            document.title or document.page_title or "full_body_text",
+            compact_document_text(document.full_body_text, max_chars=MAX_BODY_CHARS),
+            source_scope="full_body_text",
+            confidence_hint=0.6,
+        )
+    return items
+
+
+def _merge_snippet_map(target: Dict[str, List[str]], source: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    merged = {key: list(value) for key, value in target.items()}
+    for key, snippets in source.items():
+        if not snippets:
+            continue
+        bucket = merged.setdefault(key, [])
+        bucket.extend(snippets)
+        merged[key] = unique_preserve_order([clean_text(item) for item in bucket if clean_text(item)])
+    return merged
+
+
+def _is_unknown_placeholder(value: Any) -> bool:
+    if value in (None, "", [], {}):
+        return True
+    text = _coerce_text(getattr(value, "value", value)).casefold()
+    return text in {"unknown", "unknowns", "none", "null"}
+
+
+def _merge_scalar_value(existing: Any, candidate: Any) -> Any:
+    if _is_unknown_placeholder(candidate):
+        return existing
+    if _is_unknown_placeholder(existing):
+        return candidate
+    if isinstance(existing, list) and isinstance(candidate, list):
+        return unique_preserve_order([*existing, *candidate])
+    return existing
+
+
+def _append_bundle_value(bundle: FieldEvidenceBundle, field_name: str, value: Any) -> None:
+    if value in (None, "", [], {}):
+        return
+    current = bundle.field_values.get(field_name)
+    bundle.field_values[field_name] = _merge_scalar_value(current, value)
+
+
+def _add_bundle_snippet(bundle: FieldEvidenceBundle, bucket: str, snippet: str) -> None:
+    cleaned = clean_text(snippet)
+    if not cleaned:
+        return
+    bundle.raw_text_snippets.setdefault(bucket, []).append(cleaned)
+
+
+def _add_bundle_evidence(bundle: FieldEvidenceBundle, field_name: str, snippet: str, confidence: float) -> None:
+    cleaned = clean_text(snippet)
+    if not cleaned:
+        return
+    bundle.evidence_by_field.setdefault(field_name, []).append(cleaned)
+    bundle.field_confidence[field_name] = max(bundle.field_confidence.get(field_name, 0.0), max(0.0, min(float(confidence), 1.0)))
+
+
+def _route_content_item_to_fields(item: ContentItem) -> FieldEvidenceBundle:
+    """Map one content item to the schema fields it most likely supports."""
+    bundle = FieldEvidenceBundle()
+    text = clean_text(" ".join([item.label, item.content]))
+    lowered = text.lower()
+    if not text:
+        return bundle
+
+    snippet = compact_document_text(text, max_chars=900) or text
+    label_lower = clean_text(item.label).lower()
+    content_lower = clean_text(item.content).lower()
+    route_hits = [
+        bucket
+        for bucket, terms in CONTENT_BUCKET_TERMS.items()
+        if any(term in lowered or term in label_lower or term in content_lower for term in terms)
+    ]
+    if not route_hits:
+        if item.item_type in {"title", "page_title"}:
+            route_hits = ["program"]
+        elif item.item_type in {"heading", "structured_section", "tab", "accordion", "card", "table", "list", "document_evidence"}:
+            route_hits = ["program"]
+        else:
+            route_hits = ["supporting"]
+
+    source_confidence = max(0.0, min(item.confidence_hint, 1.0))
+    if item.item_type in {"title", "page_title"}:
+        program_name = strip_leading_numbered_prefix(text.split(" - ")[0].split(" | ")[0].strip() or text)
+        if program_name:
+            _append_bundle_value(bundle, "program_name", program_name)
+            _add_bundle_evidence(bundle, "program_name", program_name, max(source_confidence, 0.95))
+        funder_name = _extract_funder_name_from_title(text)
+        if funder_name:
+            _append_bundle_value(bundle, "funder_name", funder_name)
+            _add_bundle_evidence(bundle, "funder_name", funder_name, max(source_confidence, 0.9))
+        _add_bundle_snippet(bundle, "program_title", snippet)
+        _add_bundle_evidence(bundle, "source_page_title", snippet, max(source_confidence, 0.9))
+        _append_bundle_value(bundle, "source_page_title", text)
+
+    for route_hit in route_hits:
+        bundle.notes.append(f"Routed {item.item_type} into {route_hit}")
+        _add_bundle_snippet(bundle, route_hit, snippet)
+
+    if "eligibility" in route_hits:
+        _add_bundle_evidence(bundle, "raw_eligibility_data", snippet, max(source_confidence, 0.84))
+        extracted = extract_eligibility_criteria(text)
+        if extracted:
+            _append_bundle_value(bundle, "raw_eligibility_criteria", extracted)
+        else:
+            _append_bundle_value(bundle, "raw_eligibility_criteria", [snippet])
+    if "funding" in route_hits:
+        _add_bundle_evidence(bundle, "raw_funding_offer_data", snippet, max(source_confidence, 0.82))
+        _append_bundle_value(bundle, "funding_lines", [snippet])
+        money_min, money_max, currency, _money_snippet, money_confidence = extract_money_range(text, default_currency=None)
+        if money_min is not None:
+            _append_bundle_value(bundle, "ticket_min", money_min)
+            bundle.field_confidence["ticket_min"] = max(bundle.field_confidence.get("ticket_min", 0.0), max(source_confidence, money_confidence))
+        if money_max is not None:
+            _append_bundle_value(bundle, "ticket_max", money_max)
+            bundle.field_confidence["ticket_max"] = max(bundle.field_confidence.get("ticket_max", 0.0), max(source_confidence, money_confidence))
+        if money_min is not None or money_max is not None:
+            _append_bundle_value(bundle, "program_budget_total", money_max or money_min)
+            bundle.field_confidence["program_budget_total"] = max(bundle.field_confidence.get("program_budget_total", 0.0), max(source_confidence, money_confidence))
+        if currency:
+            _append_bundle_value(bundle, "currency", currency)
+            bundle.field_confidence["currency"] = max(bundle.field_confidence.get("currency", 0.0), max(source_confidence, money_confidence))
+    if "terms" in route_hits:
+        _add_bundle_evidence(bundle, "raw_terms_data", snippet, max(source_confidence, 0.82))
+        payback = extract_payback_details(text)
+        if payback.raw_text:
+            _append_bundle_value(bundle, "payback_raw_text", payback.raw_text)
+            bundle.field_confidence["payback_raw_text"] = max(bundle.field_confidence.get("payback_raw_text", 0.0), max(source_confidence, payback.confidence))
+        if payback.structure:
+            _append_bundle_value(bundle, "payback_structure", payback.structure)
+            bundle.field_confidence["payback_structure"] = max(bundle.field_confidence.get("payback_structure", 0.0), max(source_confidence, payback.confidence))
+        if payback.term_min_months is not None:
+            _append_bundle_value(bundle, "payback_term_min_months", payback.term_min_months)
+            bundle.field_confidence["payback_term_min_months"] = max(bundle.field_confidence.get("payback_term_min_months", 0.0), max(source_confidence, payback.confidence))
+        if payback.term_max_months is not None:
+            _append_bundle_value(bundle, "payback_term_max_months", payback.term_max_months)
+            bundle.field_confidence["payback_term_max_months"] = max(bundle.field_confidence.get("payback_term_max_months", 0.0), max(source_confidence, payback.confidence))
+        if payback.grace_period_months is not None:
+            _append_bundle_value(bundle, "grace_period_months", payback.grace_period_months)
+            bundle.field_confidence["grace_period_months"] = max(bundle.field_confidence.get("grace_period_months", 0.0), max(source_confidence, payback.confidence))
+        interest_type = getattr(payback, "interest_type", None)
+        if interest_type:
+            _append_bundle_value(bundle, "interest_type", interest_type)
+            bundle.field_confidence["interest_type"] = max(bundle.field_confidence.get("interest_type", 0.0), max(source_confidence, payback.confidence))
+        if payback.repayment_frequency:
+            _append_bundle_value(bundle, "repayment_frequency", payback.repayment_frequency)
+            bundle.field_confidence["repayment_frequency"] = max(bundle.field_confidence.get("repayment_frequency", 0.0), max(source_confidence, payback.confidence))
+        security_required = getattr(payback, "security_required", None)
+        if security_required:
+            _append_bundle_value(bundle, "security_required", security_required)
+            bundle.field_confidence["security_required"] = max(bundle.field_confidence.get("security_required", 0.0), max(source_confidence, payback.confidence))
+        equity_required = getattr(payback, "equity_required", None)
+        if equity_required:
+            _append_bundle_value(bundle, "equity_required", equity_required)
+            bundle.field_confidence["equity_required"] = max(bundle.field_confidence.get("equity_required", 0.0), max(source_confidence, payback.confidence))
+    if "documents" in route_hits:
+        _add_bundle_evidence(bundle, "raw_documents_data", snippet, max(source_confidence, 0.8))
+        document_terms = []
+        document_source_text = item.content or text
+        for sentence in sentence_chunks(document_source_text):
+            lowered_sentence = sentence.lower()
+            if any(term in lowered_sentence for term in ("document", "documents", "checklist", "certificate", "proof", "registration", "download")):
+                document_terms.append(sentence)
+        if document_terms:
+            _append_bundle_value(bundle, "required_documents", document_terms)
+            bundle.field_confidence["required_documents"] = max(bundle.field_confidence.get("required_documents", 0.0), max(source_confidence, 0.8))
+    if "application" in route_hits:
+        _add_bundle_evidence(bundle, "raw_application_data", snippet, max(source_confidence, 0.82))
+        urls = [url for url in extract_urls(text) if any(term in url.lower() for term in ("apply", "application", "portal", "register", "submit"))]
+        if urls:
+            _append_bundle_value(bundle, "application_url", urls[0])
+            bundle.field_confidence["application_url"] = max(bundle.field_confidence.get("application_url", 0.0), max(source_confidence, 0.86))
+            _append_bundle_value(bundle, "application_channel", ApplicationChannel.ONLINE_FORM)
+            bundle.field_confidence["application_channel"] = max(bundle.field_confidence.get("application_channel", 0.0), max(source_confidence, 0.82))
+        emails = extract_emails(text)
+        phones = extract_phone_numbers(text)
+        if emails:
+            _append_bundle_value(bundle, "contact_email", emails[0])
+            bundle.field_confidence["contact_email"] = max(bundle.field_confidence.get("contact_email", 0.0), max(source_confidence, 0.84))
+        if phones:
+            _append_bundle_value(bundle, "contact_phone", phones[0])
+            bundle.field_confidence["contact_phone"] = max(bundle.field_confidence.get("contact_phone", 0.0), max(source_confidence, 0.84))
+        if not urls and not emails and not phones:
+            _append_bundle_value(bundle, "application_channel", ApplicationChannel.MANUAL_CONTACT_FIRST)
+            bundle.field_confidence["application_channel"] = max(bundle.field_confidence.get("application_channel", 0.0), max(source_confidence, 0.7))
+    if "deadline" in route_hits:
+        _add_bundle_evidence(bundle, "raw_terms_data", snippet, max(source_confidence, 0.8))
+        deadline_info = parse_deadline_info(text)
+        if deadline_info.get("deadline_date"):
+            _append_bundle_value(bundle, "deadline_date", deadline_info["deadline_date"])
+            bundle.field_confidence["deadline_date"] = max(bundle.field_confidence.get("deadline_date", 0.0), max(source_confidence, 0.88))
+        if deadline_info.get("deadline_type"):
+            _append_bundle_value(bundle, "deadline_type", _coerce_enum(DeadlineType, deadline_info.get("deadline_type")) or deadline_info.get("deadline_type"))
+            bundle.field_confidence["deadline_type"] = max(bundle.field_confidence.get("deadline_type", 0.0), max(source_confidence, 0.8))
+    if "contact" in route_hits:
+        emails = extract_emails(text)
+        phones = extract_phone_numbers(text)
+        if emails:
+            _append_bundle_value(bundle, "contact_email", emails[0])
+            bundle.field_confidence["contact_email"] = max(bundle.field_confidence.get("contact_email", 0.0), max(source_confidence, 0.9))
+        if phones:
+            _append_bundle_value(bundle, "contact_phone", phones[0])
+            bundle.field_confidence["contact_phone"] = max(bundle.field_confidence.get("contact_phone", 0.0), max(source_confidence, 0.9))
+        _add_bundle_evidence(bundle, "raw_application_data", snippet, max(source_confidence, 0.75))
+    if "geography" in route_hits:
+        if any(term in lowered for term in ("national", "countrywide", "south africa")):
+            _append_bundle_value(bundle, "geography_scope", GeographyScope.NATIONAL)
+        elif any(term in lowered for term in ("province", "provincial")):
+            _append_bundle_value(bundle, "geography_scope", GeographyScope.PROVINCE)
+        elif any(term in lowered for term in ("municipality", "municipal")):
+            _append_bundle_value(bundle, "geography_scope", GeographyScope.MUNICIPALITY)
+        elif any(term in lowered for term in ("local", "regional")):
+            _append_bundle_value(bundle, "geography_scope", GeographyScope.LOCAL)
+        if bundle.field_values.get("geography_scope") is not None:
+            bundle.field_confidence["geography_scope"] = max(bundle.field_confidence.get("geography_scope", 0.0), max(source_confidence, 0.72))
+
+    if "supporting" in route_hits:
+        _add_bundle_snippet(bundle, "supporting_text", snippet)
+        bundle.notes.append(f"Supporting text retained from {item.item_type}")
+
+    return bundle
+
+
+def _build_field_evidence_map(content_items: Sequence[ContentItem]) -> FieldEvidenceBundle:
+    """Aggregate the routed evidence from all page content items."""
+    bundle = FieldEvidenceBundle()
+    for item in content_items:
+        routed = _route_content_item_to_fields(item)
+        bundle.evidence_by_field = _merge_snippet_map(bundle.evidence_by_field, routed.evidence_by_field)
+        bundle.raw_text_snippets = _merge_snippet_map(bundle.raw_text_snippets, routed.raw_text_snippets)
+        for field_name, value in routed.field_values.items():
+            _append_bundle_value(bundle, field_name, value)
+        for field_name, confidence in routed.field_confidence.items():
+            bundle.field_confidence[field_name] = max(bundle.field_confidence.get(field_name, 0.0), confidence)
+        bundle.validation_errors.extend(routed.validation_errors)
+        bundle.notes.extend(routed.notes)
+    bundle.evidence_by_field = {
+        field_name: unique_preserve_order([clean_text(item) for item in snippets if clean_text(item)])
+        for field_name, snippets in bundle.evidence_by_field.items()
+        if unique_preserve_order([clean_text(item) for item in snippets if clean_text(item)])
+    }
+    bundle.raw_text_snippets = {
+        field_name: unique_preserve_order([clean_text(item) for item in snippets if clean_text(item)])
+        for field_name, snippets in bundle.raw_text_snippets.items()
+        if unique_preserve_order([clean_text(item) for item in snippets if clean_text(item)])
+    }
+    bundle.validation_errors = unique_preserve_order([clean_text(item) for item in bundle.validation_errors if clean_text(item)])
+    bundle.notes = unique_preserve_order([clean_text(item) for item in bundle.notes if clean_text(item)])
+    return bundle
+
+
+def _document_content_annotation_bundle(document: PageContentDocument) -> FieldEvidenceBundle:
+    """Convenience wrapper for the document-to-field evidence routing pass."""
+    return _build_field_evidence_map(_build_content_items_from_document(document))
+
+
+def _merge_content_bundle_into_payload(payload: Dict[str, Any], bundle: FieldEvidenceBundle) -> Dict[str, Any]:
+    """Merge routed content evidence into a draft or record payload."""
+    merged = dict(payload)
+
+    list_fields = {
+        "raw_eligibility_data",
+        "raw_eligibility_criteria",
+        "raw_funding_offer_data",
+        "raw_terms_data",
+        "raw_documents_data",
+        "raw_application_data",
+        "funding_lines",
+        "required_documents",
+        "related_documents",
+        "exclusions",
+        "notes",
+    }
+    scalar_fields = {
+        "program_name",
+        "funder_name",
+        "source_page_title",
+        "application_url",
+        "contact_email",
+        "contact_phone",
+        "deadline_type",
+        "deadline_date",
+        "geography_scope",
+        "ticket_min",
+        "ticket_max",
+        "program_budget_total",
+        "payback_raw_text",
+        "payback_structure",
+        "payback_term_min_months",
+        "payback_term_max_months",
+        "grace_period_months",
+        "interest_type",
+        "repayment_frequency",
+        "security_required",
+        "equity_required",
+        "application_channel",
+        "currency",
+    }
+
+    for field_name, value in bundle.field_values.items():
+        if field_name in list_fields:
+            existing = _coerce_list(merged.get(field_name))
+            candidate = _coerce_list(value)
+            merged[field_name] = unique_preserve_order([*existing, *candidate])
+            continue
+        if field_name in scalar_fields:
+            if _is_unknown_placeholder(merged.get(field_name)) or merged.get(field_name) in (None, "", [], {}):
+                merged[field_name] = value
+            continue
+        if merged.get(field_name) in (None, "", [], {}):
+            merged[field_name] = value
+
+    merged["raw_text_snippets"] = _merge_snippet_map(
+        dict(merged.get("raw_text_snippets") or {}),
+        bundle.raw_text_snippets,
+    )
+    merged["evidence_by_field"] = _merge_snippet_map(
+        dict(merged.get("evidence_by_field") or {}),
+        bundle.evidence_by_field,
+    )
+    merged["extraction_confidence"] = {
+        str(field_name): max(
+            float(merged.get("extraction_confidence", {}).get(field_name, 0.0) or 0.0),
+            float(bundle.field_confidence.get(field_name, 0.0) or 0.0),
+        )
+        for field_name in unique_preserve_order(
+            [*dict(merged.get("extraction_confidence") or {}).keys(), *bundle.field_confidence.keys()]
+        )
+    }
+    merged["field_confidence"] = {
+        str(field_name): max(
+            float(merged.get("field_confidence", {}).get(field_name, 0.0) or 0.0),
+            float(bundle.field_confidence.get(field_name, 0.0) or 0.0),
+        )
+        for field_name in unique_preserve_order(
+            [*dict(merged.get("field_confidence") or {}).keys(), *bundle.field_confidence.keys()]
+        )
+    }
+    merged["validation_errors"] = unique_preserve_order(
+        [*([clean_text(item) for item in merged.get("validation_errors") or [] if clean_text(item)]), *bundle.validation_errors]
+    )
+    merged["notes"] = unique_preserve_order(
+        [*([clean_text(item) for item in merged.get("notes") or [] if clean_text(item)]), *bundle.notes]
+    )
+    return merged
+
+
+def _validate_field_evidence(record: FundingProgrammeRecord, bundle: Optional[FieldEvidenceBundle] = None) -> FundingProgrammeRecord:
+    """Ensure each populated business field has some traceable evidence."""
+    payload = record.model_dump(mode="python")
+    evidence_by_field = {
+        field_name: list(snippets)
+        for field_name, snippets in (payload.get("evidence_by_field") or {}).items()
+        if snippets
+    }
+    raw_text_snippets = {
+        field_name: list(snippets)
+        for field_name, snippets in (payload.get("raw_text_snippets") or {}).items()
+        if snippets
+    }
+    validation_errors = unique_preserve_order([clean_text(item) for item in payload.get("validation_errors") or [] if clean_text(item)])
+    if bundle:
+        evidence_by_field = _merge_snippet_map(evidence_by_field, bundle.evidence_by_field)
+        raw_text_snippets = _merge_snippet_map(raw_text_snippets, bundle.raw_text_snippets)
+        validation_errors.extend(bundle.validation_errors)
+    for field_name, value in payload.items():
+        if field_name in FIELD_EVIDENCE_SKIP_FIELDS:
+            continue
+        if value in (None, "", [], {}, False):
+            continue
+        snippets = evidence_by_field.get(field_name)
+        if snippets:
+            continue
+        fallback = raw_text_snippets.get(field_name)
+        if fallback:
+            evidence_by_field[field_name] = unique_preserve_order(fallback)
+            continue
+        if isinstance(value, list):
+            fallback_snippets = [clean_text(item) for item in value if clean_text(item)]
+        else:
+            fallback_snippets = [clean_text(str(value))] if clean_text(str(value)) else []
+        if fallback_snippets:
+            evidence_by_field[field_name] = unique_preserve_order(fallback_snippets)
+        else:
+            validation_errors.append(f"missing evidence for {field_name}")
+    payload["evidence_by_field"] = evidence_by_field
+    payload["raw_text_snippets"] = raw_text_snippets
+    payload["validation_errors"] = unique_preserve_order(validation_errors)
+    payload["needs_review"] = bool(payload.get("needs_review") or payload["validation_errors"])
+    return FundingProgrammeRecord.model_validate(payload)
+
+
+def _apply_field_confidence_rules(record: FundingProgrammeRecord, bundle: Optional[FieldEvidenceBundle] = None) -> FundingProgrammeRecord:
+    """Promote or soften confidence values based on the routed evidence."""
+    payload = record.model_dump(mode="python")
+    field_confidence = {
+        str(field_name): max(0.0, min(float(confidence), 1.0))
+        for field_name, confidence in (payload.get("field_confidence") or {}).items()
+        if confidence is not None
+    }
+    extraction_confidence = {
+        str(field_name): max(0.0, min(float(confidence), 1.0))
+        for field_name, confidence in (payload.get("extraction_confidence") or {}).items()
+        if confidence is not None
+    }
+    if bundle:
+        for field_name, confidence in bundle.field_confidence.items():
+            field_confidence[field_name] = max(field_confidence.get(field_name, 0.0), confidence)
+            extraction_confidence[field_name] = max(extraction_confidence.get(field_name, 0.0), confidence)
+    for field_name, snippets in (payload.get("evidence_by_field") or {}).items():
+        if field_name in FIELD_EVIDENCE_SKIP_FIELDS:
+            continue
+        snippet_count = len([snippet for snippet in snippets if clean_text(str(snippet))])
+        if snippet_count:
+            inferred_confidence = min(0.95, 0.45 + (snippet_count * 0.08))
+            field_confidence[field_name] = max(field_confidence.get(field_name, 0.0), inferred_confidence)
+            extraction_confidence[field_name] = max(extraction_confidence.get(field_name, 0.0), inferred_confidence)
+    for field_name, value in payload.items():
+        if field_name in FIELD_EVIDENCE_SKIP_FIELDS:
+            continue
+        if value in (None, "", [], {}, False):
+            continue
+        if field_name not in field_confidence:
+            fallback_confidence = 0.72 if field_name in FIELD_EVIDENCE_CORE_FIELDS else 0.55
+            field_confidence[field_name] = fallback_confidence
+        if field_name not in extraction_confidence:
+            extraction_confidence[field_name] = field_confidence[field_name]
+    payload["field_confidence"] = field_confidence
+    payload["extraction_confidence"] = extraction_confidence
+    payload["extraction_confidence_by_field"] = extraction_confidence
+    return FundingProgrammeRecord.model_validate(payload)
 
 # Evidence context groups support-document content into categories that the
 # prompt and fallback extractors can reuse without re-reading each file.
@@ -1153,6 +1890,7 @@ def _normalize_draft(
     # FundingProgrammeRecord: it fills gaps, fixes types, and merges evidence.
     derived = _derive_page_evidence(document)
     document_context = _document_evidence_context(document)
+    content_bundle = _document_content_annotation_bundle(document)
     payload = draft.model_dump(mode="python")
     ai_eligibility_items = _coerce_list(payload.get("raw_eligibility_data"))
     # Eligibility text is rebuilt from the page evidence so structured fields can
@@ -1344,6 +2082,7 @@ def _normalize_draft(
         payload["contact_email"] = document_context["emails"][0]
     if not payload["contact_phone"] and document_context["phones"]:
         payload["contact_phone"] = document_context["phones"][0]
+    payload = _merge_content_bundle_into_payload(payload, content_bundle)
     return AIProgrammeDraft.model_validate(payload)
 
 
@@ -1363,7 +2102,9 @@ def _draft_to_record(
     now = datetime.now(timezone.utc)
     derived = _derive_page_evidence(document)
     document_context = _document_evidence_context(document)
+    content_bundle = _document_content_annotation_bundle(document)
     payload = draft.model_dump(mode="python")
+    payload = _merge_content_bundle_into_payload(payload, content_bundle)
     ai_eligibility_items = _coerce_list(payload.get("raw_eligibility_data"))
     # Rebuild eligibility text from the current page so deterministic extraction
     # can supplement or override incomplete model output.
@@ -1603,8 +2344,8 @@ def _draft_to_record(
         contact_phone=contact_phone,
         raw_text_snippets=raw_text_snippets,
         extraction_confidence=extraction_confidence,
-        evidence_by_field={},
-        field_confidence=dict(extraction_confidence),
+        evidence_by_field=dict(payload.get("evidence_by_field") or {}),
+        field_confidence=dict(payload.get("field_confidence") or extraction_confidence),
         related_documents=related_documents,
         parser_version=parser_version or SCRAPER_VERSION,
         ai_enriched=True,
@@ -1613,6 +2354,9 @@ def _draft_to_record(
         status=_coerce_enum(ProgrammeStatus, payload.get("status")) or ProgrammeStatus.UNKNOWN,
         notes=notes or [f"AI classification applied to {document.page_url}"],
     )
+    record = FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))
+    record = _validate_field_evidence(record, content_bundle)
+    record = _apply_field_confidence_rules(record, content_bundle)
     return FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))
 
 
@@ -2233,6 +2977,7 @@ class AIClassifier:
             return []
         derived = _derive_page_evidence(document)
         document_context = _document_evidence_context(document)
+        content_bundle = _document_content_annotation_bundle(document)
         title = document.title or document.page_title or ""
         title_candidate = strip_leading_numbered_prefix(title.split(" - ")[0].split(" | ")[0].strip() or "")
         heading_candidate = strip_leading_numbered_prefix(document.headings[0]) if document.headings else None
@@ -2395,6 +3140,11 @@ class AIClassifier:
             ),
             ai_enriched=False,
         )
+        payload = record.model_dump(mode="python")
+        payload = _merge_content_bundle_into_payload(payload, content_bundle)
+        record = FundingProgrammeRecord.model_validate(payload)
+        record = _validate_field_evidence(record, content_bundle)
+        record = _apply_field_confidence_rules(record, content_bundle)
         return [FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))]
 
     def classify_document(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:

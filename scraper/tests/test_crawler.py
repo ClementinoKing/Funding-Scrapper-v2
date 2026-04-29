@@ -391,3 +391,156 @@ def test_crawler_discovers_programme_routes_from_rendered_homepage(settings) -> 
     assert "https://www.pic.gov.za/early-stage-fund" in fetcher.calls
     assert "https://www.pic.gov.za/isibaya" in fetcher.calls
     assert "https://www.pic.gov.za/properties" in fetcher.calls
+
+
+def test_crawler_uses_sharepoint_portal_profile_with_relative_seeds(settings) -> None:
+    http_home = PageFetchResult(
+        url="https://www.pic.gov.za/",
+        requested_url="https://www.pic.gov.za/",
+        canonical_url="https://www.pic.gov.za/",
+        final_url="https://www.pic.gov.za/",
+        status_code=200,
+        content_type="text/html",
+        html="""
+        <html>
+          <head>
+            <title>Public Investment Corporation</title>
+            <script src="/assets/app.js"></script>
+            <script src="/assets/vendor.js"></script>
+          </head>
+          <body>
+            <div id="root"></div>
+          </body>
+        </html>
+        """,
+        title="Public Investment Corporation",
+        fetch_method="http",
+        headers={},
+        js_rendered=False,
+        notes=[],
+    )
+    browser_home = _page(
+        "https://www.pic.gov.za/",
+        """
+        <html>
+          <head><title>Public Investment Corporation</title></head>
+          <body>
+            <main>
+              <nav class="site-nav">
+                <a href="/pic/site/site-map">Site map</a>
+                <button data-href="/apply-for-funding/isibaya">Isibaya</button>
+                <button data-href="/apply-for-funding/properties">Properties</button>
+              </nav>
+            </main>
+          </body>
+        </html>
+        """,
+        "Public Investment Corporation",
+    )
+    site_map = _page(
+        "https://www.pic.gov.za/pic/site/site-map",
+        """
+        <html>
+          <head><title>Site Map</title></head>
+          <body>
+            <main>
+              <article>
+                <h1>Site Map</h1>
+                <a href="/Pages/isibaya.aspx">Isibaya</a>
+                <a href="/Pages/properties.aspx">Properties</a>
+              </article>
+            </main>
+          </body>
+        </html>
+        """,
+        "Site Map",
+    )
+    apply_isibaya = _page(
+        "https://www.pic.gov.za/apply-for-funding/isibaya",
+        """
+        <html>
+          <head><title>Isibaya Fund Applications</title></head>
+          <body>
+            <main>
+              <article>
+                <h1>Isibaya Fund Applications</h1>
+                <p>Application portal for Isibaya funding proposals.</p>
+              </article>
+            </main>
+          </body>
+        </html>
+        """,
+        "Isibaya Fund Applications",
+    )
+    apply_properties = _page(
+        "https://www.pic.gov.za/apply-for-funding/properties",
+        """
+        <html>
+          <head><title>Properties Funding Applications</title></head>
+          <body>
+            <main>
+              <article>
+                <h1>Properties Funding Applications</h1>
+                <p>Application portal for property investment opportunities.</p>
+              </article>
+            </main>
+          </body>
+        </html>
+        """,
+        "Properties Funding Applications",
+    )
+    pages = {
+        "https://www.pic.gov.za/": http_home,
+        "https://www.pic.gov.za/pic/site/site-map": site_map,
+        "https://www.pic.gov.za/apply-for-funding/isibaya": apply_isibaya,
+        "https://www.pic.gov.za/apply-for-funding/properties": apply_properties,
+        "https://www.pic.gov.za/Pages/isibaya.aspx": _page(
+            "https://www.pic.gov.za/Pages/isibaya.aspx",
+            """
+            <html><head><title>Isibaya</title></head><body><main><article><h1>Isibaya</h1></article></main></body></html>
+            """,
+            "Isibaya",
+        ),
+        "https://www.pic.gov.za/Pages/properties.aspx": _page(
+            "https://www.pic.gov.za/Pages/properties.aspx",
+            """
+            <html><head><title>Properties</title></head><body><main><article><h1>Properties</h1></article></main></body></html>
+            """,
+            "Properties",
+        ),
+    }
+
+    fetcher = FixtureFetcher(pages)
+    browser_fetcher = TrackingBrowserFetcher(browser_home)
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=fetcher,
+        browser_fetcher=browser_fetcher,
+    )
+
+    summary = pipeline.run_sites(
+        [
+            SiteDefinition(
+                site_key="pic",
+                display_name="Public Investment Corporation",
+                primary_domain="www.pic.gov.za",
+                adapter_key="sharepoint_portal",
+                seed_urls=("https://www.pic.gov.za/",),
+                adapter_config={
+                    "default_seed_urls": [
+                        "/pic/site/site-map",
+                        "/apply-for-funding/isibaya",
+                        "/apply-for-funding/properties",
+                    ],
+                },
+            )
+        ]
+    )
+
+    assert summary.pages_fetched_successfully == 4
+    assert browser_fetcher.calls[0] == "https://www.pic.gov.za/"
+    assert "https://www.pic.gov.za/pic/site/site-map" in fetcher.calls
+    assert "https://www.pic.gov.za/apply-for-funding/isibaya" in fetcher.calls
+    assert "https://www.pic.gov.za/apply-for-funding/properties" in fetcher.calls

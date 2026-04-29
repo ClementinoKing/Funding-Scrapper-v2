@@ -6,11 +6,11 @@ import copy
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from scraper.schemas import FundingProgrammeRecord, PageFetchResult
 from scraper.utils.text import clean_text, strip_leading_numbered_prefix, unique_preserve_order
-from scraper.utils.urls import extract_domain
+from scraper.utils.urls import canonicalize_url, extract_domain, extract_host
 from scraper.parsers.normalization import classify_page_type
 
 
@@ -235,8 +235,12 @@ class SiteAdapter:
     site_profile: SiteExtractionProfile = field(default_factory=SiteExtractionProfile)
 
     def matches_domain(self, candidate_domain: str) -> bool:
+        if self.domain in {"*", ""}:
+            return True
         normalized_candidate = extract_domain(candidate_domain)
         normalized_domain = extract_domain(self.domain)
+        if not normalized_domain:
+            return False
         return (
             normalized_candidate == normalized_domain
             or normalized_candidate.endswith("." + normalized_domain)
@@ -559,4 +563,18 @@ class SiteAdapter:
         # returns something for adapters that were given explicit defaults.
         if not self.matches_domain(domain):
             return []
-        return unique_preserve_order([str(url).strip() for url in self.default_seed_urls if str(url).strip()])
+        base_url = "https://%s/" % extract_host(domain)
+        resolved: List[str] = []
+        for url in self.default_seed_urls:
+            candidate = clean_text(str(url or ""))
+            if not candidate:
+                continue
+            if "{domain}" in candidate:
+                candidate = candidate.replace("{domain}", extract_domain(domain))
+            if candidate.startswith(("http://", "https://")):
+                resolved_url = canonicalize_url(candidate)
+            else:
+                resolved_url = canonicalize_url(urljoin(base_url, candidate))
+            if resolved_url:
+                resolved.append(resolved_url)
+        return unique_preserve_order(resolved)
