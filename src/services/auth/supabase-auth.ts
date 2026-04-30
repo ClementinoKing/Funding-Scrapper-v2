@@ -1,4 +1,5 @@
 import type { Role } from "@/types/domain";
+import {supabase} from "@/lib/supabase";
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL?.trim();
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim();
@@ -90,6 +91,12 @@ export const signInWithSupabase = async (email: string, password: string): Promi
   }
   const payload = (await response.json()) as SupabaseAuthResponse;
   const user = await fetchProfile(payload.user.id, payload.access_token);
+
+  await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
+
   return {
     user,
     accessToken: payload.access_token,
@@ -127,6 +134,12 @@ export const signUpWithSupabase = async (
   }
 
   const user = await fetchProfile(payload.user.id, payload.access_token);
+
+  await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
+  
   return {
     user,
     accessToken: payload.access_token,

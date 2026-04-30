@@ -32,3 +32,25 @@ enable_signup = true
 [analytics]
 enabled = false
 port = 54327
+
+[functions.match-programs]
+enabled = true
+verify_jwt = true
+import_map = "./functions/match-programs/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/match-programs/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/match-programs/*.html" ]
+
+[functions.background-matcher]
+enabled = true
+verify_jwt = true
+import_map = "./functions/background-matcher/deno.json"
+# Uncomment to specify a custom file path to the entrypoint.
+# Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
+entrypoint = "./functions/background-matcher/index.ts"
+# Specifies static files to be bundled with the function. Supports glob patterns.
+# For example, if you want to serve static HTML pages in your function:
+# static_files = [ "./functions/background-matcher/*.html" ]
