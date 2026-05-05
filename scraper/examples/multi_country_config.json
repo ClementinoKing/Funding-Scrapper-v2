@@ -1,0 +1,82 @@
+{
+  "geography": {
+    "countries": {
+      "ZA": {
+        "name": "South Africa",
+        "provinces": [
+          "Eastern Cape",
+          "Free State",
+          "Gauteng",
+          "KwaZulu-Natal",
+          "Limpopo",
+          "Mpumalanga",
+          "Northern Cape",
+          "North West",
+          "Western Cape"
+        ],
+        "postal_pattern": "\\b\\d{4}\\b"
+      },
+      "US": {
+        "name": "United States",
+        "provinces": [
+          "Alabama", "Alaska", "Arizona", "Arkansas", "California",
+          "Colorado", "Connecticut", "Delaware", "Florida", "Georgia",
+          "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa",
+          "Kansas", "Kentucky", "Louisiana", "Maine", "Maryland",
+          "Massachusetts", "Michigan", "Minnesota", "Mississippi", "Missouri",
+          "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey",
+          "New Mexico", "New York", "North Carolina", "North Dakota", "Ohio",
+          "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island", "South Carolina",
+          "South Dakota", "Tennessee", "Texas", "Utah", "Vermont",
+          "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming"
+        ],
+        "postal_pattern": "\\b\\d{5}(-\\d{4})?\\b"
+      },
+      "GB": {
+        "name": "United Kingdom",
+        "provinces": [
+          "England", "Scotland", "Wales", "Northern Ireland"
+        ],
+        "postal_pattern": "[A-Z]{1,2}\\d{1,2}[A-Z]?\\s?\\d[A-Z]{2}"
+      },
+      "CA": {
+        "name": "Canada",
+        "provinces": [
+          "Alberta", "British Columbia", "Manitoba", "New Brunswick",
+          "Newfoundland and Labrador", "Northwest Territories", "Nova Scotia",
+          "Nunavut", "Ontario", "Prince Edward Island", "Quebec",
+          "Saskatchewan", "Yukon"
+        ],
+        "postal_pattern": "[A-Z]\\d[A-Z]\\s?\\d[A-Z]\\d"
+      },
+      "AU": {
+        "name": "Australia",
+        "provinces": [
+          "New South Wales", "Victoria", "Queensland", "South Australia",
+          "Western Australia", "Tasmania", "Northern Territory",
+          "Australian Capital Territory"
+        ],
+        "postal_pattern": "\\b\\d{4}\\b"
+      }
+    }
+  },
+  "industry": {
+    "industry_keywords": {
+      "Agriculture": ["farming", "agriculture", "crops", "livestock", "agribusiness"],
+      "Technology": ["software", "IT", "technology", "digital", "tech", "SaaS"],
+      "Manufacturing": ["manufacturing", "production", "factory", "industrial"],
+      "Retail": ["retail", "shop", "store", "e-commerce", "online store"],
+      "Healthcare": ["healthcare", "medical", "health", "clinic", "hospital"],
+      "Education": ["education", "training", "school", "learning", "academic"],
+      "Construction": ["construction", "building", "contractor", "infrastructure"],
+      "Tourism": ["tourism", "hospitality", "hotel", "travel", "accommodation"],
+      "Finance": ["finance", "banking", "fintech", "financial services"],
+      "Energy": ["energy", "renewable", "solar", "wind", "power", "electricity"]
+    },
+    "industry_hierarchy": {
+      "Technology": ["Software", "Hardware", "IT Services", "Digital Marketing"],
+      "Manufacturing": ["Food Processing", "Textiles", "Automotive", "Electronics"],
+      "Healthcare": ["Medical Devices", "Pharmaceuticals", "Healthcare Services"]
+    }
+  }
+}

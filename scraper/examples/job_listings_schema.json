@@ -1,0 +1,137 @@
+{
+  "schema_name": "job_listing",
+  "schema_version": "1.0.0",
+  "description": "Schema for job listing scraping",
+  "fields": [
+    {
+      "name": "job_title",
+      "field_type": "string",
+      "required": true,
+      "description": "Title of the job position",
+      "extraction_hints": ["h1", "job-title", "position-title"]
+    },
+    {
+      "name": "company_name",
+      "field_type": "string",
+      "required": true,
+      "description": "Name of the hiring company",
+      "extraction_hints": ["company", "employer", "organization"]
+    },
+    {
+      "name": "location",
+      "field_type": "string",
+      "required": false,
+      "description": "Job location",
+      "extraction_hints": ["location", "city", "address"]
+    },
+    {
+      "name": "salary_min",
+      "field_type": "float",
+      "required": false,
+      "description": "Minimum salary"
+    },
+    {
+      "name": "salary_max",
+      "field_type": "float",
+      "required": false,
+      "description": "Maximum salary"
+    },
+    {
+      "name": "currency",
+      "field_type": "string",
+      "required": false,
+      "description": "Salary currency code"
+    },
+    {
+      "name": "employment_type",
+      "field_type": "string",
+      "required": false,
+      "description": "Type of employment (full-time, part-time, contract, etc.)"
+    },
+    {
+      "name": "remote_allowed",
+      "field_type": "boolean",
+      "required": false,
+      "description": "Whether remote work is allowed"
+    },
+    {
+      "name": "job_description",
+      "field_type": "text",
+      "required": false,
+      "description": "Full job description"
+    },
+    {
+      "name": "requirements",
+      "field_type": "list_string",
+      "required": false,
+      "description": "Job requirements and qualifications"
+    },
+    {
+      "name": "benefits",
+      "field_type": "list_string",
+      "required": false,
+      "description": "Employee benefits"
+    },
+    {
+      "name": "application_url",
+      "field_type": "url",
+      "required": false,
+      "description": "URL to apply for the job"
+    },
+    {
+      "name": "application_email",
+      "field_type": "email",
+      "required": false,
+      "description": "Email to send applications"
+    },
+    {
+      "name": "posted_date",
+      "field_type": "date",
+      "required": false,
+      "description": "Date the job was posted"
+    },
+    {
+      "name": "closing_date",
+      "field_type": "date",
+      "required": false,
+      "description": "Application closing date"
+    },
+    {
+      "name": "experience_years_min",
+      "field_type": "integer",
+      "required": false,
+      "description": "Minimum years of experience required"
+    },
+    {
+      "name": "experience_years_max",
+      "field_type": "integer",
+      "required": false,
+      "description": "Maximum years of experience"
+    },
+    {
+      "name": "education_level",
+      "field_type": "string",
+      "required": false,
+      "description": "Required education level"
+    },
+    {
+      "name": "skills",
+      "field_type": "list_string",
+      "required": false,
+      "description": "Required skills"
+    },
+    {
+      "name": "industry",
+      "field_type": "string",
+      "required": false,
+      "description": "Industry sector"
+    }
+  ],
+  "required_fields": ["job_title", "company_name"],
+  "unique_fields": ["source_url"],
+  "metadata": {
+    "domain": "job_listings",
+    "version": "1.0.0",
+    "created_by": "scraper_v2"
+  }
+}

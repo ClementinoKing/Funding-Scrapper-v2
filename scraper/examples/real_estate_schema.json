@@ -1,0 +1,188 @@
+{
+  "schema_name": "real_estate_listing",
+  "schema_version": "1.0.0",
+  "description": "Schema for real estate property listings",
+  "fields": [
+    {
+      "name": "property_title",
+      "field_type": "string",
+      "required": true,
+      "description": "Title or headline of the property listing"
+    },
+    {
+      "name": "property_type",
+      "field_type": "string",
+      "required": false,
+      "description": "Type of property (house, apartment, condo, land, etc.)"
+    },
+    {
+      "name": "listing_type",
+      "field_type": "string",
+      "required": false,
+      "description": "Sale or rental listing"
+    },
+    {
+      "name": "price",
+      "field_type": "float",
+      "required": false,
+      "description": "Property price or rental amount"
+    },
+    {
+      "name": "currency",
+      "field_type": "string",
+      "required": false,
+      "description": "Currency code"
+    },
+    {
+      "name": "price_per_sqm",
+      "field_type": "float",
+      "required": false,
+      "description": "Price per square meter"
+    },
+    {
+      "name": "address",
+      "field_type": "string",
+      "required": false,
+      "description": "Property address"
+    },
+    {
+      "name": "city",
+      "field_type": "string",
+      "required": false,
+      "description": "City"
+    },
+    {
+      "name": "state_province",
+      "field_type": "string",
+      "required": false,
+      "description": "State or province"
+    },
+    {
+      "name": "postal_code",
+      "field_type": "string",
+      "required": false,
+      "description": "Postal/ZIP code"
+    },
+    {
+      "name": "country",
+      "field_type": "string",
+      "required": false,
+      "description": "Country"
+    },
+    {
+      "name": "bedrooms",
+      "field_type": "integer",
+      "required": false,
+      "description": "Number of bedrooms"
+    },
+    {
+      "name": "bathrooms",
+      "field_type": "float",
+      "required": false,
+      "description": "Number of bathrooms"
+    },
+    {
+      "name": "square_meters",
+      "field_type": "float",
+      "required": false,
+      "description": "Property size in square meters"
+    },
+    {
+      "name": "square_feet",
+      "field_type": "float",
+      "required": false,
+      "description": "Property size in square feet"
+    },
+    {
+      "name": "lot_size",
+      "field_type": "float",
+      "required": false,
+      "description": "Lot/land size"
+    },
+    {
+      "name": "year_built",
+      "field_type": "integer",
+      "required": false,
+      "description": "Year the property was built"
+    },
+    {
+      "name": "description",
+      "field_type": "text",
+      "required": false,
+      "description": "Full property description"
+    },
+    {
+      "name": "features",
+      "field_type": "list_string",
+      "required": false,
+      "description": "Property features and amenities"
+    },
+    {
+      "name": "images",
+      "field_type": "list_url",
+      "required": false,
+      "description": "Property image URLs"
+    },
+    {
+      "name": "agent_name",
+      "field_type": "string",
+      "required": false,
+      "description": "Real estate agent name"
+    },
+    {
+      "name": "agent_phone",
+      "field_type": "phone",
+      "required": false,
+      "description": "Agent phone number"
+    },
+    {
+      "name": "agent_email",
+      "field_type": "email",
+      "required": false,
+      "description": "Agent email"
+    },
+    {
+      "name": "listing_date",
+      "field_type": "date",
+      "required": false,
+      "description": "Date the listing was posted"
+    },
+    {
+      "name": "parking_spaces",
+      "field_type": "integer",
+      "required": false,
+      "description": "Number of parking spaces"
+    },
+    {
+      "name": "has_garage",
+      "field_type": "boolean",
+      "required": false,
+      "description": "Whether property has a garage"
+    },
+    {
+      "name": "has_pool",
+      "field_type": "boolean",
+      "required": false,
+      "description": "Whether property has a pool"
+    },
+    {
+      "name": "has_garden",
+      "field_type": "boolean",
+      "required": false,
+      "description": "Whether property has a garden"
+    },
+    {
+      "name": "pet_friendly",
+      "field_type": "boolean",
+      "required": false,
+      "description": "Whether pets are allowed"
+    }
+  ],
+  "required_fields": ["property_title"],
+  "unique_fields": ["source_url"],
+  "metadata": {
+    "domain": "real_estate",
+    "version": "1.0.0",
+    "created_by": "scraper_v2"
+  }
+}
