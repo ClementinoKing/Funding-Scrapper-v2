@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import { format } from "date-fns";
 import { SectionHeader } from "@/components/shared/section-header";
@@ -6,10 +7,9 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { apiClient } from "@/services/api/client";
 import type { FundingProgram } from "@/types/domain";
 import type { ScrapedFundingProgramme } from "@/types/funding";
-import {usePrograms} from "@/hooks/use-programs"
-import { Pagination } from "@/components/shared/pagination";
 
 const formatDeadline = (program: FundingProgram): string => {
   if (program.deadlineAt) {
@@ -39,33 +39,37 @@ function ProgrammeCard({ program }: { program: ScrapedFundingProgramme }) {
       <CardHeader className="space-y-3">
         <div className="flex items-start justify-between gap-3">
           <div className="space-y-1">
-            <CardTitle className="text-base">{program.program_name}</CardTitle>
-            <p className="text-sm text-muted-foreground">{program.funder_name}</p>
+            <CardTitle className="text-base">{program.title}</CardTitle>
+            <p className="text-sm text-muted-foreground">{program.providerName}</p>
           </div>
-          {/* <Badge variant={program.status === "active" ? "success" : program.status === "closing_soon" ? "warning" : "secondary"}>
+          <Badge variant={program.status === "active" ? "success" : program.status === "closing_soon" ? "warning" : "secondary"}>
             {program.status}
-          </Badge> */}
+          </Badge>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Badge variant="secondary">{program.funding_type}</Badge>
+          <Badge variant="secondary">{program.fundingType}</Badge>
           <Badge variant="outline">{formatDeadline(program)}</Badge>
           <Badge variant="outline">
-            {formatMoney(program.ticket_min as number)}
-            {program.ticket_max ? ` - ${formatMoney(program.ticket_max as number)}` : ""}
+            {formatMoney(program.amountMin)}
+            {program.amountMax ? ` - ${formatMoney(program.amountMax)}` : ""}
           </Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        <p className="text-sm text-muted-foreground line-clamp-3">{program.funding_lines}</p>
+        <p className="text-sm text-muted-foreground">{program.eligibilitySummary}</p>
         <div className="flex flex-wrap gap-2">
-          {program.geography_scope}
+          {program.geography.slice(0, 3).map((item) => (
+            <Badge key={item} variant="outline">
+              {item}
+            </Badge>
+          ))}
         </div>
         <div className="flex flex-wrap gap-2 pt-2">
           <Button asChild variant="outline" size="sm">
-            <Link to={`/app/programs/${program?.program_id}`}>Open full page</Link>
+            <Link to={`/app/programs/${program.id}`}>Open full page</Link>
           </Button>
           <Button asChild size="sm">
-            <a href={program?.source_url} target="_blank" rel="noreferrer">
+            <a href={program.sourceUrl} target="_blank" rel="noreferrer">
               Open source
             </a>
           </Button>
@@ -76,35 +80,23 @@ function ProgrammeCard({ program }: { program: ScrapedFundingProgramme }) {
 }
 
 export function ProgramsPage() {
-  const {data: programs = []} = usePrograms();
-  console.log(programs)
   const [query, setQuery] = useState("");
-
-  const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 12;
+  const { data: programs = [] } = useQuery({
+    queryKey: ["programs"],
+    queryFn: apiClient.getPrograms
+  });
 
   const filteredPrograms = useMemo(() => {
     const terms = query.toLowerCase().trim();
     return programs
-      .filter(program => {
-        
-        if(!terms) return true;
-
-        return [program.program_name, program.funder_name, ...program.funding_lines, program.geography_scope]
-            .join(" ")
-            .toLowerCase()
-            .includes(terms)
+      .filter((program) => {
+        if (!terms) return true;
+        return [program.title, program.providerName, program.eligibilitySummary, ...program.geography].join(" ")
+          .toLowerCase()
+          .includes(terms);
       })
-      .sort((a,b) => a.program_name.localeCompare(b.program_name));
+      .sort((left, right) => left.title.localeCompare(right.title));
   }, [programs, query]);
-
-  // Pagination
-    const paginatedPrograms = useMemo(() => {
-      const start = (currentPage - 1) * itemsPerPage;
-      return filteredPrograms.slice(start, start + itemsPerPage);
-    }, [filteredPrograms, currentPage, itemsPerPage]);
-  
-    const totalPages = Math.ceil(filteredPrograms.length / itemsPerPage);
 
   return (
     <div className="space-y-8">
@@ -116,21 +108,10 @@ export function ProgramsPage() {
         <Input placeholder="Filter by title, provider, or sector..." value={query} onChange={(e) => setQuery(e.target.value)} />
       </div>
       <div className="grid gap-4 lg:grid-cols-2">
-        {paginatedPrograms?.map((program) => (
+        {filteredPrograms.map((program) => (
           <ProgrammeCard key={program.id} program={program} />
         ))}
       </div>
-      {totalPages > 1 && (
-          <div className="mt-6">
-            <Pagination
-              currentPage={currentPage}
-              totalPages={totalPages}
-              onPageChange={setCurrentPage}
-              itemsPerPage={itemsPerPage}
-              totalItems={filteredPrograms.length}
-            />
-          </div>
-        )}
     </div>
   );
 }

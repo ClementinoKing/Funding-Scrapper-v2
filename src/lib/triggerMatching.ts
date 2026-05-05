@@ -1,9 +1,32 @@
 import { supabase } from './supabase'
 
 /**
- * Manually trigger matching for a business
+ * Enqueue job for matching for a business
  */
 export async function triggerBusinessMatching(
+  businessId: string,
+  useAI = false
+) {
+  const { data, error } = await supabase.rpc(
+    "enqueue_program_matching_job",
+    {
+      business_id: businessId,
+      use_ai: useAI,
+    }
+  );
+
+  if (error) {
+    console.error("QUEUE INSERT FAILED:", error);
+    return { success: false, error };
+  }
+
+  return { success: true, message_id: data };
+}
+
+/**
+ * Manually trigger edge function for matching for a business
+ */
+export async function triggerEdgeBusinessMatching(
   businessId: string,
   useAI = true
 ) {

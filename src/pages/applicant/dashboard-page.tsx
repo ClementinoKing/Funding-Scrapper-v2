@@ -1,20 +1,39 @@
-import { useQuery } from "@tanstack/react-query";
 import { StatCard } from "@/components/shared/stat-card";
 import { SectionHeader } from "@/components/shared/section-header";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { apiClient } from "@/services/api/client";
+import { useProfile } from "@/hooks/use-profile";
+import { getBusinessMatches } from "@/lib/triggerMatching";
+import { UserProfileView } from "@/types/api";
+import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 
 export function ApplicantDashboardPage() {
-  const { data: profile } = useQuery({
-    queryKey: ["profile"],
-    queryFn: apiClient.getCurrentUserProfile
-  });
+  const { data: profile } = useProfile();
+  const userProfile = profile?.[0] as UserProfileView;
 
-  const { data: matches } = useQuery({
-    queryKey: ["matches"],
-    queryFn: () => apiClient.getMatchesByUser("user_001")
-  });
+  const [matches, setMatches] = useState<any[]>([]);
+
+  const loadMatches = async () => {
+      if (!userProfile?.business_id) return [];
+  
+      const { data } = await getBusinessMatches(userProfile.business_id);
+  
+      if (data) {
+        setMatches(data);
+        return data;
+      }
+  
+      return [];
+    };
+  
+    useEffect(() => {
+      if (userProfile?.business_id) {
+        loadMatches();
+      }
+      console.log(userProfile)
+
+    },[userProfile]);
 
   return (
     <div>
@@ -26,7 +45,7 @@ export function ApplicantDashboardPage() {
       <div className="grid gap-4 md:grid-cols-3">
         <StatCard
           label="Profile completeness"
-          value={`${profile?.profileCompleteness ?? 0}%`}
+          value={`${userProfile?.profile_completeness ?? 0}%`}
           caption="Aim for 90%+ to improve match quality"
         />
         <StatCard
@@ -39,25 +58,31 @@ export function ApplicantDashboardPage() {
 
       <Card className="mt-6">
         <CardHeader>
-          <CardTitle>Recent Match Signals</CardTitle>
+          <CardTitle>Recent Matches</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          {matches?.map((match) => (
-            <div key={match.id} className="rounded-lg border p-4">
-              <div className="mb-2 flex items-center justify-between">
-                <p className="text-sm font-semibold">Program ID: {match.programId}</p>
-                <Badge variant={match.status === "high_fit" ? "success" : "secondary"}>
-                  {match.status.replace("_", " ")}
-                </Badge>
+          {matches?.slice?.(0, 5)?.map((match) => (
+            <Link to={`/app/matches/${match?.program_id}`} key={match?.program_id}>
+              <div className="rounded-lg border p-4 mb-2 hover:bg-muted-background transition">
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="font-semibold">{match?.program_name}</p>
+                  <Badge variant={match?.final_score >= 60 ? "success" : "secondary"}>
+                    {match?.match_category || "Uncategorized"}
+                  </Badge>
+                </div>
+                <p className="text-sm text-muted-foreground">Match score: {match?.final_score}/100</p>
+                <ul className="mt-2 list-disc space-y-1 pl-4 text-sm grid grid-cols-1 md:grid-cols-3 gap-2">
+                  {match?.match_reasons?.map((reason: { reason: string }) => (
+                    <li key={reason?.reason}>{reason?.reason}</li>
+                  ))}
+                </ul>
               </div>
-              <p className="text-sm text-muted-foreground">Match score: {match.score}/100</p>
-              <ul className="mt-2 list-disc space-y-1 pl-4 text-sm">
-                {match.reasons.map((reason) => (
-                  <li key={reason}>{reason}</li>
-                ))}
-              </ul>
-            </div>
+            </Link>
           ))}
+
+          {matches?.length === 0 && (
+            <p className="text-sm text-muted-foreground">No matches found. Please complete your profile, visit the My Matches page, and check back later.</p>
+          )}
         </CardContent>
       </Card>
     </div>

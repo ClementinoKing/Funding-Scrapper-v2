@@ -93,7 +93,7 @@ export default function BusinessTrading({
             </Select>
           </div>
         </div>
-        <Field>
+        <Field className="hidden">
           <FieldLabel>How do customers pay you?</FieldLabel>
           <FieldDescription>
             Choose all that apply. Add detail for better matches.

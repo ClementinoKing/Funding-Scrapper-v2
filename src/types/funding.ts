@@ -2,6 +2,7 @@ import type { ApplicantProfile, FundingProgram } from "@/types/domain";
 
 export type ScrapedFundingProgramme = FundingProgram & {
   id?: string;
+  program_id?: string | null;
   program_name?: string | null;
   program_slug?: string | null;
   parent_programme_name?: string | null;

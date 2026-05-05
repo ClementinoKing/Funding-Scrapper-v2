@@ -23,6 +23,7 @@ import { AIRulesPage } from "@/pages/admin/ai-rules-page";
 import { InterventionsPage } from "@/pages/admin/interventions-page";
 import { ChangeLogPage } from "@/pages/admin/change-log-page";
 import { NotFoundPage } from "@/pages/not-found-page";
+import FundingDetail from "@/pages/applicant/funding-details-page";
 
 function ProtectedRoute({ role }: { role?: Role }) {
   const { isAuthenticated, user } = useAuthStore();
@@ -56,7 +57,8 @@ export const router = createBrowserRouter([
               { path: "/app/programs", element: <ProgramsPage /> },
               { path: "/app/programs/:programId", element: <ProgramDetailPage /> },
               { path: "/app/matches", element: <MatchesPage /> },
-              { path: "/app/notifications", element: <NotificationsPage /> }
+              { path: "/app/notifications", element: <NotificationsPage /> },
+              { path: "/app/matches/:programId", element: <FundingDetail /> },
             ]
           },
           {
