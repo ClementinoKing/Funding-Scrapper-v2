@@ -30,6 +30,7 @@ from scraper.schemas import (
 )
 from scraper.utils.dates import looks_expired, parse_deadline_info
 from scraper.utils.money import extract_budget_total, extract_money_range, infer_default_currency
+from scraper.utils.page_classification import classify_global_page_type
 from scraper.utils.text import (
     clean_text,
     extract_emails,
@@ -1702,19 +1703,12 @@ def classify_page_type(
     document_link_count: int,
     text: str,
 ) -> str:
-    lowered = (text or "").lower()
-    if record_count > 1:
-        return "listing"
-    if candidate_block_count > 1 and record_count > 1:
-        return "listing"
-    if candidate_block_count > 1:
-        return "mixed"
-    if application_link_count or document_link_count:
-        return "support" if record_count == 0 else "detail"
-    if detail_link_count > 0 and record_count <= 1:
-        return "listing" if detail_link_count > 2 else "detail"
-    if internal_link_count > 8 and record_count <= 1:
-        return "listing"
-    if any(term in lowered for term in ["eligibility", "apply", "application", "funding", "finance", "loan", "grant"]):
-        return "detail"
-    return "unknown"
+    return classify_global_page_type(
+        record_count=record_count,
+        candidate_block_count=candidate_block_count,
+        internal_link_count=internal_link_count,
+        detail_link_count=detail_link_count,
+        application_link_count=application_link_count,
+        document_link_count=document_link_count,
+        text=text,
+    )

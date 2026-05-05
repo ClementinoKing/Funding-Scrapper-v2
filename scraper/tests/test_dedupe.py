@@ -78,6 +78,57 @@ def test_dedupe_normalizes_inverted_ticket_ranges() -> None:
     assert merged.ticket_max == 5000000
 
 
+def test_dedupe_groups_related_support_fragments_into_programme_record() -> None:
+    detail = FundingProgrammeRecord(
+        program_name="Green Growth Fund",
+        funder_name="Example Agency",
+        source_url="https://example.org/programmes/green-growth-fund",
+        source_urls=["https://example.org/programmes/green-growth-fund"],
+        source_domain="example.org",
+        source_page_title="Green Growth Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.GRANT,
+        page_type="funding_programme",
+        ticket_max=1000000,
+    )
+    eligibility = FundingProgrammeRecord(
+        program_name="Eligibility",
+        funder_name="Example Agency",
+        parent_programme_name="Green Growth Fund",
+        source_url="https://example.org/programmes/green-growth-fund/eligibility",
+        source_urls=["https://example.org/programmes/green-growth-fund/eligibility"],
+        source_domain="example.org",
+        source_page_title="Eligibility - Green Growth Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.UNKNOWN,
+        page_type="support_programme",
+        raw_eligibility_data=["SMEs must be registered and tax compliant."],
+    )
+    documents = FundingProgrammeRecord(
+        program_name="Required Documents",
+        funder_name="Example Agency",
+        parent_programme_name="Green Growth Fund",
+        source_url="https://example.org/programmes/green-growth-fund/documents",
+        source_urls=["https://example.org/programmes/green-growth-fund/documents"],
+        source_domain="example.org",
+        source_page_title="Required Documents - Green Growth Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.UNKNOWN,
+        page_type="support_programme",
+        required_documents=["Tax clearance certificate"],
+    )
+
+    deduped = dedupe_records([detail, eligibility, documents])
+
+    assert len(deduped) == 1
+    merged = deduped[0]
+    assert merged.program_name == "Green Growth Fund"
+    assert merged.page_type == "funding_programme"
+    assert len(merged.source_urls) == 3
+    assert "SMEs must be registered and tax compliant." in (merged.raw_eligibility_data or [])
+    assert "Tax clearance certificate" in merged.required_documents
+
+
 def test_dedupe_keeps_ttf_support_pages_under_the_parent_programme() -> None:
     parent = FundingProgrammeRecord(
         program_name="Tourism Transformation Fund",

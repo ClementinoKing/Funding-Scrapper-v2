@@ -12,6 +12,7 @@ from scraper.adapters.base import PARENT_HUB_SEGMENTS, PARENT_SUPPORT_SEGMENT_TE
 from scraper.schemas import FieldEvidence, FundingProgrammeRecord, FundingType, ProgrammeNature
 from scraper.utils.text import clean_text, completeness_score, generate_program_id, slugify, strip_leading_numbered_prefix, unique_preserve_order
 from scraper.utils.urls import canonicalize_url
+from scraper.utils.page_classification import PAGE_TYPE_FUNDING_PROGRAMME, PAGE_TYPE_FUNDING_LISTING, PAGE_TYPE_OPEN_CALL, normalize_page_type
 
 
 UNKNOWN_ENUMS = {"Unknown", None, ""}
@@ -137,7 +138,39 @@ def _scalar_is_empty(value: object) -> bool:
 
 
 def _is_generic_support_program(program_name: Optional[str]) -> bool:
-    return False
+    normalized = clean_text(program_name or "").casefold()
+    if not normalized:
+        return True
+    generic_terms = {
+        "eligibility",
+        "eligibility criteria",
+        "requirements",
+        "how to apply",
+        "application",
+        "application process",
+        "documents",
+        "required documents",
+        "funding",
+        "funding offer",
+        "terms",
+        "overview",
+        "support",
+    }
+    return normalized in generic_terms or normalized.endswith(":")
+
+
+def _shared_grouping_evidence(left: FundingProgrammeRecord, right: FundingProgrammeRecord) -> bool:
+    left_context = _source_context_keys(left) | _source_leaf_base_keys(left)
+    right_context = _source_context_keys(right) | _source_leaf_base_keys(right)
+    if left_context and right_context and left_context & right_context:
+        return True
+    left_links = set(left.related_documents + ([left.application_url] if left.application_url else []))
+    right_links = set(right.related_documents + ([right.application_url] if right.application_url else []))
+    if left_links and right_links and left_links & right_links:
+        return True
+    left_parent = clean_text(left.parent_programme_name or "").casefold()
+    right_parent = clean_text(right.parent_programme_name or "").casefold()
+    return bool(left_parent and right_parent and left_parent == right_parent)
 
 
 def _should_merge(
@@ -159,6 +192,18 @@ def _should_merge(
 
     if left.source_domain != right.source_domain:
         return False
+
+    if (
+        merge_decider
+        and hasattr(merge_decider, "score_duplicate_records")
+    ):
+        score_result = merge_decider.score_duplicate_records(left, right)
+        if isinstance(score_result, dict):
+            decision = str(score_result.get("decision") or "").casefold()
+            if decision == "merge":
+                return True
+            if decision == "separate":
+                return False
 
     if (
         merge_decider
@@ -185,9 +230,21 @@ def _should_merge(
         return False
 
     if not (left_program and right_program and left_funder and right_funder):
-        return False
+        if left.source_domain != right.source_domain or not _shared_grouping_evidence(left, right):
+            return False
+        if left_program and right_program and left_program != right_program:
+            return False
+        if left_funder and right_funder and left_funder != right_funder:
+            return False
+        return True
     if left_program != right_program or left_funder != right_funder:
-        return False
+        if not _shared_grouping_evidence(left, right):
+            return False
+        if left_program and right_program and not (_is_generic_support_program(left_program) or _is_generic_support_program(right_program)):
+            return False
+        if left_funder and right_funder and left_funder != right_funder:
+            return False
+        return True
     if left_parent or right_parent:
         return bool(left_parent) and bool(right_parent) and left_parent == right_parent
 
@@ -250,6 +307,8 @@ def _merge_record_pair(
 ) -> FundingProgrammeRecord:
     merged = primary.model_copy(deep=True)
     secondary_data = secondary.model_dump(mode="python")
+    primary_page_type = normalize_page_type(primary.page_type)
+    secondary_page_type = normalize_page_type(secondary.page_type)
 
     for field_name, candidate_value in secondary_data.items():
         current_value = getattr(merged, field_name)
@@ -290,12 +349,20 @@ def _merge_record_pair(
                 setattr(merged, field_name, candidate_value)
             elif _scalar_is_empty(current_value) and not _scalar_is_empty(candidate_value):
                 setattr(merged, field_name, candidate_value)
+        elif field_name == "page_type":
+            preferred = _preferred_page_type(primary_page_type, secondary_page_type)
+            setattr(merged, field_name, preferred)
+        elif field_name == "page_role":
+            if _scalar_is_empty(current_value) or current_value == "generic":
+                setattr(merged, field_name, candidate_value)
         elif _scalar_is_empty(current_value) and not _scalar_is_empty(candidate_value):
             setattr(merged, field_name, candidate_value)
 
     merged.source_urls = _merge_lists(primary.source_urls, secondary.source_urls)
     if merged.source_url not in merged.source_urls and merged.source_urls:
         merged.source_url = merged.source_urls[0]
+    if len(merged.source_urls) > 1:
+        merged.needs_review_reasons = unique_preserve_order([*merged.needs_review_reasons, "merged_multi_page_record"])
     if not merged.page_debug_package and secondary.page_debug_package:
         merged.page_debug_package = secondary.page_debug_package
     if adapter:
@@ -306,6 +373,15 @@ def _merge_record_pair(
     merged.program_slug = slugify(merged.program_name or merged.program_id, max_length=80)
     merged.funder_slug = slugify(merged.funder_name or merged.source_domain, max_length=80)
     return FundingProgrammeRecord.model_validate(merged.model_dump(mode="python"))
+
+
+def _preferred_page_type(left: str, right: str) -> str:
+    priority = {
+        PAGE_TYPE_FUNDING_PROGRAMME: 4,
+        PAGE_TYPE_OPEN_CALL: 3,
+        PAGE_TYPE_FUNDING_LISTING: 2,
+    }
+    return left if priority.get(left, 0) >= priority.get(right, 0) else right
 
 
 def _merge_cluster(cluster: List[FundingProgrammeRecord], adapter: Optional[SiteAdapter] = None) -> FundingProgrammeRecord:

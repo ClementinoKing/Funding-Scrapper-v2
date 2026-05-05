@@ -44,7 +44,21 @@ from scraper.classifiers.repayment import extract_payback_details
 from scraper.utils.document_reader import compact_document_text, extract_local_document_text, infer_document_kind
 from scraper.utils.dates import parse_deadline_info
 from scraper.utils.money import extract_budget_total, extract_money_range, infer_default_currency
-from scraper.parsers.normalization import classify_page_type
+from scraper.utils.page_classification import (
+    _has_programme_detail_signals,
+    classify_global_page_type,
+    PAGE_TYPE_FUNDING_LISTING,
+    PAGE_TYPE_FUNDING_PROGRAMME,
+    PAGE_TYPE_GENERIC_CONTENT,
+    PAGE_TYPE_NEWS_ARTICLE,
+    PAGE_TYPE_OPEN_CALL,
+    PAGE_TYPE_SUPPORT_PROGRAMME,
+    PAGE_TYPE_TECHNOLOGY_STATION,
+    PAGE_TYPE_TENDER_PROCUREMENT,
+    has_fundable_support,
+    looks_like_tender_title,
+    normalize_page_type,
+)
 from scraper.utils.text import (
     clean_text,
     extract_emails,
@@ -139,6 +153,118 @@ NON_PROGRAMME_SIGNAL_TERMS = (
     "gallery",
     "attachment",
 )
+PAGE_ROLE_OVERVIEW = "overview"
+PAGE_ROLE_ELIGIBILITY = "eligibility"
+PAGE_ROLE_APPLICATION = "application"
+PAGE_ROLE_CHECKLIST = "checklist"
+PAGE_ROLE_FUNDING_DETAIL = "funding_detail"
+PAGE_ROLE_LISTING = "listing"
+PAGE_ROLE_PROCUREMENT_NOTICE = "procurement_notice"
+PAGE_ROLE_NEWS_ARTICLE = "news_article"
+PAGE_ROLE_ABOUT_CONTACT = "about_contact"
+PAGE_ROLE_SUPPORT_DETAIL = "support_detail"
+PAGE_ROLE_TECHNOLOGY_STATION = "technology_station"
+PAGE_ROLE_GENERIC = "generic"
+REVIEW_REASON_UNKNOWN_FUNDING_TYPE = "unknown_funding_type"
+REVIEW_REASON_WEAK_MONEY_EVIDENCE = "weak_money_evidence"
+REVIEW_REASON_INVALID_MONEY_CONTEXT = "invalid_money_context"
+REVIEW_REASON_NON_PROGRAMME_PAGE = "non_programme_page"
+REVIEW_REASON_CONFLICTING_FIELD_VALUES = "conflicting_field_values"
+REVIEW_REASON_MISSING_CORE_EVIDENCE = "missing_core_evidence"
+REVIEW_REASON_WEAK_DUPLICATE_MATCH = "weak_duplicate_match"
+REVIEW_REASON_MERGED_MULTI_PAGE = "merged_multi_page_record"
+REVIEW_REASON_UNCONFIRMED_PAGE_TYPE = "unconfirmed_page_type"
+REVIEW_REASON_INVALID_PROGRAM_NAME = "invalid_program_name"
+REVIEW_REASON_INVALID_FUNDER_NAME = "invalid_funder_name"
+REVIEW_REASON_LISTING_UNKNOWN_FUNDING_TYPE = "listing_unknown_funding_type"
+REVIEW_REASON_UNFUNDABLE_OPEN_CALL = "unfundable_open_call"
+MONEY_INVALID_CONTEXT_RE = re.compile(
+    r"\b(?:tender number|bid number|rfp|rfq|procurement|telephone|phone|fax|postal code|postcode|trl|technology readiness level)\b",
+    re.I,
+)
+MONEY_INVALID_DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b")
+MONEY_INVALID_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+MONEY_INVALID_PERCENT_RE = re.compile(r"\b\d{1,3}(?:\.\d+)?\s?%")
+MONEY_INVALID_PHONE_RE = re.compile(r"(?:\+?\d[\s().-]*){7,}")
+MONEY_INVALID_TRL_RE = re.compile(r"\btrl\s*\d+(?:\s*[-–]\s*\d+)?\b", re.I)
+MONEY_POSITIVE_CONTEXT_RE = re.compile(r"\b(?:fund|funding|grant|loan|equity|investment|capital|ticket|amount|budget|finance)\b", re.I)
+MONEY_SNIPPET_SIGNAL_RE = re.compile(
+    r"(?:\b(?:zar|usd|eur|gbp)\b|(?:^|\s)[r$£]\s*\d|\b\d[\d\s,]*(?:\.\d+)?\s*(?:thousand|million|billion|mn|bn|k|m|b)\b)",
+    re.I,
+)
+ABOUT_CONTACT_TERMS = ("about us", "about", "contact us", "contact", "privacy", "terms and conditions")
+PAGE_ROLE_SUPPORT_SUFFIXES = (
+    "apply",
+    "application",
+    "applications",
+    "eligibility",
+    "criteria",
+    "checklist",
+    "documents",
+    "required-documents",
+    "how-to-apply",
+    "application-form",
+    "overview",
+    "terms",
+    "funding",
+    "register",
+    "contact",
+)
+INVALID_PROGRAMME_NAME_TERMS = {
+    "about",
+    "about us",
+    "apply",
+    "application",
+    "contact",
+    "contact us",
+    "eligibility",
+    "eligibility criteria",
+    "generic content",
+    "funding",
+    "funding opportunities",
+    "funding programmes",
+    "home",
+    "latest news",
+    "listing",
+    "news",
+    "news article",
+    "open call",
+    "overview",
+    "products and services",
+    "programme",
+    "program",
+    "required documents",
+    "support",
+}
+INVALID_FUNDER_NAME_TERMS = GENERIC_FUNDER_TOKENS | {
+    "about",
+    "about us",
+    "apply",
+    "application",
+    "contact",
+    "contact us",
+    "funding",
+    "home",
+    "listing",
+    "news",
+    "overview",
+    "programme",
+    "program",
+    "support",
+}
+IMPORTANT_EVIDENCE_FIELDS = {
+    "program_name",
+    "funder_name",
+    "funding_type",
+    "ticket_min",
+    "ticket_max",
+    "program_budget_total",
+    "deadline_type",
+    "deadline_date",
+    "application_url",
+    "required_documents",
+    "raw_eligibility_criteria",
+}
 
 ELIGIBILITY_STAGE_PATTERNS = {
     "startup": ("startup", "start-up", "new business", "early-stage business"),
@@ -262,6 +388,8 @@ FIELD_EVIDENCE_SKIP_FIELDS = {
     "field_confidence",
     "validation_errors",
     "needs_review",
+    "needs_review_reasons",
+    "field_conflicts",
     "ai_enriched",
 }
 
@@ -273,6 +401,7 @@ FIELD_EVIDENCE_CORE_FIELDS = {
     "source_domain",
     "source_page_title",
     "page_type",
+    "page_role",
     "source_scope",
     "funding_type",
     "geography_scope",
@@ -1302,6 +1431,13 @@ def _validate_field_evidence(record: FundingProgrammeRecord, bundle: Optional[Fi
             evidence_by_field[field_name] = unique_preserve_order(fallback_snippets)
         else:
             validation_errors.append(f"missing evidence for {field_name}")
+    for field_name in IMPORTANT_EVIDENCE_FIELDS:
+        value = payload.get(field_name)
+        if value in (None, "", [], {}, False):
+            continue
+        snippets = [snippet for snippet in evidence_by_field.get(field_name, []) if clean_text(str(snippet))]
+        if not snippets:
+            validation_errors.append(f"missing important evidence for {field_name}")
     payload["evidence_by_field"] = evidence_by_field
     payload["raw_text_snippets"] = raw_text_snippets
     payload["validation_errors"] = unique_preserve_order(validation_errors)
@@ -1514,6 +1650,9 @@ def _normalize_page_decision(value: Any) -> str:
     text = _coerce_text(value).casefold().replace("-", "_").replace(" ", "_")
     if text in {
         PAGE_DECISION_FUNDING_PROGRAM,
+        PAGE_TYPE_FUNDING_PROGRAMME,
+        "funding_listing",
+        PAGE_TYPE_OPEN_CALL,
         "fundingprogramme",
         "funding_programme",
         "programme",
@@ -1524,6 +1663,11 @@ def _normalize_page_decision(value: Any) -> str:
         return PAGE_DECISION_FUNDING_PROGRAM
     if text in {
         PAGE_DECISION_NOT_FUNDING_PROGRAM,
+        PAGE_TYPE_SUPPORT_PROGRAMME,
+        PAGE_TYPE_TECHNOLOGY_STATION,
+        PAGE_TYPE_TENDER_PROCUREMENT,
+        PAGE_TYPE_NEWS_ARTICLE,
+        PAGE_TYPE_GENERIC_CONTENT,
         "not_program",
         "not_programme",
         "non_program",
@@ -1541,6 +1685,106 @@ def _normalize_page_decision(value: Any) -> str:
     return PAGE_DECISION_UNCLEAR
 
 
+def normalize_page_role(value: Any) -> str:
+    text = _coerce_text(value).casefold().replace("-", "_").replace("/", "_").replace(" ", "_")
+    aliases = {
+        "overview": PAGE_ROLE_OVERVIEW,
+        "programme_detail": PAGE_ROLE_OVERVIEW,
+        "program_detail": PAGE_ROLE_OVERVIEW,
+        "eligibility": PAGE_ROLE_ELIGIBILITY,
+        "criteria": PAGE_ROLE_ELIGIBILITY,
+        "application": PAGE_ROLE_APPLICATION,
+        "apply": PAGE_ROLE_APPLICATION,
+        "checklist": PAGE_ROLE_CHECKLIST,
+        "documents": PAGE_ROLE_CHECKLIST,
+        "funding_detail": PAGE_ROLE_FUNDING_DETAIL,
+        "funding": PAGE_ROLE_FUNDING_DETAIL,
+        "listing": PAGE_ROLE_LISTING,
+        "procurement": PAGE_ROLE_PROCUREMENT_NOTICE,
+        "procurement_notice": PAGE_ROLE_PROCUREMENT_NOTICE,
+        "news": PAGE_ROLE_NEWS_ARTICLE,
+        "news_article": PAGE_ROLE_NEWS_ARTICLE,
+        "about": PAGE_ROLE_ABOUT_CONTACT,
+        "contact": PAGE_ROLE_ABOUT_CONTACT,
+        "about_contact": PAGE_ROLE_ABOUT_CONTACT,
+        "support": PAGE_ROLE_SUPPORT_DETAIL,
+        "support_detail": PAGE_ROLE_SUPPORT_DETAIL,
+        "technology_station": PAGE_ROLE_TECHNOLOGY_STATION,
+        "generic": PAGE_ROLE_GENERIC,
+    }
+    return aliases.get(text, PAGE_ROLE_GENERIC)
+
+
+def _canonical_programme_path_key(urls: Sequence[str]) -> str:
+    for url in urls:
+        path = urlparse(url or "").path.casefold().strip("/")
+        if not path:
+            continue
+        parts = [part for part in path.split("/") if part]
+        if not parts:
+            continue
+        last = parts[-1]
+        for suffix in PAGE_ROLE_SUPPORT_SUFFIXES:
+            if last == suffix:
+                parts = parts[:-1]
+                break
+            if last.endswith("-" + suffix):
+                parts[-1] = last[: -(len(suffix) + 1)]
+                break
+        cleaned = "/".join(part for part in parts if part)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _record_canonical_group_key(record: FundingProgrammeRecord) -> str:
+    normalized_program = clean_text(record.program_name or record.parent_programme_name or "").casefold()
+    normalized_funder = clean_text(record.funder_name or "").casefold()
+    path_key = _canonical_programme_path_key(record.source_urls or [record.source_url])
+    if normalized_program and normalized_funder:
+        return f"{record.source_domain}:{normalized_funder}:{normalized_program}"
+    if path_key:
+        return f"{record.source_domain}:{path_key}"
+    return f"{record.source_domain}:{clean_text(record.source_url).casefold()}"
+
+
+def _infer_page_role(document: PageContentDocument, page_type: str, existing_role: Any = None) -> str:
+    normalized_existing = normalize_page_role(existing_role)
+    if normalized_existing != PAGE_ROLE_GENERIC:
+        return normalized_existing
+    normalized_page_type = normalize_page_type(page_type)
+    haystack = " ".join(
+        [
+            document.page_url or "",
+            document.title or "",
+            document.page_title or "",
+            document.full_body_text or "",
+            " ".join(document.headings or []),
+        ]
+    ).casefold()
+    if normalized_page_type == PAGE_TYPE_FUNDING_LISTING:
+        return PAGE_ROLE_LISTING
+    if normalized_page_type == PAGE_TYPE_TENDER_PROCUREMENT:
+        return PAGE_ROLE_PROCUREMENT_NOTICE
+    if normalized_page_type == PAGE_TYPE_NEWS_ARTICLE:
+        return PAGE_ROLE_NEWS_ARTICLE
+    if normalized_page_type == PAGE_TYPE_TECHNOLOGY_STATION:
+        return PAGE_ROLE_TECHNOLOGY_STATION
+    if normalized_page_type == PAGE_TYPE_SUPPORT_PROGRAMME:
+        return PAGE_ROLE_SUPPORT_DETAIL
+    if any(term in haystack for term in ABOUT_CONTACT_TERMS):
+        return PAGE_ROLE_ABOUT_CONTACT
+    if any(term in haystack for term in ("checklist", "required documents", "supporting documents", "paperwork needed")):
+        return PAGE_ROLE_CHECKLIST
+    if any(term in haystack for term in ("apply", "application", "register", "submission portal", "how to apply")):
+        return PAGE_ROLE_APPLICATION
+    if any(term in haystack for term in ("eligibility", "criteria", "who qualifies", "requirements")):
+        return PAGE_ROLE_ELIGIBILITY
+    if any(term in haystack for term in ("funding amount", "ticket size", "loan amount", "grant amount", "repayment", "interest rate")):
+        return PAGE_ROLE_FUNDING_DETAIL
+    return PAGE_ROLE_OVERVIEW
+
+
 def _page_decision_hint(document: PageContentDocument) -> Tuple[str, List[str]]:
     # This is the cheap pre-model heuristic that guesses whether the page is a
     # real funding programme or just generic site content.
@@ -1555,9 +1799,26 @@ def _page_decision_hint(document: PageContentDocument) -> Tuple[str, List[str]]:
             _interactive_sections_text(document),
         ]
     ).casefold()
+    inferred_page_type = _classify_enhancer_page_type(
+        record_count=max(1, len(document.headings) // 2) if document.headings else 0,
+        candidate_block_count=max(1, len(document.structured_sections) or len(document.headings) or 1),
+        internal_link_count=len(document.internal_links),
+        detail_link_count=len(document.discovered_links),
+        application_link_count=len(document.application_links),
+        document_link_count=len(document.document_links),
+        text=text,
+    )
     program_hits = [term for term in PROGRAMME_SIGNAL_TERMS if term in text]
     non_program_hits = [term for term in NON_PROGRAMME_SIGNAL_TERMS if term in text]
     file_like = bool(re.search(r"\bimg[-_ ]?\d|\.(?:jpe?g|png|gif|webp|pdf)(?:\b|$)", text))
+    if inferred_page_type in {
+        PAGE_TYPE_TENDER_PROCUREMENT,
+        PAGE_TYPE_NEWS_ARTICLE,
+        PAGE_TYPE_TECHNOLOGY_STATION,
+        PAGE_TYPE_SUPPORT_PROGRAMME,
+        PAGE_TYPE_GENERIC_CONTENT,
+    }:
+        return PAGE_DECISION_NOT_FUNDING_PROGRAM, [f"inferred page_type {inferred_page_type}"]
     if file_like and len(program_hits) < 2:
         # File-like URLs without enough programme evidence are treated as
         # non-program pages because they are usually attachments or media.
@@ -1574,6 +1835,319 @@ def _page_decision_hint(document: PageContentDocument) -> Tuple[str, List[str]]:
         # substantial and otherwise clean.
         return PAGE_DECISION_FUNDING_PROGRAM, [f"contains funding signal: {program_hits[0]}"]
     return PAGE_DECISION_UNCLEAR, []
+
+
+def _source_scope_for_page_type(page_type: str) -> str:
+    normalized = normalize_page_type(page_type)
+    if normalized == "funding_listing":
+        return "listing_page"
+    if normalized in {"support_programme", "technology_station"}:
+        return "support_page"
+    if normalized in {"news_article", "tender_procurement", "generic_content"}:
+        return "non_programme_page"
+    return "product_page"
+
+
+def _classify_enhancer_page_type(
+    *,
+    record_count: int,
+    candidate_block_count: int,
+    internal_link_count: int,
+    detail_link_count: int,
+    application_link_count: int,
+    document_link_count: int,
+    text: str,
+) -> str:
+    page_type = normalize_page_type(
+        classify_global_page_type(
+            record_count=record_count,
+            candidate_block_count=candidate_block_count,
+            internal_link_count=internal_link_count,
+            detail_link_count=detail_link_count,
+            application_link_count=application_link_count,
+            document_link_count=document_link_count,
+            text=text,
+        )
+    )
+    lowered = clean_text(text or "").casefold()
+    detail_term_hits = sum(
+        1
+        for term in (
+            "eligibility",
+            "application",
+            "apply",
+            "submit",
+            "funding amount",
+            "loan amount",
+            "grant amount",
+            "finance is available",
+            "available up to",
+            "repayment",
+            "repayment term",
+            "trading history",
+            "collateral",
+            "supporting documents",
+            "required documents",
+        )
+        if term in lowered
+    )
+    if (
+        page_type == PAGE_TYPE_FUNDING_LISTING
+        and record_count <= 1
+        and candidate_block_count <= 8
+        and detail_link_count <= 2
+        and internal_link_count <= 8
+        and (_has_programme_detail_signals(lowered) or detail_term_hits >= 2)
+    ):
+        return PAGE_TYPE_FUNDING_PROGRAMME
+    return page_type
+
+
+def _add_review_reason(record: FundingProgrammeRecord, code: str, note: Optional[str] = None) -> FundingProgrammeRecord:
+    if code:
+        record.needs_review_reasons = unique_preserve_order([*record.needs_review_reasons, code])
+        record.needs_review = True
+    if note:
+        record.notes = unique_preserve_order([*record.notes, note])
+    return record
+
+
+def _looks_like_valid_programme_name(value: Optional[str]) -> bool:
+    text = clean_text(value or "")
+    if not text or len(text) < 4:
+        return False
+    lowered = text.casefold()
+    if lowered in INVALID_PROGRAMME_NAME_TERMS:
+        return False
+    if looks_like_tender_title(text):
+        return False
+    if looks_like_support_title(text) and not any(term in lowered for term in ("grant", "loan", "equity", "fund", "capital")):
+        return False
+    if re.fullmatch(r"(?:page|detail|details|listing|mixed|generic)", lowered):
+        return False
+    if re.fullmatch(r"(?:\d+|[ivxlcdm]+)", lowered, re.I):
+        return False
+    return True
+
+
+def _looks_like_valid_funder_name(value: Optional[str]) -> bool:
+    text = clean_text(value or "")
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered in INVALID_FUNDER_NAME_TERMS:
+        return False
+    if re.fullmatch(r"(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\.[a-z]{2,})*", lowered):
+        return False
+    return _looks_like_funder_name(text)
+
+
+def _money_context_is_invalid(text: str) -> bool:
+    lowered = clean_text(text or "").casefold()
+    if not lowered:
+        return False
+    positive_context = bool(MONEY_POSITIVE_CONTEXT_RE.search(lowered))
+    if MONEY_INVALID_CONTEXT_RE.search(lowered) or MONEY_INVALID_PERCENT_RE.search(lowered):
+        return True
+    if MONEY_INVALID_TRL_RE.search(lowered):
+        return True
+    if MONEY_INVALID_PHONE_RE.fullmatch(lowered):
+        return True
+    if not positive_context and (MONEY_INVALID_DATE_RE.search(lowered) or MONEY_INVALID_YEAR_RE.fullmatch(lowered)):
+        return True
+    return False
+
+
+def _money_evidence_snippets(record: FundingProgrammeRecord) -> List[str]:
+    snippets = []
+    for key in ("ticket_range", "ticket_min", "ticket_max", "program_budget_total", "raw_funding_offer_data"):
+        snippets.extend(record.evidence_by_field.get(key, []))
+        snippets.extend(record.raw_text_snippets.get(key, []))
+    snippets.extend(record.raw_funding_offer_data)
+    return unique_preserve_order([clean_text(snippet) for snippet in snippets if clean_text(snippet)])
+
+
+def _looks_like_money_snippet(text: str) -> bool:
+    snippet = clean_text(text or "")
+    if not snippet:
+        return False
+    return bool(MONEY_SNIPPET_SIGNAL_RE.search(snippet))
+
+
+def _validate_post_ai_money_fields(record: FundingProgrammeRecord, document: PageContentDocument) -> FundingProgrammeRecord:
+    snippets = _money_evidence_snippets(record)
+    money_snippets = [snippet for snippet in snippets if _looks_like_money_snippet(snippet)]
+    has_amount_fields = any(
+        value is not None for value in (record.ticket_min, record.ticket_max, record.program_budget_total)
+    )
+    invalid_numeric_snippets = [
+        snippet
+        for snippet in snippets
+        if any(
+            pattern.search(snippet)
+            for pattern in (
+                MONEY_INVALID_CONTEXT_RE,
+                MONEY_INVALID_DATE_RE,
+                MONEY_INVALID_YEAR_RE,
+                MONEY_INVALID_PERCENT_RE,
+                MONEY_INVALID_PHONE_RE,
+                MONEY_INVALID_TRL_RE,
+            )
+        )
+    ]
+    combined_text = " ".join(
+        [
+            document.title or "",
+            document.page_title or "",
+            " ".join(money_snippets or snippets),
+        ]
+    )
+    invalid_snippets = [
+        snippet
+        for snippet in money_snippets
+        if _money_context_is_invalid(snippet)
+        and extract_money_range(snippet, default_currency=record.currency)[3] is None
+    ]
+    if has_amount_fields and not money_snippets:
+        record.ticket_min = None
+        record.ticket_max = None
+        if record.program_budget_total is not None:
+            record.program_budget_total = None
+        reason = REVIEW_REASON_INVALID_MONEY_CONTEXT if invalid_numeric_snippets else REVIEW_REASON_WEAK_MONEY_EVIDENCE
+        note = (
+            "Rejected AI money values because evidence matched invalid numeric context."
+            if invalid_numeric_snippets
+            else "Removed unsupported AI amount because no trustworthy money evidence was found."
+        )
+        record = _add_review_reason(record, reason, note)
+        record.validation_errors = unique_preserve_order(
+            [
+                *record.validation_errors,
+                "invalid money evidence context" if invalid_numeric_snippets else "money amount could not be validated from evidence",
+            ]
+        )
+        return record
+    deterministic_min, deterministic_max, deterministic_currency, _snippet, deterministic_confidence = extract_money_range(
+        combined_text,
+        default_currency=record.currency,
+    )
+    if invalid_snippets:
+        record.ticket_min = None
+        record.ticket_max = None
+        if record.program_budget_total is not None and not any("budget" in snippet.casefold() for snippet in snippets):
+            record.program_budget_total = None
+        record = _add_review_reason(record, REVIEW_REASON_INVALID_MONEY_CONTEXT, "Rejected AI money values because evidence matched invalid numeric context.")
+        record.validation_errors = unique_preserve_order([*record.validation_errors, "invalid money evidence context"])
+        return record
+    if (record.ticket_min is not None or record.ticket_max is not None) and deterministic_min is None and deterministic_max is None:
+        record.ticket_min = None
+        record.ticket_max = None
+        record = _add_review_reason(record, REVIEW_REASON_WEAK_MONEY_EVIDENCE, "Removed unsupported AI amount because deterministic validation found no valid money evidence.")
+        record.validation_errors = unique_preserve_order([*record.validation_errors, "money amount could not be validated from evidence"])
+        return record
+    if deterministic_confidence and deterministic_confidence < 0.7 and (record.ticket_min is not None or record.ticket_max is not None):
+        record = _add_review_reason(record, REVIEW_REASON_WEAK_MONEY_EVIDENCE, "Money evidence exists but remains weak after deterministic validation.")
+    if deterministic_currency and not record.currency:
+        record.currency = deterministic_currency
+    if record.program_budget_total is not None:
+        budget_text = str(int(record.program_budget_total)) if isinstance(record.program_budget_total, float) and record.program_budget_total.is_integer() else str(record.program_budget_total)
+        if MONEY_INVALID_YEAR_RE.fullmatch(budget_text):
+            record.program_budget_total = None
+            record = _add_review_reason(record, REVIEW_REASON_INVALID_MONEY_CONTEXT, "Rejected budget-like value because it looked like a year.")
+    return record
+
+
+def _record_money_fields_are_valid(record: FundingProgrammeRecord) -> bool:
+    has_amount_fields = any(value is not None for value in (record.ticket_min, record.ticket_max, record.program_budget_total))
+    if not has_amount_fields:
+        return True
+    if any(
+        reason in record.needs_review_reasons
+        for reason in (REVIEW_REASON_INVALID_MONEY_CONTEXT, REVIEW_REASON_WEAK_MONEY_EVIDENCE)
+    ):
+        return False
+    snippets = [snippet for snippet in _money_evidence_snippets(record) if _looks_like_money_snippet(snippet)]
+    if not snippets:
+        return False
+    minimum, maximum, _currency, _snippet, _confidence = extract_money_range(" ".join(snippets), default_currency=record.currency)
+    if record.ticket_min is not None and minimum is None and maximum is None:
+        return False
+    if record.ticket_max is not None and minimum is None and maximum is None:
+        return False
+    return True
+
+
+def _finalize_record_acceptance(record: FundingProgrammeRecord) -> Optional[FundingProgrammeRecord]:
+    page_type = normalize_page_type(record.page_type)
+    record.page_type = page_type
+
+    if page_type in {
+        PAGE_TYPE_TENDER_PROCUREMENT,
+        PAGE_TYPE_NEWS_ARTICLE,
+        PAGE_TYPE_TECHNOLOGY_STATION,
+        PAGE_TYPE_SUPPORT_PROGRAMME,
+        PAGE_TYPE_GENERIC_CONTENT,
+    }:
+        logger.info("ai_record_rejected_page_type", source_url=record.source_url, page_type=page_type, program_name=record.program_name)
+        return None
+
+    if page_type == PAGE_TYPE_OPEN_CALL and not has_fundable_support(record):
+        record = _add_review_reason(record, REVIEW_REASON_UNFUNDABLE_OPEN_CALL, "Rejected open call because no explicit fundable support was confirmed.")
+        logger.info("ai_record_rejected_unfundable_open_call", source_url=record.source_url, program_name=record.program_name)
+        return None
+
+    if page_type == PAGE_TYPE_FUNDING_LISTING and record.funding_type == FundingType.UNKNOWN:
+        record = _add_review_reason(record, REVIEW_REASON_LISTING_UNKNOWN_FUNDING_TYPE, "Rejected listing-derived record because funding type remained Unknown.")
+        logger.info("ai_record_rejected_listing_unknown_funding_type", source_url=record.source_url, program_name=record.program_name)
+        return None
+
+    valid_program_name = _looks_like_valid_programme_name(record.program_name)
+    valid_funder_name = _looks_like_valid_funder_name(record.funder_name)
+    valid_money_fields = _record_money_fields_are_valid(record)
+    confirmed_final_page_type = page_type in {PAGE_TYPE_FUNDING_PROGRAMME, PAGE_TYPE_OPEN_CALL}
+
+    if not valid_program_name:
+        record = _add_review_reason(record, REVIEW_REASON_INVALID_PROGRAM_NAME, "Programme name did not look like a specific funding programme title.")
+    if not valid_funder_name:
+        record = _add_review_reason(record, REVIEW_REASON_INVALID_FUNDER_NAME, "Funder name did not look like a specific organization.")
+    if not confirmed_final_page_type:
+        record = _add_review_reason(record, REVIEW_REASON_UNCONFIRMED_PAGE_TYPE, f"Page type {page_type} is not a confirmed final programme detail page.")
+
+    can_clear_review = (
+        confirmed_final_page_type
+        and valid_program_name
+        and valid_funder_name
+        and record.funding_type != FundingType.UNKNOWN
+        and valid_money_fields
+        and not record.validation_errors
+        and not record.needs_review_reasons
+    )
+    record.needs_review = not can_clear_review
+    return FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))
+
+
+def _apply_record_review_flags(record: FundingProgrammeRecord) -> FundingProgrammeRecord:
+    if record.funding_type == FundingType.UNKNOWN:
+        record = _add_review_reason(record, REVIEW_REASON_UNKNOWN_FUNDING_TYPE, "Funding type remains Unknown after AI normalization.")
+    if record.field_conflicts:
+        record = _add_review_reason(record, REVIEW_REASON_CONFLICTING_FIELD_VALUES, "Multiple sources disagreed on one or more important fields.")
+    missing_core_evidence = [
+        field_name for field_name in IMPORTANT_EVIDENCE_FIELDS if getattr(record, field_name, None) not in (None, "", [], {}) and not record.evidence_by_field.get(field_name)
+    ]
+    if missing_core_evidence:
+        record.validation_errors = unique_preserve_order(
+            [*record.validation_errors, *[f"missing evidence for {field_name}" for field_name in missing_core_evidence]]
+        )
+        record = _add_review_reason(record, REVIEW_REASON_MISSING_CORE_EVIDENCE, "Important extracted fields were missing direct traceable evidence.")
+    if record.page_type and normalize_page_type(record.page_type) in {
+        PAGE_TYPE_TENDER_PROCUREMENT,
+        PAGE_TYPE_NEWS_ARTICLE,
+        PAGE_TYPE_TECHNOLOGY_STATION,
+        PAGE_TYPE_SUPPORT_PROGRAMME,
+        PAGE_TYPE_GENERIC_CONTENT,
+    }:
+        record = _add_review_reason(record, REVIEW_REASON_NON_PROGRAMME_PAGE, f"Source page classified as {record.page_type}.")
+    return record
 
 
 def _collect_section_snippets(
@@ -1922,6 +2496,20 @@ def _normalize_draft(
         payload["program_name"] = strip_leading_numbered_prefix(document.title)
     payload["funder_name"] = _infer_funder_name(document, payload) or _coerce_optional_text(payload.get("funder_name"))
     payload["parent_programme_name"] = _coerce_optional_text(payload.get("parent_programme_name"))
+    payload["page_type"] = normalize_page_type(
+        payload.get("page_type")
+        or _classify_enhancer_page_type(
+            record_count=1,
+            candidate_block_count=max(1, len(document.structured_sections) or len(document.headings) or 1),
+            internal_link_count=len(document.internal_links),
+            detail_link_count=len(document.discovered_links),
+            application_link_count=len(document.application_links),
+            document_link_count=len(document.document_links),
+            text=" ".join([document.title or "", document.full_body_text or ""]),
+        )
+    )
+    payload["page_role"] = _infer_page_role(document, payload["page_type"], payload.get("page_role"))
+    payload["source_scope"] = _coerce_optional_text(payload.get("source_scope")) or _source_scope_for_page_type(payload["page_type"])
     # All enum-like fields are normalized to schema values so the downstream
     # record validator receives exactly one representation.
     payload["funding_type"] = (_coerce_enum(FundingType, payload.get("funding_type")) or FundingType.UNKNOWN).value
@@ -2353,10 +2941,15 @@ def _draft_to_record(
         country_code=_coerce_text(payload.get("country_code")) or "ZA",
         status=_coerce_enum(ProgrammeStatus, payload.get("status")) or ProgrammeStatus.UNKNOWN,
         notes=notes or [f"AI classification applied to {document.page_url}"],
+        page_type=normalize_page_type(payload.get("page_type")),
+        page_role=normalize_page_role(payload.get("page_role")),
+        source_scope=_coerce_optional_text(payload.get("source_scope")) or _source_scope_for_page_type(normalize_page_type(payload.get("page_type"))),
     )
     record = FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))
     record = _validate_field_evidence(record, content_bundle)
     record = _apply_field_confidence_rules(record, content_bundle)
+    record = _validate_post_ai_money_fields(record, document)
+    record = _apply_record_review_flags(record)
     return FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))
 
 
@@ -2369,6 +2962,7 @@ class AIClassifier:
         self.config = config
         self.storage = storage
         self.disable_remote_ai = bool(config.get("disableRemoteAi") or config.get("offline"))
+        self.require_remote_ai = bool(config.get("requireRemoteAi") or config.get("require_remote_ai"))
         self.ai_provider = (config.get("aiProvider") or os.getenv("AI_PROVIDER") or "openai").strip().lower()
         self.model = config.get("aiModel") or os.getenv("SCRAPER_AI_MODEL") or "gpt-4o-mini"
         self.document_ai_max_documents_per_page = int(config.get("documentAiMaxDocumentsPerPage") or config.get("document_ai_max_documents_per_page") or 4)
@@ -2708,22 +3302,26 @@ class AIClassifier:
             "Scan repayment wording carefully. Look for repayment, repay, repayable, pay back, payback, loan term, tenor, tenure, duration, period, months, years, instalments, installments, moratorium, grace period, deferred payment, repayment holiday, bullet repayment, monthly repayments, and quarterly repayments.\n"
             "Preserve the original repayment wording in payback_raw_text, convert years to months where possible, keep payback_term_min_months and payback_term_max_months aligned with the wording, and summarize the structure in payback_structure.\n"
             "If the page says up to a term, keep only payback_term_max_months. If it says between two periods, capture both bounds. If no repayment information is present, return null payback fields, repayment_frequency as Unknown, and payback_confidence as 0.\n"
-            "Normalize money values to plain numbers.\n"
-            "First decide whether the page is a real funding programme page.\n"
-            "If the page is not a programme page, set page_decision to not_funding_program and return records as an empty array.\n"
-            "Use not_funding_program for article, news, policy, about, contact, media, image, gallery, document, or screenshot pages that are not the actual funding programme page.\n"
-            "Use funding_program only when the page is clearly a programme page with substantive funding, eligibility, or application evidence.\n"
+            "Normalize money values to plain numbers only when the amount is directly attached to currency or funding context. Never extract standalone numbers, phone numbers, years, tender numbers, dates, postal codes, percentages, or TRL ranges as ticket_min or ticket_max.\n"
+            "First classify page_type as exactly one of: funding_programme, funding_listing, support_programme, technology_station, open_call, tender_procurement, news_article, generic_content.\n"
+            "Also classify page_role separately as one of: overview, eligibility, application, checklist, funding_detail, listing, procurement_notice, news_article, about_contact, support_detail, technology_station, generic.\n"
+            "Set page_decision to funding_program only for page_type funding_programme, funding_listing, or open_call with fundable financial or capital support. Otherwise set page_decision to not_funding_program and return records as an empty array.\n"
+            "Use tender_procurement for tender, bid, RFQ, RFP, procurement, supply-chain, and appointment notices even when they mention funding.\n"
+            "Use news_article for news, press releases, media releases, stories, announcements, and articles that are not the canonical programme page.\n"
+            "Use technology_station for technical assistance or technology station pages without explicit fundable support.\n"
+            "Use support_programme for mentorship, training, incubation, acceleration, advisory, or technical support without explicit fundable support.\n"
+            "Before extracting records, classify each candidate block or heading-based section independently. If one page contains multiple distinct fundable programme headings, return one record per programme section. If a section only supports a programme described elsewhere on the page, do not create a duplicate record; include that evidence in the relevant record.\n"
             "A child or sub-programme is still a real programme record if it has its own distinct name, rules, or funding terms.\n"
             "Do not collapse sibling programmes just because they share a parent fund or similar numbered naming.\n"
             "When raw_eligibility_data or raw_eligibility_criteria is present, extract it into industries, use_of_funds, business_stage_eligibility, turnover_min/max, years_in_business_min/max, employee_min/max, ownership_targets, entity_types_allowed, and certifications_required whenever supported.\n"
             "Prefer short list values for those fields and do not leave them blank if the eligibility text clearly supports them.\n"
             "Always capture eligibility statements as a clean list in raw_eligibility_criteria, using headings such as Eligibility Criteria, Qualifying Criteria, Who can apply, Applicant Requirements, Funding Requirements, Minimum Requirements, Compliance Requirements, Mandatory Requirements, Requirements, Criteria, Conditions, Terms and Conditions, Selection Criteria, Application Criteria, Funding Criteria, and Investment Criteria.\n"
             "If the page is ambiguous, use unclear and keep records empty unless the page clearly supports a programme record.\n"
-            "Return an object with keys: page_decision, page_decision_confidence, records, and notes.\n"
+            "Return an object with keys: page_decision, page_type, page_decision_confidence, records, and notes.\n"
             "records must be an array of 0 or more programme objects.\n"
             "Set source_url and source_urls to the current page URL only unless the page clearly references another canonical source page.\n"
             "Each programme object may contain only funding-programme fields and must omit technical DB fields such as program_id, id, created_at, updated_at, scraped_at, source_domain, parser_version, approval_status, and ai_enriched.\n"
-            "Allowed business fields include program_name, funder_name, source_url, source_urls, source_page_title, raw_eligibility_data, raw_eligibility_criteria, raw_funding_offer_data, raw_terms_data, raw_documents_data, raw_application_data, funding_type, funding_lines, ticket_min, ticket_max, currency, program_budget_total, deadline_type, deadline_date, funding_speed_days_min, funding_speed_days_max, geography_scope, provinces, municipalities, postal_code_ranges, industries, use_of_funds, business_stage_eligibility, turnover_min, turnover_max, years_in_business_min, years_in_business_max, employee_min, employee_max, ownership_targets, entity_types_allowed, certifications_required, security_required, equity_required, payback_months_min, payback_months_max, payback_raw_text, payback_term_min_months, payback_term_max_months, payback_structure, grace_period_months, payback_confidence, interest_type, repayment_frequency, exclusions, required_documents, application_channel, application_url, contact_email, contact_phone, raw_text_snippets, extraction_confidence, related_documents, notes, status, country_code, and parent_programme_name."
+            "Allowed business fields include program_name, funder_name, source_url, source_urls, source_page_title, page_type, page_role, source_scope, raw_eligibility_data, raw_eligibility_criteria, raw_funding_offer_data, raw_terms_data, raw_documents_data, raw_application_data, funding_type, funding_lines, ticket_min, ticket_max, currency, program_budget_total, deadline_type, deadline_date, funding_speed_days_min, funding_speed_days_max, geography_scope, provinces, municipalities, postal_code_ranges, industries, use_of_funds, business_stage_eligibility, turnover_min, turnover_max, years_in_business_min, years_in_business_max, employee_min, employee_max, ownership_targets, entity_types_allowed, certifications_required, security_required, equity_required, payback_months_min, payback_months_max, payback_raw_text, payback_term_min_months, payback_term_max_months, payback_structure, grace_period_months, payback_confidence, interest_type, repayment_frequency, exclusions, required_documents, application_channel, application_url, contact_email, contact_phone, raw_text_snippets, extraction_confidence, related_documents, notes, status, country_code, and parent_programme_name."
         )
 
     def _build_user_prompt(
@@ -2740,8 +3338,10 @@ class AIClassifier:
             prompt = prompt[: MAX_PROMPT_CHARS - 3] + "..."
         return (
             "Map the page content into zero or more funding-programme records.\n"
-            "If the page is not a programme page, return {\"page_decision\": \"not_funding_program\", \"records\": [], \"notes\": [...]}.\n"
+            "Classify page_type first, then classify each candidate block/heading section independently.\n"
+            "If the page is not persistable funding content, return {\"page_decision\": \"not_funding_program\", \"page_type\": \"...\", \"records\": [], \"notes\": [...]}.\n"
             "If the page is a sub-programme with its own name and terms, keep it as an independent programme record.\n"
+            "If a listing contains multiple fundable programme sections, return multiple records, one per section.\n"
             "Use the values already present under current_records as the baseline record state and only change them when the page evidence supports a better value.\n"
             "Treat document evidence as supporting context; do not replace clear page facts unless the document is the page itself.\n"
             "Keep all extracted wording close to the source text.\n"
@@ -2783,9 +3383,9 @@ class AIClassifier:
         if len(prompt) > MAX_PROMPT_CHARS:
             prompt = prompt[: MAX_PROMPT_CHARS - 3] + "..."
         return (
-            "Decide whether this page is a real funding programme page.\n"
-            "If it is not, return page_decision as not_funding_program and records as an empty array.\n"
-            "If it is, return page_decision as funding_program and include only records directly supported by the page.\n"
+            "Classify this page into the exact page_type vocabulary first.\n"
+            "If it is not persistable funding content, return page_decision as not_funding_program, page_type, and records as an empty array.\n"
+            "If it is persistable, return page_decision as funding_program, page_type, and include only records directly supported by the page.\n"
             "Do not guess.\n\n"
             f"PAGE CONTENT:\n{prompt}"
         )
@@ -2804,7 +3404,9 @@ class AIClassifier:
             "source_path": source_path,
             "source_page_title": record.source_page_title,
             "page_type": record.page_type,
+            "page_role": record.page_role,
             "source_scope": record.source_scope,
+            "canonical_group_key": _record_canonical_group_key(record),
             "funding_type": record.funding_type.value if hasattr(record.funding_type, "value") else record.funding_type,
             "funding_lines": list(record.funding_lines),
             "raw_eligibility_data": list(record.raw_eligibility_data or []),
@@ -2860,11 +3462,84 @@ class AIClassifier:
             return "separate"
         return "unclear"
 
+    def score_duplicate_records(self, left: FundingProgrammeRecord, right: FundingProgrammeRecord) -> Dict[str, Any]:
+        reasons: List[str] = []
+        score = 0
+        if left.source_domain != right.source_domain:
+            return {"decision": "separate", "score": 0, "reasons": ["different_source_domain"]}
+
+        left_key = _record_canonical_group_key(left)
+        right_key = _record_canonical_group_key(right)
+        if left_key == right_key:
+            score += 40
+            reasons.append("same_canonical_group_key")
+
+        left_name = clean_text(left.program_name or "").casefold()
+        right_name = clean_text(right.program_name or "").casefold()
+        left_funder = clean_text(left.funder_name or "").casefold()
+        right_funder = clean_text(right.funder_name or "").casefold()
+        left_parent = clean_text(left.parent_programme_name or "").casefold()
+        right_parent = clean_text(right.parent_programme_name or "").casefold()
+        if left_name and right_name and left_name == right_name:
+            score += 18
+            reasons.append("same_program_name")
+        if left_funder and right_funder and left_funder == right_funder:
+            score += 14
+            reasons.append("same_funder_name")
+        if left_parent and right_parent and left_parent == right_parent:
+            score += 10
+            reasons.append("same_parent_programme")
+
+        shared_urls = set(left.source_urls) & set(right.source_urls)
+        if shared_urls:
+            score += 35
+            reasons.append("shared_source_url")
+        shared_docs = set(left.related_documents) & set(right.related_documents)
+        if shared_docs:
+            score += 10
+            reasons.append("shared_related_document")
+        if left.application_url and right.application_url and left.application_url == right.application_url:
+            score += 12
+            reasons.append("shared_application_url")
+
+        complementary_roles = {normalize_page_role(left.page_role), normalize_page_role(right.page_role)}
+        if complementary_roles <= {PAGE_ROLE_OVERVIEW, PAGE_ROLE_ELIGIBILITY, PAGE_ROLE_APPLICATION, PAGE_ROLE_CHECKLIST, PAGE_ROLE_FUNDING_DETAIL}:
+            score += 10
+            reasons.append("complementary_programme_roles")
+
+        if normalize_page_type(left.page_type) != normalize_page_type(right.page_type):
+            score += 4
+        if normalize_page_type(left.page_type) in {PAGE_TYPE_NEWS_ARTICLE, PAGE_TYPE_TENDER_PROCUREMENT, PAGE_TYPE_GENERIC_CONTENT}:
+            score -= 30
+            reasons.append("left_non_programme_page_type")
+        if normalize_page_type(right.page_type) in {PAGE_TYPE_NEWS_ARTICLE, PAGE_TYPE_TENDER_PROCUREMENT, PAGE_TYPE_GENERIC_CONTENT}:
+            score -= 30
+            reasons.append("right_non_programme_page_type")
+        if left_name and right_name and left_name != right_name and left_parent != right_parent:
+            score -= 35
+            reasons.append("different_program_name")
+        if left_funder and right_funder and left_funder != right_funder:
+            score -= 20
+            reasons.append("different_funder_name")
+
+        if score >= 65:
+            decision = "merge"
+        elif score <= 15:
+            decision = "separate"
+        else:
+            decision = "unclear"
+        return {"decision": decision, "score": score, "reasons": reasons, "canonical_group_key": left_key}
+
     def should_merge_records(self, left: FundingProgrammeRecord, right: FundingProgrammeRecord) -> Optional[bool]:
         # The merge judge is only invoked for records that already look like the
         # same programme by name and funder.
         if not self.api_key:
             return None
+        deterministic = self.score_duplicate_records(left, right)
+        if deterministic["decision"] == "merge":
+            return True
+        if deterministic["decision"] == "separate":
+            return False
         same_name = clean_text(left.program_name or "").casefold() == clean_text(right.program_name or "").casefold()
         same_funder = clean_text(left.funder_name or "").casefold() == clean_text(right.funder_name or "").casefold()
         if not (same_name and same_funder):
@@ -3060,7 +3735,7 @@ class AIClassifier:
             ]
         )
 
-        page_type = classify_page_type(
+        page_type = _classify_enhancer_page_type(
             record_count=1,
             candidate_block_count=max(1, len(document.structured_sections) or len(document.headings) or 1),
             internal_link_count=len(document.internal_links),
@@ -3069,7 +3744,7 @@ class AIClassifier:
             document_link_count=len(document.document_links),
             text=" ".join([document.title or "", document.full_body_text or ""]),
         )
-        source_scope = "support_page" if page_type == "support" else "listing_page" if page_type == "listing" else "product_page"
+        source_scope = _source_scope_for_page_type(page_type)
 
         record = FundingProgrammeRecord(
             program_name=program_name,
@@ -3118,6 +3793,7 @@ class AIClassifier:
             contact_email=contact_emails[0] if contact_emails else None,
             contact_phone=contact_phones[0] if contact_phones else None,
             page_type=page_type,
+            page_role=_infer_page_role(document, page_type),
             source_scope=source_scope,
             industries=eligibility_profile["industries"],
             use_of_funds=eligibility_profile["use_of_funds"],
@@ -3145,7 +3821,10 @@ class AIClassifier:
         record = FundingProgrammeRecord.model_validate(payload)
         record = _validate_field_evidence(record, content_bundle)
         record = _apply_field_confidence_rules(record, content_bundle)
-        return [FundingProgrammeRecord.model_validate(record.model_dump(mode="python"))]
+        record = _validate_post_ai_money_fields(record, document)
+        record = _apply_record_review_flags(record)
+        finalized = _finalize_record_acceptance(record)
+        return [finalized] if finalized else []
 
     def classify_document(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
         # This is the main AI path: prepare context, call the model, retry on
@@ -3154,6 +3833,8 @@ class AIClassifier:
             return []
         document = self._prepare_document_context(document)
         if not self.api_key:
+            if self.require_remote_ai:
+                raise RuntimeError("Remote AI classification is required but no AI API key is configured.")
             return self._fallback_classify(document)
 
         start = time.time()
@@ -3169,6 +3850,7 @@ class AIClassifier:
                 raw_response = self._call_model(system_prompt, user_prompt)
                 parsed = self._parse_response(raw_response)
                 parsed.page_decision = _normalize_page_decision(parsed.page_decision)
+                parsed.page_type = normalize_page_type(parsed.page_type) if _coerce_optional_text(parsed.page_type) else None
                 if parsed.records:
                     response = parsed
                     break
@@ -3239,7 +3921,7 @@ class AIClassifier:
             )
             return []
 
-        page_type = classify_page_type(
+        inferred_page_type = _classify_enhancer_page_type(
             record_count=len(records),
             candidate_block_count=max(1, len(document.structured_sections) or len(document.headings) or 1),
             internal_link_count=len(document.internal_links),
@@ -3248,12 +3930,40 @@ class AIClassifier:
             document_link_count=len(document.document_links),
             text=" ".join([document.title or "", document.full_body_text or ""]),
         )
-        source_scope = "support_page" if page_type == "support" else "listing_page" if page_type == "listing" else "product_page"
+        explicit_page_type = _coerce_optional_text(response.page_type)
+        page_type = normalize_page_type(explicit_page_type or inferred_page_type)
+        if not explicit_page_type and page_type == PAGE_TYPE_GENERIC_CONTENT and records:
+            page_type = PAGE_TYPE_FUNDING_LISTING if len(records) > 1 else PAGE_TYPE_FUNDING_PROGRAMME
+        source_scope = _source_scope_for_page_type(page_type)
+        if page_type in {
+            PAGE_TYPE_TENDER_PROCUREMENT,
+            PAGE_TYPE_NEWS_ARTICLE,
+            PAGE_TYPE_TECHNOLOGY_STATION,
+            PAGE_TYPE_SUPPORT_PROGRAMME,
+            PAGE_TYPE_GENERIC_CONTENT,
+        }:
+            logger.info("ai_classification_rejected_page_type", page_url=document.page_url, page_type=page_type)
+            return []
+        finalized_records: List[FundingProgrammeRecord] = []
         for record in records:
-            if not record.page_type:
+            record.page_type = page_type if explicit_page_type else normalize_page_type(record.page_type or page_type)
+            record.page_role = normalize_page_role(record.page_role or _infer_page_role(document, record.page_type))
+            if record.page_type == PAGE_TYPE_GENERIC_CONTENT:
                 record.page_type = page_type
             if not record.source_scope:
                 record.source_scope = source_scope
+            record = _validate_post_ai_money_fields(record, document)
+            record = _apply_record_review_flags(record)
+            finalized = _finalize_record_acceptance(record)
+            if finalized:
+                finalized_records.append(finalized)
+        records = finalized_records
+        if page_type == PAGE_TYPE_OPEN_CALL and not any(has_fundable_support(record) for record in records):
+            logger.info("ai_classification_rejected_unfundable_open_call", page_url=document.page_url)
+            return []
+        if not records:
+            logger.info("ai_classification_rejected_all_records", page_url=document.page_url, page_type=page_type)
+            return []
 
         duration = time.time() - start
         logger.info("ai_classification_success", page_url=document.page_url, duration=duration, records=len(records))

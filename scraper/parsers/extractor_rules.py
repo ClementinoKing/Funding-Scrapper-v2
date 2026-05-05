@@ -504,13 +504,16 @@ def extract_candidate_blocks(
                 continue
             selector_selected_nodes.add(node_id)
             candidate_nodes.append(node)
-    candidate_nodes.extend(soup.find_all(["article", "section", "li", "div"]))
+    candidate_nodes.extend(soup.find_all(["article", "section", "li", "div", "tr", "table"]))
     for node in candidate_nodes:
         if _has_noise_ancestor(node) or _is_layout_noise(node):
             continue
         class_name = " ".join(node.get("class", [])) if hasattr(node, "get") else ""
-        class_hint = any(hint in class_name.lower() for hint in ["card", "panel", "tile", "accordion", "content"])
-        if node.name == "div" and not class_hint and id(node) not in selector_selected_nodes:
+        class_hint = any(
+            hint in class_name.lower()
+            for hint in ["card", "panel", "tile", "accordion", "content", "views-row", "field-content", "elementor", "wp-block"]
+        )
+        if node.name in {"div", "tr", "table"} and not class_hint and id(node) not in selector_selected_nodes:
             continue
         heading_node = node.find(["h1", "h2", "h3", "h4", "strong", "b"])
         heading = clean_text(heading_node.get_text(" ", strip=True)) if heading_node else ""

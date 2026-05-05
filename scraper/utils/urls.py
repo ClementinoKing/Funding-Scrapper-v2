@@ -86,6 +86,22 @@ def extract_host(url: str) -> str:
     return parsed.netloc.lower()
 
 
+def _without_www(host: str) -> str:
+    return (host or "").lower().removeprefix("www.")
+
+
+def hosts_match(candidate_host: str, allowed_host: str) -> bool:
+    candidate = extract_host(candidate_host)
+    allowed = extract_host(allowed_host)
+    if not candidate or not allowed:
+        return False
+    if candidate == allowed:
+        return True
+    return _without_www(candidate) == _without_www(allowed) and (
+        candidate.startswith("www.") or allowed.startswith("www.")
+    )
+
+
 def get_domain_slug(url_or_domain: str) -> str:
     domain = extract_domain(url_or_domain)
     return slugify(domain.replace(".", "-"), max_length=40)
@@ -96,8 +112,7 @@ def is_internal_url(url: str, allowed_domains: Sequence[str]) -> bool:
         return True
     host = extract_host(url)
     for allowed in allowed_domains:
-        normalized = extract_host(allowed)
-        if host == normalized:
+        if hosts_match(host, allowed):
             return True
     return False
 

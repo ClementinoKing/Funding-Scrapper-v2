@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import time
+from typing import Any, Optional, Sequence
 
 from scraper.config import ScraperSettings
 from scraper.schemas import PageFetchResult
@@ -17,6 +18,7 @@ class BrowserFetcher:
         self.logger = get_logger(__name__)
         self._playwright = None
         self._browser = None
+        self._context = None
 
     def _ensure_browser(self) -> None:
         if self._browser is not None:
@@ -28,8 +30,22 @@ class BrowserFetcher:
 
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(headless=self.settings.headless)
+        self._context = self._browser.new_context()
+        if self.settings.browser_block_assets:
+            try:
+                self._context.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in {"image", "media", "font", "stylesheet"}
+                    else route.continue_(),
+                )
+            except Exception:
+                self.logger.warning("browser_asset_blocking_unavailable")
 
     def close(self) -> None:
+        if self._context is not None:
+            self._context.close()
+            self._context = None
         if self._browser is not None:
             self._browser.close()
             self._browser = None
@@ -79,13 +95,18 @@ class BrowserFetcher:
         except Exception:
             return
 
-    def fetch(self, url: str) -> PageFetchResult:
+    def fetch(self, url: str, wait_selectors: Optional[Sequence[str]] = None) -> PageFetchResult:
+        start_time = time.monotonic()
         try:
             self._ensure_browser()
-            context = self._browser.new_context()
-            page = context.new_page()
+            page = self._context.new_page()
             response = page.goto(url, wait_until=self.settings.browser_wait_until, timeout=self.settings.timeout_seconds * 1000)
             page.wait_for_timeout(750)
+            for selector in wait_selectors or self.settings.browser_wait_selectors:
+                try:
+                    page.wait_for_selector(selector, timeout=min(self.settings.timeout_seconds * 1000, 5000))
+                except Exception:
+                    continue
             self._scroll_discovery_sweep(page)
             self._interactive_discovery_sweep(page)
             html = page.content()
@@ -93,7 +114,7 @@ class BrowserFetcher:
             final_url = page.url
             status_code = response.status if response else 200
             headers = response.headers if response else {}
-            context.close()
+            page.close()
             return PageFetchResult(
                 url=final_url,
                 requested_url=url,
@@ -106,6 +127,8 @@ class BrowserFetcher:
                 fetch_method="browser",
                 headers=dict(headers),
                 js_rendered=True,
+                response_bytes=len(html.encode("utf-8")),
+                elapsed_seconds=round(time.monotonic() - start_time, 4),
                 notes=[],
             )
         except Exception as exc:
@@ -121,5 +144,6 @@ class BrowserFetcher:
                 fetch_method="browser",
                 headers={},
                 js_rendered=True,
+                elapsed_seconds=round(time.monotonic() - start_time, 4),
                 notes=["Browser fetch failed: %s" % exc],
             )

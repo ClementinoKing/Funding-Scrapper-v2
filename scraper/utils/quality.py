@@ -7,6 +7,14 @@ from urllib.parse import urlparse
 from typing import List, Tuple
 
 from scraper.schemas import FundingProgrammeRecord, FundingType, DeadlineType, ApplicationChannel
+from scraper.utils.page_classification import (
+    PAGE_TYPE_GENERIC_CONTENT,
+    PAGE_TYPE_NEWS_ARTICLE,
+    PAGE_TYPE_SUPPORT_PROGRAMME,
+    PAGE_TYPE_TENDER_PROCUREMENT,
+    PAGE_TYPE_TECHNOLOGY_STATION,
+    normalize_page_type,
+)
 from scraper.utils.text import unique_preserve_order
 
 
@@ -78,6 +86,18 @@ def score_programme_quality(record: FundingProgrammeRecord) -> Tuple[int, List[s
 
     if _looks_like_article_or_publication(record):
         score -= 10
+        blockers.append("Article or publication page")
+
+    normalized_page_type = normalize_page_type(record.page_type) if record.page_type else None
+    if normalized_page_type in {
+        PAGE_TYPE_TENDER_PROCUREMENT,
+        PAGE_TYPE_NEWS_ARTICLE,
+        PAGE_TYPE_TECHNOLOGY_STATION,
+        PAGE_TYPE_SUPPORT_PROGRAMME,
+        PAGE_TYPE_GENERIC_CONTENT,
+    }:
+        score -= 25
+        blockers.append(f"Non-programme page type: {normalized_page_type}")
 
     if _has_text(record.program_name):
         score += 18
@@ -170,6 +190,14 @@ def score_programme_quality(record: FundingProgrammeRecord) -> Tuple[int, List[s
 
     if completeness_signals <= 2:
         score -= 10
+
+    if record.field_conflicts:
+        score -= 12
+        blockers.append("Conflicting field values")
+
+    if record.needs_review_reasons:
+        score -= min(10, len(record.needs_review_reasons) * 2)
+        reasons.append("Review reasons recorded")
 
     return max(0, min(100, score)), unique_preserve_order(reasons), unique_preserve_order(blockers)
 

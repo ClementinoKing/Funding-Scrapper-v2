@@ -38,6 +38,47 @@ def test_extract_money_range_ignores_year_like_values() -> None:
     assert confidence == 0.0
 
 
+def test_extract_money_range_requires_currency_or_funding_context() -> None:
+    minimum, maximum, currency, snippet, confidence = extract_money_range(
+        "The programme has 2024 participants and 350 applications.",
+        default_currency="ZAR",
+    )
+    assert minimum is None
+    assert maximum is None
+    assert currency is None
+    assert snippet is None
+    assert confidence == 0.0
+
+
+def test_extract_money_range_rejects_non_amount_numeric_contexts() -> None:
+    examples = [
+        "Call 011 555 0100 for details.",
+        "Tender number T2025/004 closes on 12/05/2026.",
+        "Applicants need 51% black ownership.",
+        "Support is for TRL 4-7 technologies.",
+        "Postal code 2001 applies.",
+    ]
+    for example in examples:
+        minimum, maximum, currency, snippet, confidence = extract_money_range(example, default_currency="ZAR")
+        assert minimum is None
+        assert maximum is None
+        assert currency is None
+        assert snippet is None
+        assert confidence == 0.0
+
+
+def test_extract_money_range_accepts_scaled_amount_with_funding_context() -> None:
+    minimum, maximum, currency, snippet, confidence = extract_money_range(
+        "The loan amount is ZAR 1 million for qualifying businesses.",
+        default_currency="ZAR",
+    )
+    assert minimum is None
+    assert maximum == 1000000
+    assert currency == "ZAR"
+    assert "ZAR 1 million" in snippet
+    assert confidence >= 0.65
+
+
 def test_extract_budget_total() -> None:
     amount, currency, snippet, confidence = extract_budget_total(
         "The programme budget totals ZAR 2 million for the 2026 intake.",

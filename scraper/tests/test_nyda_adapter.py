@@ -241,7 +241,7 @@ def test_generic_adapter_support_mode_can_be_driven_by_db_config(settings, monke
             )
         ]
     )
-    assert funding_only_summary.programmes_after_dedupe == 1
+    assert funding_only_summary.programmes_after_dedupe == 0
     assert "https://erp.nyda.gov.za/register/mentorship" not in funding_only_fetcher.calls
 
     support_fetcher = FixtureFetcher(pages)
@@ -265,8 +265,7 @@ def test_generic_adapter_support_mode_can_be_driven_by_db_config(settings, monke
             )
         ]
     )
-    assert support_summary.programmes_after_dedupe == 1
+    assert support_summary.programmes_after_dedupe == 0
     assert "https://erp.nyda.gov.za/register/mentorship" not in support_fetcher.calls
     payload = json.loads((support_settings.output_path / "normalized" / "funding_programmes.json").read_text(encoding="utf-8"))
-    record = next(item for item in payload if item["program_name"] == "Mentorship Programme")
-    assert record["source_domain"].endswith("nyda.gov.za")
+    assert payload == []

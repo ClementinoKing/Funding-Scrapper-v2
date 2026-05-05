@@ -202,11 +202,19 @@ class SiteAdapter:
 
     # Crawl boundary controls.
     allowed_path_prefixes: Tuple[str, ...] = ()
+    allowed_hosts: Tuple[str, ...] = ()
     default_seed_urls: Tuple[str, ...] = ()
     include_url_terms: Tuple[str, ...] = ()
     exclude_url_terms: Tuple[str, ...] = ()
+    link_include_terms: Tuple[str, ...] = ()
+    link_exclude_terms: Tuple[str, ...] = ()
     strict_path_prefixes: bool = False
     allow_root_url: bool = True
+    max_pages: Optional[int] = None
+    depth_limit: Optional[int] = None
+    max_queue_urls: Optional[int] = None
+    max_links_per_page: Optional[int] = None
+    crawl_budget_mode: str = "balanced"
 
     # Content-discovery hints used by the parser and queue ranking.
     discovery_terms: Tuple[str, ...] = ()
@@ -230,6 +238,8 @@ class SiteAdapter:
     # Merge/dedupe hints and crawl behavior flags.
     merge_aliases: Dict[str, str] = field(default_factory=dict)
     playwright_required_by_default: bool = False
+    force_browser_url_terms: Tuple[str, ...] = ()
+    browser_wait_selectors: Tuple[str, ...] = ()
     crawl_mode: str = "default"
     notes: Tuple[str, ...] = ()
     site_profile: SiteExtractionProfile = field(default_factory=SiteExtractionProfile)
@@ -253,8 +263,10 @@ class SiteAdapter:
         lowered = (url or "").lower()
         path = urlparse(url).path.lower()
         haystack = "%s %s" % (lowered, (anchor_text or "").lower())
-        if _contains_any(haystack, self.exclude_url_terms):
+        if _contains_any(haystack, (*self.exclude_url_terms, *self.link_exclude_terms)):
             return False
+        if self.link_include_terms and _contains_any(haystack, self.link_include_terms):
+            return True
         if not self.allowed_path_prefixes:
             return True
         if path in {"", "/"}:
@@ -267,6 +279,9 @@ class SiteAdapter:
 
     def should_use_browser(self, page: PageFetchResult) -> bool:
         if self.playwright_required_by_default:
+            return True
+        lowered_url = " ".join([page.requested_url or "", page.canonical_url or "", page.final_url or ""]).lower()
+        if _contains_any(lowered_url, self.force_browser_url_terms):
             return True
         lowered = (page.html or "").lower()
         # We only spend browser-rendering effort when the page signals that
@@ -354,10 +369,13 @@ class SiteAdapter:
         lowered = (url or "").lower()
         path = urlparse(url).path.lower()
         haystack = "%s %s" % (lowered, (anchor_text or "").lower())
-        if _contains_any(haystack, self.exclude_url_terms):
+        if _contains_any(haystack, (*self.exclude_url_terms, *self.link_exclude_terms)):
             return -100, "adapter-excluded"
         score = 0
         reason: Optional[str] = None
+        if _contains_any(haystack, self.link_include_terms):
+            score += 14
+            reason = "adapter-link-include-term"
         if any(_path_matches_prefix(path, prefix) for prefix in self.allowed_path_prefixes):
             score += 12
             reason = "adapter-prefix"
@@ -442,9 +460,12 @@ class SiteAdapter:
         # actually provides something. Empty arrays are treated as "leave default".
         tuple_fields = (
             "allowed_path_prefixes",
+            "allowed_hosts",
             "default_seed_urls",
             "include_url_terms",
             "exclude_url_terms",
+            "link_include_terms",
+            "link_exclude_terms",
             "discovery_terms",
             "content_selectors",
             "candidate_selectors",
@@ -476,6 +497,8 @@ class SiteAdapter:
             "suppress_support_record_terms",
             "application_support_terms",
             "supporting_programme_terms",
+            "force_browser_url_terms",
+            "browser_wait_selectors",
         ):
             if field_name in config:
                 values = _as_string_tuple(config.get(field_name))
@@ -488,6 +511,20 @@ class SiteAdapter:
             crawl_mode = clean_text(str(config.get("crawl_mode") or ""))
             if crawl_mode:
                 object.__setattr__(clone, "crawl_mode", crawl_mode)
+
+        for field_name in ("max_pages", "depth_limit", "max_queue_urls", "max_links_per_page"):
+            if field_name in config and config.get(field_name) not in (None, ""):
+                try:
+                    value = int(config.get(field_name))
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    object.__setattr__(clone, field_name, value)
+
+        if "crawl_budget_mode" in config:
+            crawl_budget_mode = clean_text(str(config.get("crawl_budget_mode") or ""))
+            if crawl_budget_mode:
+                object.__setattr__(clone, "crawl_budget_mode", crawl_budget_mode)
 
         # Merge aliases are additive because the base aliases are often still
         # useful even when a site adds its own cleanup rules.

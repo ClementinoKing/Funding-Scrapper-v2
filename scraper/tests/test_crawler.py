@@ -40,6 +40,35 @@ class FixtureFetcher:
         return None
 
 
+class FixtureHttpResponse:
+    def __init__(self, text: str, status_code: int = 200, url: str = "https://example.org/sitemap.xml", headers=None):
+        self.text = text
+        self.content = text.encode("utf-8")
+        self.status_code = status_code
+        self.url = url
+        self.headers = headers or {"content-type": "application/xml"}
+        self.encoding = "utf-8"
+
+
+class SitemapClient:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls: list[str] = []
+
+    def get(self, url: str, headers=None):
+        self.calls.append(url)
+        return self.responses.get(url, FixtureHttpResponse("", status_code=404, url=url))
+
+
+class SitemapFixtureFetcher(FixtureFetcher):
+    def __init__(self, pages, responses):
+        super().__init__(pages)
+        self.client = SitemapClient(responses)
+
+    def _headers(self):
+        return {}
+
+
 class TrackingBrowserFetcher:
     def __init__(self, page: PageFetchResult):
         self.page = page
@@ -258,9 +287,109 @@ def test_crawler_uses_browser_fallback_on_forbidden_response(settings) -> None:
     summary = pipeline.run(["https://example.org/programmes/youth-growth-loan"])
 
     assert summary.pages_fetched_successfully == 1
+    assert summary.browser_fallback_count == 1
     assert browser_fetcher.calls == ["https://example.org/programmes/youth-growth-loan"]
     trace = (settings.output_path / "logs" / "crawl_trace.jsonl").read_text(encoding="utf-8")
     assert '"event":"content_extracted"' in trace
+    assert '"event":"browser_fallback"' in trace
+    assert "restricted-or-rate-limited-status" in trace
+
+
+def test_crawler_treats_www_and_root_domain_as_same_site(settings) -> None:
+    home = _page(
+        "https://example.org/",
+        "<html><body><main><a href='https://www.example.org/funding/youth-grant'>Youth Grant</a></main></body></html>",
+        "Example",
+    )
+    grant = _page(
+        "https://www.example.org/funding/youth-grant",
+        "<html><body><main><h1>Youth Grant</h1><p>Grant funding for youth businesses.</p></main></body></html>",
+        "Youth Grant",
+    )
+    fetcher = FixtureFetcher({"https://example.org/": home, "https://www.example.org/funding/youth-grant": grant})
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=fetcher,
+        browser_fetcher=None,
+    )
+
+    summary = pipeline.run(["https://example.org/"])
+
+    assert summary.pages_fetched_successfully == 2
+    assert "https://www.example.org/funding/youth-grant" in fetcher.calls
+
+
+def test_crawler_discovers_sitemaps_from_robots_and_nested_indexes(settings) -> None:
+    home = _page("https://example.org/", "<html><body><main><h1>Home</h1></main></body></html>", "Home")
+    grant = _page(
+        "https://example.org/funding/youth-grant",
+        "<html><body><main><h1>Youth Grant</h1><p>Grant funding for youth businesses.</p></main></body></html>",
+        "Youth Grant",
+    )
+    responses = {
+        "https://example.org/robots.txt": FixtureHttpResponse(
+            "User-agent: *\nAllow: /\nSitemap: https://example.org/sitemap-index.xml",
+            url="https://example.org/robots.txt",
+            headers={"content-type": "text/plain"},
+        ),
+        "https://example.org/sitemap-index.xml": FixtureHttpResponse(
+            """<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+            <sitemap><loc>https://example.org/programmes-sitemap.xml</loc></sitemap>
+            </sitemapindex>""",
+            url="https://example.org/sitemap-index.xml",
+        ),
+        "https://example.org/programmes-sitemap.xml": FixtureHttpResponse(
+            """<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+            <url><loc>https://example.org/funding/youth-grant</loc></url>
+            </urlset>""",
+            url="https://example.org/programmes-sitemap.xml",
+        ),
+    }
+    fetcher = SitemapFixtureFetcher({"https://example.org/": home, "https://example.org/funding/youth-grant": grant}, responses)
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=fetcher,
+        browser_fetcher=None,
+    )
+
+    summary = pipeline.run(["https://example.org/"])
+
+    assert summary.pages_fetched_successfully == 2
+    assert "https://example.org/robots.txt" in fetcher.client.calls
+    assert "https://example.org/programmes-sitemap.xml" in fetcher.client.calls
+
+
+def test_crawler_applies_queue_and_link_caps(settings) -> None:
+    settings.max_queue_urls = 1
+    settings.max_links_per_page = 2
+    home_links = "".join(
+        f"<a href='https://example.org/funding/program-{index}'>Programme {index} Grant</a>"
+        for index in range(5)
+    )
+    pages = {
+        "https://example.org/": _page("https://example.org/", f"<html><body><main>{home_links}</main></body></html>", "Home")
+    }
+    for index in range(5):
+        url = f"https://example.org/funding/program-{index}"
+        pages[url] = _page(url, f"<html><body><main><h1>Programme {index}</h1><p>Grant funding.</p></main></body></html>", f"Programme {index}")
+    fetcher = FixtureFetcher(pages)
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=fetcher,
+        browser_fetcher=None,
+    )
+
+    summary = pipeline.run(["https://example.org/"])
+
+    assert summary.pages_fetched_successfully == 2
+    assert summary.queue_saturation_count >= 1
+    assert summary.skipped_url_counts["queue-saturated"] >= 1
 
 
 def test_crawler_discovers_programme_routes_from_rendered_homepage(settings) -> None:

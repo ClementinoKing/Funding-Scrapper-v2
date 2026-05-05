@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import heapq
+import gzip
 import random
 import re
 import time
+from collections import defaultdict
 from itertools import count
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import DefaultDict, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urljoin
 from xml.etree import ElementTree as ET
 
@@ -56,10 +58,20 @@ class Crawler:
         self.http_fetcher = http_fetcher
         self.browser_fetcher = browser_fetcher
         self.logger = get_logger(__name__)
+        self._last_fetch_by_host: Dict[str, float] = {}
 
-    def _sleep(self) -> None:
+    def _sleep(self, url: str = "") -> None:
         delay = random.uniform(self.settings.delay_min_seconds, self.settings.delay_max_seconds)
-        time.sleep(delay)
+        host = extract_host(url)
+        if not host:
+            time.sleep(delay)
+            return
+        now = time.monotonic()
+        next_allowed_at = self._last_fetch_by_host.get(host, 0.0) + delay
+        sleep_for = max(0.0, next_allowed_at - now)
+        if sleep_for:
+            time.sleep(sleep_for)
+        self._last_fetch_by_host[host] = time.monotonic()
 
     def _trace(self, **kwargs) -> CrawlTraceEntry:
         return CrawlTraceEntry(**kwargs)
@@ -95,13 +107,31 @@ class Crawler:
         return False
 
     def _should_try_browser_for_adapter(self, page: PageFetchResult, adapter: Optional[SiteAdapter]) -> bool:
+        return self._browser_fallback_reason(page, adapter) is not None
+
+    def _browser_fallback_reason(self, page: PageFetchResult, adapter: Optional[SiteAdapter]) -> Optional[str]:
         if not self.browser_fetcher:
-            return False
+            return None
         if adapter and adapter.should_use_browser(page):
-            return True
+            return "adapter-browser-rule"
         if page.status_code in {401, 403, 429}:
-            return True
-        return self._should_try_browser(page)
+            return "restricted-or-rate-limited-status"
+        if not page.succeeded:
+            return "http-fetch-failed"
+        lowered = (page.html or "").lower()
+        if any(term in lowered for term in ("checking your browser", "cf-browser-verification", "cf-challenge", "just a moment")):
+            return "browser-challenge"
+        if "enable javascript" in lowered or "requires javascript" in lowered:
+            return "javascript-required"
+        stripped_length = self._stripped_text_length(page.html)
+        if stripped_length < 220:
+            return "thin-html"
+        if stripped_length < 450 and lowered.count("<script") >= 2:
+            return "spa-shell"
+        shell_signals = ("data-reactroot", 'id="root"', "id='root'", 'id="app"', "id='app'", "ng-app", "__next", "gatsby", "vue")
+        if stripped_length < 650 and any(signal in lowered for signal in shell_signals):
+            return "app-shell"
+        return None
 
     def _fetch_sitemap_urls(self, domain: str) -> List[str]:
         if not hasattr(self.http_fetcher, "client") or not hasattr(self.http_fetcher, "_headers"):
@@ -111,7 +141,24 @@ class Crawler:
 
         def looks_like_sitemap(candidate: str) -> bool:
             lowered = candidate.lower()
-            return lowered.endswith(".xml") and "sitemap" in lowered
+            return (lowered.endswith(".xml") or lowered.endswith(".xml.gz")) and "sitemap" in lowered
+
+        def response_text(response) -> str:
+            body = getattr(response, "content", b"") or b""
+            if str(getattr(response, "url", "")).lower().endswith(".gz") or urlparse_content_type(response).endswith("gzip"):
+                try:
+                    body = gzip.decompress(body)
+                except Exception:
+                    pass
+            if body:
+                try:
+                    return body.decode(getattr(response, "encoding", None) or "utf-8", errors="replace")
+                except Exception:
+                    return getattr(response, "text", "") or ""
+            return getattr(response, "text", "") or ""
+
+        def urlparse_content_type(response) -> str:
+            return (getattr(response, "headers", {}) or {}).get("content-type", "").lower()
 
         def collect(url: str, depth: int = 0) -> None:
             if depth > 2:
@@ -122,10 +169,11 @@ class Crawler:
             seen.add(canonical)
             try:
                 response = self.http_fetcher.client.get(canonical, headers=self.http_fetcher._headers())  # type: ignore[attr-defined]
-                if response.status_code != 200 or not response.text:
+                text = response_text(response)
+                if response.status_code != 200 or not text:
                     return
                 try:
-                    root = ET.fromstring(response.text)
+                    root = ET.fromstring(text)
                 except ET.ParseError:
                     return
                 namespaces = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -141,8 +189,24 @@ class Crawler:
             except Exception:
                 return
 
+        def collect_robots_sitemaps() -> None:
+            try:
+                robots_url = urljoin(f"https://{domain}", "/robots.txt")
+                response = self.http_fetcher.client.get(robots_url, headers=self.http_fetcher._headers())  # type: ignore[attr-defined]
+                if response.status_code != 200:
+                    return
+                for line in (response.text or "").splitlines():
+                    if line.lower().startswith("sitemap:"):
+                        sitemap_url = line.split(":", 1)[1].strip()
+                        if sitemap_url:
+                            collect(sitemap_url)
+            except Exception:
+                return
+
+        collect_robots_sitemaps()
         collect(urljoin(f"https://{domain}", "/sitemap.xml"))
         collect(urljoin(f"https://{domain}", "/sitemap_index.xml"))
+        collect(urljoin(f"https://{domain}", "/sitemap.xml.gz"))
         return list(dict.fromkeys(discovered))
 
     def _score_candidate_url(
@@ -219,7 +283,16 @@ class Crawler:
         seed_urls: Sequence[str],
         adapter: Optional[SiteAdapter] = None,
     ) -> Tuple[List[PageContentDocument], Dict[str, object]]:
-        allowed_hosts = sorted({extract_host(url) for url in seed_urls})
+        allowed_hosts = sorted(
+            {
+                host
+                for host in [
+                    *[extract_host(url) for url in seed_urls],
+                    *([extract_host(host) for host in adapter.allowed_hosts] if adapter else []),
+                ]
+                if host
+            }
+        )
         queue: List[Tuple[float, int, str, int, str]] = []
         order = count()
         queued: Set[str] = set()
@@ -229,22 +302,57 @@ class Crawler:
         warnings: List[str] = []
         pages_fetched_successfully = 0
         pages_failed = 0
+        browser_fallback_count = 0
+        retry_count = 0
+        fetch_time_total = 0.0
+        skipped_url_counts: DefaultDict[str, int] = defaultdict(int)
+        queue_saturation_count = 0
         crawl_trace: List[CrawlTraceEntry] = []
+        max_pages = adapter.max_pages if adapter and adapter.max_pages else self.settings.max_pages
+        depth_limit = adapter.depth_limit if adapter and adapter.depth_limit else self.settings.depth_limit
+        max_queue_urls = adapter.max_queue_urls if adapter and adapter.max_queue_urls else self.settings.max_queue_urls
+        max_links_per_page = (
+            adapter.max_links_per_page if adapter and adapter.max_links_per_page else self.settings.max_links_per_page
+        )
 
-        for seed_url in seed_urls:
-            canonical = canonicalize_url(seed_url)
-            heapq.heappush(queue, (-100.0, next(order), canonical, 0, "seed"))
-            queued.add(canonical)
+        def note_skipped(reason: str) -> None:
+            skipped_url_counts[reason or "filtered"] += 1
+
+        def enqueue_url(url: str, depth: int, source: str, score: float, reason: str, source_url: Optional[str] = None) -> bool:
+            nonlocal queue_saturation_count
+            if len(queue) >= max_queue_urls:
+                queue_saturation_count += 1
+                note_skipped("queue-saturated")
+                crawl_trace.append(
+                    self._trace(
+                        event="skipped",
+                        url=url,
+                        adapter_name=adapter.key if adapter else None,
+                        source_url=source_url,
+                        depth=depth,
+                        score=score,
+                        reason="queue-saturated",
+                    )
+                )
+                return False
+            heapq.heappush(queue, (-score, next(order), url, depth, source))
+            queued.add(url)
             crawl_trace.append(
                 self._trace(
                     event="queued",
-                    url=canonical,
+                    url=url,
                     adapter_name=adapter.key if adapter else None,
-                    depth=0,
-                    score=100.0,
-                    reason="seed",
+                    source_url=source_url,
+                    depth=depth,
+                    score=score,
+                    reason=reason,
                 )
             )
+            return True
+
+        for seed_url in seed_urls:
+            canonical = canonicalize_url(seed_url)
+            enqueue_url(canonical, 0, "seed", 100.0, "seed")
 
         for domain in allowed_hosts:
             for sitemap_url in self._fetch_sitemap_urls(domain):
@@ -258,7 +366,9 @@ class Crawler:
                 )
                 if score is None:
                     if skip_reason == "irrelevant-url":
+                        note_skipped(skip_reason)
                         continue
+                    note_skipped(skip_reason or "filtered")
                     crawl_trace.append(
                         self._trace(
                             event="skipped",
@@ -269,26 +379,16 @@ class Crawler:
                         )
                     )
                     continue
-                heapq.heappush(queue, (-score, next(order), sitemap_url, 0, "sitemap"))
-                queued.add(sitemap_url)
-                crawl_trace.append(
-                    self._trace(
-                        event="queued",
-                        url=sitemap_url,
-                        adapter_name=adapter.key if adapter else None,
-                        depth=0,
-                        score=score,
-                        reason=adapter_reason or skip_reason or "sitemap",
-                    )
-                )
+                enqueue_url(sitemap_url, 0, "sitemap", score, adapter_reason or skip_reason or "sitemap")
 
-        unlimited_pages = self.settings.max_pages <= 0
-        while queue and (unlimited_pages or len(visited) < self.settings.max_pages):
+        unlimited_pages = max_pages <= 0
+        while queue and (unlimited_pages or len(visited) < max_pages):
             _priority, _order, current_url, depth, source = heapq.heappop(queue)
             queued.discard(current_url)
             if current_url in visited:
                 continue
             if not is_internal_url(current_url, allowed_hosts):
+                note_skipped("external")
                 crawl_trace.append(
                     self._trace(
                         event="skipped",
@@ -300,8 +400,10 @@ class Crawler:
                 )
                 continue
             if looks_irrelevant_url(current_url, self.settings.irrelevant_url_patterns):
+                note_skipped("irrelevant-url")
                 continue
             if adapter and not adapter.should_allow_url(current_url):
+                note_skipped("adapter-rule")
                 crawl_trace.append(
                     self._trace(
                         event="skipped",
@@ -323,12 +425,34 @@ class Crawler:
                     reason=source,
                 )
             )
-            self._sleep()
+            self._sleep(current_url)
             page = self.http_fetcher.fetch(current_url)
-            if self._should_try_browser_for_adapter(page, adapter):
-                browser_page = self.browser_fetcher.fetch(current_url)
+            browser_reason = self._browser_fallback_reason(page, adapter)
+            if browser_reason:
+                try:
+                    browser_page = self.browser_fetcher.fetch(
+                        current_url,
+                        wait_selectors=adapter.browser_wait_selectors if adapter else None,
+                    )
+                except TypeError:
+                    browser_page = self.browser_fetcher.fetch(current_url)
                 if browser_page.succeeded or not page.succeeded:
+                    browser_page.browser_fallback_reason = browser_reason
+                    browser_page.notes = [*browser_page.notes, f"Browser fallback reason: {browser_reason}."]
                     page = browser_page
+                    browser_fallback_count += 1
+                    crawl_trace.append(
+                        self._trace(
+                            event="browser_fallback",
+                            url=current_url,
+                            adapter_name=adapter.key if adapter else None,
+                            depth=depth,
+                            reason=browser_reason,
+                            status_code=page.status_code,
+                        )
+                    )
+            retry_count += page.retry_count
+            fetch_time_total += page.elapsed_seconds
 
             if not page.succeeded:
                 pages_failed += 1
@@ -371,10 +495,12 @@ class Crawler:
             if page_content.headings:
                 self.logger.info("page_content_extracted", url=current_url, headings=len(page_content.headings))
 
-            if depth >= self.settings.depth_limit:
+            if depth >= depth_limit:
                 continue
 
-            ranked_links = page_content.internal_links + page_content.discovered_links + page_content.document_links
+            ranked_links = unique_preserve_order(
+                [*page_content.internal_links, *page_content.discovered_links, *page_content.document_links]
+            )[:max_links_per_page]
             for discovered_link in ranked_links:
                 normalized = canonicalize_url(discovered_link)
                 if not normalized:
@@ -382,6 +508,7 @@ class Crawler:
                 if normalized in visited or normalized in queued:
                     continue
                 if not is_internal_url(normalized, allowed_hosts):
+                    note_skipped("external")
                     continue
                 score, skip_reason, adapter_reason = self._score_candidate_url(
                     normalized,
@@ -391,7 +518,9 @@ class Crawler:
                 )
                 if score is None:
                     if skip_reason == "irrelevant-url":
+                        note_skipped(skip_reason)
                         continue
+                    note_skipped(skip_reason or "filtered")
                     crawl_trace.append(
                         self._trace(
                             event="skipped",
@@ -403,19 +532,7 @@ class Crawler:
                         )
                     )
                     continue
-                heapq.heappush(queue, (-score, next(order), normalized, depth + 1, "page-link"))
-                queued.add(normalized)
-                crawl_trace.append(
-                    self._trace(
-                        event="queued",
-                        url=normalized,
-                        adapter_name=adapter.key if adapter else None,
-                        source_url=current_url,
-                        depth=depth + 1,
-                        score=score,
-                        reason=adapter_reason or "content-extracted",
-                    )
-                )
+                enqueue_url(normalized, depth + 1, "page-link", score, adapter_reason or "content-extracted", current_url)
 
         for entry in crawl_trace:
             self.storage.append_crawl_trace(entry)
@@ -428,4 +545,11 @@ class Crawler:
             "warnings": warnings,
             "crawl_trace_entries": len(crawl_trace),
             "adapter_name": adapter.key if adapter else "generic",
+            "browser_fallback_count": browser_fallback_count,
+            "retry_count": retry_count,
+            "skipped_url_counts": dict(skipped_url_counts),
+            "queue_saturation_count": queue_saturation_count,
+            "average_fetch_time_seconds": round(fetch_time_total / pages_fetched_successfully, 4)
+            if pages_fetched_successfully
+            else 0.0,
         }

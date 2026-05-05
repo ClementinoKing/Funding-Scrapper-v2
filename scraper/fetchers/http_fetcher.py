@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import random
 import re
+import time
 from typing import Dict, Optional
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from scraper.config import ScraperSettings
 from scraper.schemas import PageFetchResult
@@ -19,6 +19,7 @@ from scraper.utils.urls import is_probably_document_url
 
 
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class HttpFetcher:
@@ -29,6 +30,7 @@ class HttpFetcher:
         self.logger = get_logger(__name__)
         self.client = httpx.Client(timeout=settings.timeout_seconds, follow_redirects=True)
         self.robots_cache: Dict[str, RobotFileParser] = {}
+        self._cache: Dict[str, PageFetchResult] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -68,6 +70,12 @@ class HttpFetcher:
         return parser.can_fetch(user_agent, url)
 
     def fetch(self, url: str) -> PageFetchResult:
+        start_time = time.monotonic()
+        if self.settings.fetch_cache and url in self._cache:
+            cached = self._cache[url].model_copy(deep=True)
+            cached.notes = [*cached.notes, "Served from in-run fetch cache."]
+            return cached
+
         if not self.can_fetch(url):
             return PageFetchResult(
                 url=url,
@@ -77,20 +85,37 @@ class HttpFetcher:
                 html="",
                 title=None,
                 fetch_method="http",
+                elapsed_seconds=round(time.monotonic() - start_time, 4),
                 notes=["Blocked by robots.txt"],
             )
 
         headers = self._headers()
         response: Optional[httpx.Response] = None
+        retry_count = 0
         try:
-            for attempt in Retrying(
-                stop=stop_after_attempt(self.settings.retries),
-                wait=wait_exponential(multiplier=1, min=1, max=8),
-                retry=retry_if_exception_type((httpx.RequestError, httpx.TimeoutException)),
-                reraise=True,
-            ):
-                with attempt:
+            attempts = max(1, self.settings.retries)
+            for attempt_number in range(1, attempts + 1):
+                try:
                     response = self.client.get(url, headers=headers)
+                except (httpx.RequestError, httpx.TimeoutException):
+                    if attempt_number >= attempts:
+                        raise
+                    retry_count += 1
+                    time.sleep(min(8.0, (2 ** (attempt_number - 1))) + random.uniform(0, 0.5))
+                    continue
+                if response.status_code not in RETRYABLE_STATUS_CODES or attempt_number >= attempts:
+                    break
+                retry_count += 1
+                retry_after = response.headers.get("retry-after")
+                delay = None
+                if retry_after:
+                    try:
+                        delay = min(float(retry_after), 8.0)
+                    except ValueError:
+                        delay = None
+                if delay is None:
+                    delay = min(8.0, (2 ** (attempt_number - 1))) + random.uniform(0, 0.5)
+                time.sleep(delay)
             assert response is not None
             content_type = response.headers.get("content-type")
             content_type_lower = (content_type or "").lower()
@@ -118,7 +143,7 @@ class HttpFetcher:
                     notes.append(f"{document_kind.upper()} text extracted.")
                 else:
                     notes.append(f"{document_kind.upper()} text extraction yielded no readable text.")
-            return PageFetchResult(
+            result = PageFetchResult(
                 url=str(response.url),
                 requested_url=url,
                 canonical_url=str(response.url),
@@ -130,8 +155,14 @@ class HttpFetcher:
                 fetch_method="http",
                 headers=dict(response.headers),
                 js_rendered=False,
+                response_bytes=len(response.content or b""),
+                retry_count=retry_count,
+                elapsed_seconds=round(time.monotonic() - start_time, 4),
                 notes=notes,
             )
+            if self.settings.fetch_cache:
+                self._cache[url] = result.model_copy(deep=True)
+            return result
         except Exception as exc:
             self.logger.error("http_fetch_failed", url=url, error=str(exc))
             return PageFetchResult(
@@ -145,5 +176,7 @@ class HttpFetcher:
                 fetch_method="http",
                 headers={},
                 js_rendered=False,
+                retry_count=retry_count,
+                elapsed_seconds=round(time.monotonic() - start_time, 4),
                 notes=["HTTP fetch failed: %s" % exc],
             )

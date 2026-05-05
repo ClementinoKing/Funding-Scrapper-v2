@@ -432,6 +432,7 @@ class AIProgrammeDraft(BaseModel):
     country_code: Optional[str] = None
     status: Optional[str] = None
     page_type: Optional[str] = None
+    page_role: Optional[str] = None
     source_scope: Optional[str] = None
     ai_enriched: Optional[bool] = None
 
@@ -577,6 +578,7 @@ class AIClassificationResponse(BaseModel):
     """Strict JSON response returned by the AI model."""
 
     page_decision: Optional[str] = None
+    page_type: Optional[str] = None
     page_decision_confidence: Optional[float] = None
     records: List[AIProgrammeDraft] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
@@ -686,6 +688,10 @@ class PageFetchResult(BaseModel):
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     headers: Dict[str, str] = Field(default_factory=dict)
     js_rendered: bool = False
+    response_bytes: int = 0
+    retry_count: int = 0
+    elapsed_seconds: float = 0.0
+    browser_fallback_reason: Optional[str] = None
     notes: List[str] = Field(default_factory=list)
 
     @property
@@ -723,6 +729,7 @@ class FundingProgrammeRecord(BaseModel):
     approval_status: ApprovalStatus = ApprovalStatus.PENDING
     site_adapter: Optional[str] = None
     page_type: Optional[str] = None
+    page_role: Optional[str] = None
     parent_programme_name: Optional[str] = None
     programme_nature: ProgrammeNature = ProgrammeNature.UNKNOWN
     display_category: DisplayCategory = DisplayCategory.UNKNOWN
@@ -805,7 +812,9 @@ class FundingProgrammeRecord(BaseModel):
     parser_version: str = SCRAPER_VERSION
     ai_enriched: bool = False
     needs_review: bool = False
+    needs_review_reasons: List[str] = Field(default_factory=list)
     validation_errors: List[str] = Field(default_factory=list)
+    field_conflicts: Dict[str, List[str]] = Field(default_factory=dict)
     deleted_at: Optional[datetime] = None
     notes: List[str] = Field(default_factory=list)
     page_debug_package: Optional[PageDebugPackage] = None
@@ -828,6 +837,7 @@ class FundingProgrammeRecord(BaseModel):
         "raw_terms_data",
         "raw_documents_data",
         "raw_application_data",
+        "needs_review_reasons",
         "validation_errors",
         "notes",
         mode="before",
@@ -850,6 +860,7 @@ class FundingProgrammeRecord(BaseModel):
     @field_validator(
         "payback_raw_text",
         "payback_structure",
+        "page_role",
         mode="before",
     )
     @classmethod
@@ -1051,6 +1062,24 @@ class FundingProgrammeRecord(BaseModel):
     def _normalize_field_confidence(cls, value: Any) -> Dict[str, float]:
         return cls._normalize_confidence(value)
 
+    @field_validator("field_conflicts", mode="before")
+    @classmethod
+    def _normalize_field_conflicts(cls, value: Any) -> Dict[str, List[str]]:
+        if not value or not isinstance(value, dict):
+            return {}
+        normalized: Dict[str, List[str]] = {}
+        for field_name, conflicts in value.items():
+            if conflicts is None:
+                continue
+            if isinstance(conflicts, str):
+                items = [conflicts]
+            else:
+                items = list(conflicts)
+            cleaned = unique_preserve_order([clean_text(str(item)) for item in items if clean_text(str(item))])
+            if cleaned:
+                normalized[str(field_name)] = cleaned
+        return normalized
+
     @field_validator("source_url", "application_url")
     @classmethod
     def _validate_urls(cls, value: Optional[str]) -> Optional[str]:
@@ -1206,8 +1235,11 @@ class FundingProgrammeRecord(BaseModel):
             self.validation_errors = unique_preserve_order([*self.validation_errors, "missing funder_name"])
         if self.application_channel == ApplicationChannel.ONLINE_FORM and not self.application_url:
             self.validation_errors = unique_preserve_order([*self.validation_errors, "missing application_url"])
+        self.field_conflicts = self._detect_field_conflicts()
+        if self.field_conflicts:
+            self.needs_review_reasons = unique_preserve_order([*self.needs_review_reasons, "conflicting_field_values"])
         self.status = self._derive_status()
-        self.needs_review = self.needs_review or bool(self.validation_errors)
+        self.needs_review = self.needs_review or bool(self.validation_errors) or bool(self.needs_review_reasons) or bool(self.field_conflicts)
         return self
 
     @staticmethod
@@ -1223,6 +1255,45 @@ class FundingProgrammeRecord(BaseModel):
         if not self.extraction_confidence:
             return 0.0
         return round(sum(self.extraction_confidence.values()) / len(self.extraction_confidence), 4)
+
+    def _detect_field_conflicts(self) -> Dict[str, List[str]]:
+        conflict_candidates = (
+            "program_name",
+            "funder_name",
+            "page_type",
+            "page_role",
+            "funding_type",
+            "ticket_min",
+            "ticket_max",
+            "program_budget_total",
+            "deadline_date",
+            "application_url",
+            "contact_email",
+            "contact_phone",
+        )
+        conflicts: Dict[str, List[str]] = {}
+        for field_name in conflict_candidates:
+            evidence_items = self.field_evidence.get(field_name) or []
+            if len(evidence_items) < 2:
+                continue
+            values = unique_preserve_order(
+                [
+                    clean_text(str(item.normalized_value if item.normalized_value not in (None, "", [], {}) else item.raw_value if item.raw_value not in (None, "", [], {}) else item.evidence_text))
+                    for item in evidence_items
+                    if clean_text(
+                        str(
+                            item.normalized_value
+                            if item.normalized_value not in (None, "", [], {})
+                            else item.raw_value
+                            if item.raw_value not in (None, "", [], {})
+                            else item.evidence_text
+                        )
+                    )
+                ]
+            )
+            if len(values) > 1:
+                conflicts[field_name] = values
+        return conflicts
 
     def _derive_status(self) -> ProgrammeStatus:
         notes_lower = " ".join(self.notes).lower()
@@ -1275,6 +1346,12 @@ class RunSummary(BaseModel):
     records_with_low_confidence_extraction: int = 0
     records_with_borderline_review: int = 0
     records_rejected_for_quality: int = 0
+    browser_fallback_count: int = 0
+    retry_count: int = 0
+    skipped_url_counts: Dict[str, int] = Field(default_factory=dict)
+    queue_saturation_count: int = 0
+    average_fetch_time_seconds: float = 0.0
+    domain_telemetry: List[Dict[str, Any]] = Field(default_factory=list)
     low_confidence_threshold: float = 0.0
     errors: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)

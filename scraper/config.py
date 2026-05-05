@@ -95,6 +95,10 @@ class RuntimeOptions:
     browser_fallback: Optional[bool] = None
     respect_robots: Optional[bool] = None
     ai_enrichment: Optional[bool] = None
+    domain_concurrency: Optional[int] = None
+    max_queue_urls: Optional[int] = None
+    max_links_per_page: Optional[int] = None
+    fetch_cache: Optional[bool] = None
 
 
 @dataclass
@@ -116,6 +120,12 @@ class ScraperSettings:
     respect_robots: bool = True
     application_verification_timeout_seconds: int = 10
     browser_wait_until: str = "networkidle"
+    browser_wait_selectors: List[str] = field(default_factory=list)
+    domain_concurrency: int = 1
+    max_queue_urls: int = 500
+    max_links_per_page: int = 120
+    fetch_cache: bool = True
+    browser_block_assets: bool = True
     user_agents: List[str] = field(default_factory=lambda: list(DEFAULT_USER_AGENTS))
     relevant_keywords: List[str] = field(default_factory=list)
     irrelevant_url_patterns: List[str] = field(default_factory=list)
@@ -169,6 +179,12 @@ class ScraperSettings:
             respect_robots=_env_bool("SCRAPER_RESPECT_ROBOTS", True),
             application_verification_timeout_seconds=_env_int("SCRAPER_APPLICATION_VERIFY_TIMEOUT", 10),
             browser_wait_until=os.getenv("SCRAPER_BROWSER_WAIT_UNTIL", "networkidle"),
+            browser_wait_selectors=_env_list("SCRAPER_BROWSER_WAIT_SELECTORS", []),
+            domain_concurrency=max(1, _env_int("SCRAPER_DOMAIN_CONCURRENCY", 1)),
+            max_queue_urls=max(1, _env_int("SCRAPER_MAX_QUEUE_URLS", 500)),
+            max_links_per_page=max(1, _env_int("SCRAPER_MAX_LINKS_PER_PAGE", 120)),
+            fetch_cache=_env_bool("SCRAPER_FETCH_CACHE", True),
+            browser_block_assets=_env_bool("SCRAPER_BROWSER_BLOCK_ASSETS", True),
             user_agents=user_agents,
             relevant_keywords=load_json_resource("relevant_keywords.json"),
             irrelevant_url_patterns=load_json_resource("irrelevant_url_patterns.json"),
@@ -222,6 +238,12 @@ class ScraperSettings:
             ai_enrichment=options.ai_enrichment if options.ai_enrichment is not None else self.ai_enrichment,
             application_verification_timeout_seconds=self.application_verification_timeout_seconds,
             browser_wait_until=self.browser_wait_until,
+            browser_wait_selectors=list(self.browser_wait_selectors),
+            domain_concurrency=max(1, options.domain_concurrency if options.domain_concurrency is not None else self.domain_concurrency),
+            max_queue_urls=max(1, options.max_queue_urls if options.max_queue_urls is not None else self.max_queue_urls),
+            max_links_per_page=max(1, options.max_links_per_page if options.max_links_per_page is not None else self.max_links_per_page),
+            fetch_cache=options.fetch_cache if options.fetch_cache is not None else self.fetch_cache,
+            browser_block_assets=self.browser_block_assets,
             user_agents=list(self.user_agents),
             relevant_keywords=list(self.relevant_keywords),
             irrelevant_url_patterns=list(self.irrelevant_url_patterns),

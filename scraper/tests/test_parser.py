@@ -143,6 +143,67 @@ def test_generic_parser_extracts_interactive_sections(settings) -> None:
     )
 
 
+def test_generic_parser_handles_wordpress_and_elementor_layouts(settings) -> None:
+    parser = GenericFundingParser(settings)
+    html = """
+    <html>
+      <head>
+        <title>Spaza Shop Support Fund</title>
+        <meta name="description" content="Grant funding for township retailers.">
+        <script type="application/ld+json">
+          {"@type":"FinancialProduct","name":"Spaza Shop Support Fund","description":"Working capital support."}
+        </script>
+      </head>
+      <body>
+        <div class="elementor">
+          <div class="elementor-widget">
+            <h1>Spaza Shop Support Fund</h1>
+            <p>Grant funding for qualifying township retailers.</p>
+            <a href="/apply/spaza-shop-support-fund">Apply now</a>
+          </div>
+          <div class="wp-block-group">
+            <h2>Eligibility</h2>
+            <p>Applicants must operate a registered retail business.</p>
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    page = _page("https://example.org/funds/spaza-shop-support-fund", html, "Spaza Shop Support Fund")
+
+    result = parser.parse(page, allowed_domains=["example.org"])
+
+    assert "qualifying township retailers" in result.full_body_text.lower()
+    assert any(section.heading == "Structured metadata" for section in result.structured_sections)
+    assert any("registered retail business" in section.content.lower() for section in result.structured_sections)
+    assert result.application_links == ["https://example.org/apply/spaza-shop-support-fund"]
+
+
+def test_generic_parser_preserves_form_evidence(settings) -> None:
+    parser = GenericFundingParser(settings)
+    html = """
+    <html>
+      <body>
+        <main>
+          <h1>Innovation Grant</h1>
+          <form action="/apply/innovation-grant">
+            <legend>Application form</legend>
+            <label for="turnover">Annual turnover</label>
+            <input id="turnover" name="turnover" placeholder="Enter turnover">
+          </form>
+        </main>
+      </body>
+    </html>
+    """
+    page = _page("https://example.org/funding/innovation-grant", html, "Innovation Grant")
+
+    result = parser.parse(page, allowed_domains=["example.org"])
+
+    assert "Application form" in result.full_body_text
+    assert "Annual turnover" in result.full_body_text
+    assert "Enter turnover" in result.full_body_text
+
+
 def test_extract_document_links_includes_office_and_image_files() -> None:
     soup = BeautifulSoup(
         """

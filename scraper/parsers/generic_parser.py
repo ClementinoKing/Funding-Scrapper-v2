@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -23,7 +24,7 @@ from scraper.utils.text import clean_text, unique_preserve_order
 from scraper.utils.urls import canonicalize_url, filter_and_sort_links, is_internal_url, looks_irrelevant_url
 
 
-INLINE_NOISE_TAGS = {"script", "style", "noscript", "svg", "canvas", "iframe", "form", "template", "button"}
+INLINE_NOISE_TAGS = {"script", "style", "noscript", "svg", "canvas", "iframe", "template"}
 BLOCK_NOISE_TAGS = {"nav", "footer", "header", "aside", "dialog"}
 INTERACTIVE_TYPE_HINTS = {
     "tab": ("tab", "tabs", "tabpanel", "tab-pane"),
@@ -55,9 +56,14 @@ INTERACTIVE_PANEL_SELECTORS = (
     '.panel',
     '.box',
     '.content-box',
+    '.views-row',
+    '.field-content',
+    '.elementor-widget',
+    '[class*="wp-block"]',
     'table',
     'ul',
     'ol',
+    'form',
 )
 
 
@@ -299,10 +305,15 @@ def _extract_text(node: Tag | BeautifulSoup) -> str:
         if isinstance(child, Tag) and child.name in {"br", "hr"}:
             parts.append("\n")
             continue
-        if isinstance(child, Tag) and child.name in {"p", "li", "dt", "dd", "th", "td", "blockquote"}:
+        if isinstance(child, Tag) and child.name in {"p", "li", "dt", "dd", "th", "td", "blockquote", "label", "legend", "option", "button"}:
             text = clean_text(child.get_text(" ", strip=True))
             if text:
                 parts.append(text)
+                parts.append("\n")
+        if isinstance(child, Tag) and child.name in {"input", "textarea", "select"}:
+            label = clean_text(" ".join(str(child.get(attr, "")) for attr in ("aria-label", "name", "placeholder", "value")))
+            if label:
+                parts.append(label)
                 parts.append("\n")
     if not parts:
         text = node.get_text("\n", strip=True) if hasattr(node, "get_text") else ""
@@ -357,6 +368,39 @@ def _collect_headings(root: BeautifulSoup) -> List[str]:
         if text:
             headings.append(text)
     return unique_preserve_order(headings)
+
+
+def _collect_structured_metadata(soup: BeautifulSoup, page_url: str) -> List[PageContentSection]:
+    values: List[str] = []
+    for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        raw_json = script.string or script.get_text(" ", strip=True)
+        if not raw_json:
+            continue
+        try:
+            payload = json.loads(raw_json)
+        except Exception:
+            continue
+        stack = payload if isinstance(payload, list) else [payload]
+        for item in stack:
+            if not isinstance(item, dict):
+                continue
+            for key in ("name", "headline", "description", "provider", "organizer", "url"):
+                value = item.get(key)
+                if isinstance(value, dict):
+                    value = value.get("name") or value.get("url")
+                if isinstance(value, str) and clean_text(value):
+                    values.append(f"{key}: {clean_text(value)}")
+    for meta in soup.find_all("meta"):
+        key = clean_text(str(meta.get("name") or meta.get("property") or "")).lower()
+        if key not in {"description", "og:title", "og:description", "twitter:title", "twitter:description"}:
+            continue
+        content = clean_text(str(meta.get("content") or ""))
+        if content:
+            values.append(f"{key}: {content}")
+    values = unique_preserve_order(values)
+    if not values:
+        return []
+    return [PageContentSection(heading="Structured metadata", content="\n".join(values[:20]))]
 
 
 def _collect_sections(root: BeautifulSoup) -> List[PageContentSection]:
@@ -439,8 +483,11 @@ class GenericFundingParser:
         cleaned_root = _strip_noise(scoped_root, profile.content_exclude_selectors if profile else ())
         title = _title_from_page(soup, page.title)
         headings = _collect_headings(cleaned_root)
-        structured_sections = _remove_duplicate_sections(_collect_sections(cleaned_root))
+        metadata_sections = _collect_structured_metadata(soup, page.canonical_url)
+        structured_sections = _remove_duplicate_sections([*metadata_sections, *_collect_sections(cleaned_root)])
         full_body_text = _extract_text(cleaned_root)
+        if metadata_sections:
+            full_body_text = _dedupe_lines("\n".join([full_body_text, *[section.content for section in metadata_sections]]))
         page_domain = urlparse(page.canonical_url).netloc.lower()
         document_context_text = " ".join(
             [
@@ -465,11 +512,22 @@ class GenericFundingParser:
             irrelevant_patterns=self.settings.irrelevant_url_patterns,
         )
         document_links = extract_document_links(cleaned_root, page.canonical_url, context_text=document_context_text)
-        application_links = [
-            link for link in extract_application_links(cleaned_root, page.canonical_url) if link not in document_links
-        ]
-        internal_links = [link for link in internal_links if link not in application_links and link not in document_links]
-        discovered_links = [link for link in discovered_links if link not in application_links and link not in document_links]
+        application_like_links = unique_preserve_order(
+            [
+                href
+                for href, label in all_links
+                if any(keyword in clean_text(label).lower() for keyword in APPLICATION_HINTS)
+                or any(keyword in href.lower() for keyword in APPLICATION_HINTS)
+            ]
+        )
+        application_links = unique_preserve_order(
+            [
+                *[link for link in extract_application_links(cleaned_root, page.canonical_url) if link not in document_links],
+                *([] if profile else [link for link in application_like_links if link not in document_links]),
+            ]
+        )
+        internal_links = [link for link in internal_links if link not in application_like_links and link not in document_links]
+        discovered_links = [link for link in discovered_links if link not in application_like_links and link not in document_links]
         internal_links = unique_preserve_order([*internal_links, *discovered_links, *document_links])
 
         return PageContentDocument(

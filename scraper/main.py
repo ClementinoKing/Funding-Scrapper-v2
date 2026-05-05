@@ -29,6 +29,9 @@ def _print_summary(summary) -> None:
     typer.echo("Low-confidence records: %s" % summary.records_with_low_confidence_extraction)
     typer.echo("Borderline review records: %s" % summary.records_with_borderline_review)
     typer.echo("Rejected records: %s" % summary.records_rejected_for_quality)
+    typer.echo("Browser fallbacks: %s" % summary.browser_fallback_count)
+    typer.echo("Retries: %s" % summary.retry_count)
+    typer.echo("Average fetch time: %.3fs" % summary.average_fetch_time_seconds)
     if summary.errors:
         typer.echo("Errors: %s" % len(summary.errors))
 
@@ -48,6 +51,10 @@ def _run_seed_pipeline(
     respect_robots: bool,
     fresh: bool,
     ai_enrichment: Optional[bool],
+    domain_concurrency: Optional[int] = None,
+    max_queue_urls: Optional[int] = None,
+    max_links_per_page: Optional[int] = None,
+    fetch_cache: Optional[bool] = None,
     max_domains: Optional[int] = None,
 ):
     settings = build_settings_from_options(
@@ -58,6 +65,10 @@ def _run_seed_pipeline(
         browser_fallback,
         respect_robots,
         ai_enrichment,
+        domain_concurrency,
+        max_queue_urls,
+        max_links_per_page,
+        fetch_cache,
     )
     if fresh:
         _clear_local_scrape_output(settings.output_path)
@@ -92,6 +103,10 @@ def scrape_url(
         "--ai-enrichment/--no-ai-enrichment",
         help="Enable or disable AI enrichment for this run.",
     ),
+    domain_concurrency: Optional[int] = typer.Option(None, help="Maximum domains to process concurrently."),
+    max_queue_urls: Optional[int] = typer.Option(None, help="Maximum queued URLs per domain."),
+    max_links_per_page: Optional[int] = typer.Option(None, help="Maximum discovered links to score per fetched page."),
+    fetch_cache: Optional[bool] = typer.Option(None, "--fetch-cache/--no-fetch-cache", help="Enable in-run fetch caching."),
 ) -> None:
     settings = build_settings_from_options(
         output_path,
@@ -101,6 +116,10 @@ def scrape_url(
         browser_fallback,
         respect_robots,
         ai_enrichment,
+        domain_concurrency,
+        max_queue_urls,
+        max_links_per_page,
+        fetch_cache,
     )
     pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     summary = pipeline.run([url])
@@ -121,6 +140,10 @@ def crawl_domain(
         "--ai-enrichment/--no-ai-enrichment",
         help="Enable or disable AI enrichment for this run.",
     ),
+    domain_concurrency: Optional[int] = typer.Option(None, help="Maximum domains to process concurrently."),
+    max_queue_urls: Optional[int] = typer.Option(None, help="Maximum queued URLs per domain."),
+    max_links_per_page: Optional[int] = typer.Option(None, help="Maximum discovered links to score per fetched page."),
+    fetch_cache: Optional[bool] = typer.Option(None, "--fetch-cache/--no-fetch-cache", help="Enable in-run fetch caching."),
 ) -> None:
     settings = build_settings_from_options(
         output_path,
@@ -130,6 +153,10 @@ def crawl_domain(
         browser_fallback,
         respect_robots,
         ai_enrichment,
+        domain_concurrency,
+        max_queue_urls,
+        max_links_per_page,
+        fetch_cache,
     )
     pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     summary = pipeline.run([url])
@@ -155,6 +182,10 @@ def run_seeds(
         help="Clear previous local scrape artifacts before running. Use --resume to keep crawl state and outputs.",
     ),
     max_domains: Optional[int] = typer.Option(None, help="Maximum domains to process in this run."),
+    domain_concurrency: Optional[int] = typer.Option(None, help="Maximum domains to process concurrently."),
+    max_queue_urls: Optional[int] = typer.Option(None, help="Maximum queued URLs per domain."),
+    max_links_per_page: Optional[int] = typer.Option(None, help="Maximum discovered links to score per fetched page."),
+    fetch_cache: Optional[bool] = typer.Option(None, "--fetch-cache/--no-fetch-cache", help="Enable in-run fetch caching."),
 ) -> None:
     summary = _run_seed_pipeline(
         max_pages=max_pages,
@@ -164,6 +195,10 @@ def run_seeds(
         browser_fallback=browser_fallback,
         respect_robots=respect_robots,
         ai_enrichment=ai_enrichment,
+        domain_concurrency=domain_concurrency,
+        max_queue_urls=max_queue_urls,
+        max_links_per_page=max_links_per_page,
+        fetch_cache=fetch_cache,
         fresh=fresh,
         max_domains=max_domains,
     )
@@ -183,6 +218,10 @@ def run_next_seed(
         "--ai-enrichment/--no-ai-enrichment",
         help="Enable or disable AI enrichment for this run.",
     ),
+    domain_concurrency: Optional[int] = typer.Option(None, help="Maximum domains to process concurrently."),
+    max_queue_urls: Optional[int] = typer.Option(None, help="Maximum queued URLs per domain."),
+    max_links_per_page: Optional[int] = typer.Option(None, help="Maximum discovered links to score per fetched page."),
+    fetch_cache: Optional[bool] = typer.Option(None, "--fetch-cache/--no-fetch-cache", help="Enable in-run fetch caching."),
 ) -> None:
     summary = _run_seed_pipeline(
         max_pages=max_pages,
@@ -192,6 +231,10 @@ def run_next_seed(
         browser_fallback=browser_fallback,
         respect_robots=respect_robots,
         ai_enrichment=ai_enrichment,
+        domain_concurrency=domain_concurrency,
+        max_queue_urls=max_queue_urls,
+        max_links_per_page=max_links_per_page,
+        fetch_cache=fetch_cache,
         fresh=False,
         max_domains=1,
     )

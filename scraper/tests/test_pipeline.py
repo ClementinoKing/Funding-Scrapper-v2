@@ -42,6 +42,14 @@ class FixtureFetcher:
         return None
 
 
+class StaticClassifier:
+    def __init__(self, records):
+        self.records = records
+
+    def classify_document(self, document: PageContentDocument):
+        return [record.model_copy(update={"source_url": document.page_url, "source_urls": [document.page_url]}) for record in self.records]
+
+
 def _page(url: str, html: str, title: str) -> PageFetchResult:
     return PageFetchResult(
         url=url,
@@ -115,6 +123,44 @@ def test_pipeline_runs_end_to_end_with_raw_content_and_classified_records(settin
     assert names == {"Youth Growth Loan", "Asset Finance Facility"}
     assert all(item["ai_enriched"] is False for item in payload)
     assert all(item["source_domain"] == "example.org" for item in payload)
+
+
+def test_pipeline_does_not_persist_rejected_page_types(settings) -> None:
+    page_url = "https://example.org/tenders/rfp-2025"
+    record = FundingProgrammeRecord(
+        program_name="RFP 2025 Appointment of Service Provider",
+        funder_name="Example Agency",
+        source_url=page_url,
+        source_urls=[page_url],
+        source_domain="example.org",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type="Unknown",
+        page_type="tender_procurement",
+    )
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=FixtureFetcher(
+            {
+                page_url: _page(
+                    page_url,
+                    "<html><body><main><h1>RFP 2025</h1><p>Tender number RFP 2025 procurement notice.</p></main></body></html>",
+                    "RFP 2025",
+                )
+            }
+        ),
+        browser_fetcher=None,
+        ai_enhancer=StaticClassifier([record]),
+    )
+
+    summary = pipeline.run([page_url])
+    payload_path = settings.output_path / "normalized" / "funding_programmes.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+
+    assert summary.programmes_after_dedupe == 0
+    assert summary.records_rejected_for_quality == 1
+    assert payload == []
 
 
 def test_pipeline_resume_skips_completed_domains(settings, fixture_dir: Path) -> None:
@@ -281,7 +327,7 @@ def test_ai_classifier_reprompts_for_missing_fields(settings, fixture_dir: Path,
     records = classifier.classify_document(document)
 
     assert len(records) == 1
-    assert "Decide whether this page is a real funding programme page." in prompts[1]
+    assert "Classify this page into the exact page_type vocabulary first." in prompts[1]
     assert records[0].program_name == "Green Energy SME Grant"
 
 
@@ -633,3 +679,24 @@ def test_build_settings_from_options_ai_flag_overrides_env(monkeypatch) -> None:
     assert disabled.ai_enrichment is False
     assert enabled.ai_enrichment is True
     assert inherited.ai_enrichment is True
+
+
+def test_build_settings_from_options_applies_crawl_performance_flags() -> None:
+    settings = build_settings_from_options(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        domain_concurrency=3,
+        max_queue_urls=25,
+        max_links_per_page=7,
+        fetch_cache=False,
+    )
+
+    assert settings.domain_concurrency == 3
+    assert settings.max_queue_urls == 25
+    assert settings.max_links_per_page == 7
+    assert settings.fetch_cache is False

@@ -111,4 +111,5 @@ def test_quality_scoring_demotes_article_publication_pages_to_review() -> None:
 
     assert score >= 80
     assert is_real_programme_record(record)
-    assert not is_borderline_programme_record(record)
+    assert is_borderline_programme_record(record)
+    assert "Article or publication page" in blockers
