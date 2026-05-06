@@ -136,3 +136,19 @@ def test_site_repository_falls_back_to_local_seed_file(tmp_path: Path) -> None:
         "https://www.nefcorp.co.za/products-services",
         "https://www.nyda.gov.za/",
     ]
+
+
+def test_site_repository_loads_locked_source_registry_rows() -> None:
+    repo = SiteRepository(settings=None, adapter_registry=build_default_registry())
+    source_registry = Path(__file__).parents[1] / "resources" / "source_sites.json"
+
+    sites = repo.load_sites(fallback_seed_file=source_registry)
+
+    assert len(sites) == 16
+    by_key = {site.site_key: site for site in sites}
+    assert by_key["sefa"].primary_domain == "www.sefa.org.za"
+    assert by_key["sefa"].seed_urls == ("https://www.sefa.org.za/products/direct-lending-products",)
+    assert by_key["dsbd"].display_name == "DSBD"
+    assert by_key["dsbd"].adapter_config["include_url_terms"]
+    assert by_key["pic"].adapter_config["playwright_required_by_default"] is True
+    assert all(site.adapter_config for site in sites)

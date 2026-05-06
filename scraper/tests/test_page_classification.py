@@ -55,6 +55,41 @@ def test_persistence_gate_rejects_tender_but_accepts_fundable_open_call() -> Non
     assert should_persist_record(open_call)[0] is True
 
 
+def test_persistence_gate_rejects_generic_institution_listing_without_funding_evidence() -> None:
+    record = FundingProgrammeRecord(
+        program_name="PIC",
+        funder_name="PIC",
+        source_url="https://www.pic.gov.za/",
+        source_domain="www.pic.gov.za",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.UNKNOWN,
+        page_type="funding_listing",
+    )
+
+    should_persist, reason = should_persist_record(record)
+
+    assert should_persist is False
+    assert "generic" in str(reason)
+
+
+def test_persistence_gate_rejects_graduate_programme_without_fundable_support() -> None:
+    record = FundingProgrammeRecord(
+        program_name="Graduate Development Programme",
+        funder_name="PIC",
+        source_url="https://www.pic.gov.za/graduate",
+        source_domain="www.pic.gov.za",
+        source_page_title="Graduate Development Programme",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.UNKNOWN,
+        page_type="funding_programme",
+    )
+
+    should_persist, reason = should_persist_record(record)
+
+    assert should_persist is False
+    assert "non-funding" in str(reason)
+
+
 def test_review_reasons_mark_unknown_funding_and_tender_titles() -> None:
     record = FundingProgrammeRecord(
         program_name="Tender T2025/004 Supply and Delivery",

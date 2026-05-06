@@ -182,13 +182,23 @@ def _should_merge(
 ) -> bool:
     left_sources = set(_canonical_source_urls(left))
     right_sources = set(_canonical_source_urls(right))
-    if left_sources & right_sources:
-        return True
 
     left_program = _normalized_name(left.program_name, adapter=adapter, kind="program")
     right_program = _normalized_name(right.program_name, adapter=adapter, kind="program")
     left_funder = _normalized_name(left.funder_name, adapter=adapter, kind="funder")
     right_funder = _normalized_name(right.funder_name, adapter=adapter, kind="funder")
+
+    if left_sources & right_sources:
+        if (
+            left_program
+            and right_program
+            and left_program != right_program
+            and not (_is_generic_support_program(left_program) or _is_generic_support_program(right_program))
+        ):
+            return False
+        if left_funder and right_funder and left_funder != right_funder:
+            return False
+        return True
 
     if left.source_domain != right.source_domain:
         return False

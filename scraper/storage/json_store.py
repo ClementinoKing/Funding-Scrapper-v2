@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from scraper.schemas import (
     CrawlState,
@@ -37,6 +37,7 @@ class LocalJsonStore:
         self.normalized_json_path = self.normalized_dir / "funding_programmes.json"
         self.low_confidence_path = self.normalized_dir / "low_confidence_review.json"
         self.run_summary_path = self.logs_dir / "run_summary.json"
+        self.qa_coverage_path = self.logs_dir / "qa_coverage_report.json"
         self.crawl_state_path = self.logs_dir / "crawl_state.json"
         self.csv_path = self.normalized_dir / "funding_programmes.csv"
 
@@ -159,6 +160,10 @@ class LocalJsonStore:
     def write_run_summary(self, summary: RunSummary) -> Path:
         self.run_summary_path.write_text(summary.model_dump_json(indent=2), encoding="utf-8")
         return self.run_summary_path
+
+    def write_qa_coverage_report(self, report: List[Dict[str, Any]]) -> Path:
+        self.qa_coverage_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+        return self.qa_coverage_path
 
     def load_normalized_records(self) -> List[FundingProgrammeRecord]:
         if not self.normalized_json_path.exists():

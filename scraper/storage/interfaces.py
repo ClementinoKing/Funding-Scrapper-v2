@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Protocol
+from typing import Any, Dict, List, Protocol
 
 from scraper.schemas import (
     CrawlState,
@@ -63,6 +63,9 @@ class StorageBackend(Protocol):
         ...
 
     def write_run_summary(self, summary: RunSummary) -> Path:
+        ...
+
+    def write_qa_coverage_report(self, report: List[Dict[str, Any]]) -> Path:
         ...
 
     def load_normalized_records(self) -> List[FundingProgrammeRecord]:

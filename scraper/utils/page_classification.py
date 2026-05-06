@@ -78,6 +78,56 @@ PROCUREMENT_TEXT_TERMS = (
     "supply chain",
 )
 
+NON_FUNDING_PROGRAMME_TERMS = (
+    "graduate",
+    "graduate development",
+    "vacation work",
+    "internship",
+    "internships",
+    "bursary",
+    "bursaries",
+    "career",
+    "careers",
+    "vacancy",
+    "vacancies",
+    "procurement",
+    "tender",
+    "rfp",
+    "rfq",
+)
+
+GENERIC_PROGRAMME_NAMES = {
+    "about",
+    "about us",
+    "apply",
+    "application",
+    "business",
+    "clients",
+    "contact",
+    "contact us",
+    "development",
+    "finance",
+    "fund",
+    "funding",
+    "funding instruments",
+    "funding opportunities",
+    "funding programmes",
+    "funding solutions",
+    "home",
+    "investment",
+    "investments",
+    "isibaya",
+    "listing",
+    "overview",
+    "pic",
+    "products",
+    "products and services",
+    "program",
+    "programme",
+    "services",
+    "support",
+}
+
 NEWS_TEXT_TERMS = (
     "news",
     "article",
@@ -183,13 +233,52 @@ def has_fundable_support(record: FundingProgrammeRecord) -> bool:
         return True
     if record.ticket_min is not None or record.ticket_max is not None or record.program_budget_total is not None:
         return True
-    haystack = _record_text(record)
+    haystack = _funding_evidence_text(record)
     return any(term in haystack for term in FUNDABLE_SUPPORT_TERMS)
+
+
+def _has_core_funding_evidence(record: FundingProgrammeRecord) -> bool:
+    if record.funding_type != FundingType.UNKNOWN:
+        return True
+    if record.ticket_min is not None or record.ticket_max is not None or record.program_budget_total is not None:
+        return True
+    if record.application_url or record.application_channel.value != "Unknown":
+        return True
+    haystack = _funding_evidence_text(record)
+    if any(term in haystack for term in FUNDABLE_SUPPORT_TERMS):
+        return True
+    return bool(record.raw_funding_offer_data or record.funding_lines)
+
+
+def _looks_like_non_funding_programme(record: FundingProgrammeRecord) -> bool:
+    haystack = _record_text(record)
+    return any(term in haystack for term in NON_FUNDING_PROGRAMME_TERMS)
+
+
+def _looks_like_generic_programme_listing(record: FundingProgrammeRecord) -> bool:
+    program_name = clean_text(record.program_name or "").casefold()
+    funder_name = clean_text(record.funder_name or "").casefold()
+    title = clean_text(record.source_page_title or "").casefold()
+    if not program_name:
+        return True
+    if program_name in GENERIC_PROGRAMME_NAMES:
+        return True
+    if funder_name and program_name == funder_name:
+        return True
+    if title and program_name == title and program_name in GENERIC_PROGRAMME_NAMES:
+        return True
+    return False
 
 
 def should_persist_record(record: FundingProgrammeRecord) -> Tuple[bool, Optional[str]]:
     page_type = normalize_page_type(record.page_type)
     record.page_type = page_type
+    if _looks_like_non_funding_programme(record) and not has_fundable_support(record):
+        return False, "record looks like non-funding programme content"
+    if _looks_like_generic_programme_listing(record) and not _has_core_funding_evidence(record):
+        return False, "record looks like a generic institutional or listing page without core funding evidence"
+    if page_type == PAGE_TYPE_FUNDING_LISTING and record.funding_type == FundingType.UNKNOWN and not _has_core_funding_evidence(record):
+        return False, "funding listing lacks concrete funding evidence"
     if page_type in PERSISTABLE_PAGE_TYPES:
         return True, None
     if page_type == PAGE_TYPE_OPEN_CALL and has_fundable_support(record):
@@ -204,6 +293,10 @@ def mark_review_reasons(record: FundingProgrammeRecord) -> FundingProgrammeRecor
     haystack = _record_text(record)
     if record.funding_type == FundingType.UNKNOWN:
         reasons.append("funding_type is Unknown")
+    if _looks_like_generic_programme_listing(record):
+        reasons.append("programme_name is generic or institution-level")
+    if _looks_like_non_funding_programme(record):
+        reasons.append("source page resembles careers/procurement/non-funding content")
     if (record.ticket_min is not None or record.ticket_max is not None) and record.extraction_confidence.get("ticket_range", 1.0) < 0.7:
         reasons.append("amount evidence is weak")
     if page_type in REVIEW_PAGE_TYPES:
@@ -269,6 +362,29 @@ def _record_text(record: FundingProgrammeRecord) -> str:
         record.raw_terms_data,
         record.raw_application_data,
         record.notes,
+    ]
+    flattened = []
+    for part in parts:
+        if isinstance(part, list):
+            flattened.extend(str(item) for item in part)
+        elif part is not None:
+            flattened.append(str(part))
+    return clean_text(" ".join(flattened)).casefold()
+
+
+def _funding_evidence_text(record: FundingProgrammeRecord) -> str:
+    parts: Iterable[Any] = [
+        record.program_name,
+        record.parent_programme_name,
+        record.funding_lines,
+        record.raw_eligibility_data,
+        record.raw_eligibility_criteria,
+        record.raw_funding_offer_data,
+        record.raw_terms_data,
+        record.raw_application_data,
+        record.raw_documents_data,
+        record.required_documents,
+        record.related_documents,
     ]
     flattened = []
     for part in parts:

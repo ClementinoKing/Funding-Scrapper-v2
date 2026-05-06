@@ -81,7 +81,7 @@ def _run_seed_pipeline(
         settings=supabase_settings,
         adapter_registry=registry,
     )
-    sites = site_repository.load_sites()
+    sites = site_repository.load_sites(fallback_seed_file=PACKAGE_ROOT / "resources" / "source_sites.json")
     if not sites:
         typer.echo("No active sites were found in Supabase.")
         raise typer.Exit(code=1)

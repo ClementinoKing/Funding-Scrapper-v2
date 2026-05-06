@@ -97,3 +97,46 @@ def test_supabase_uploader_prefers_ai_enriched_records_on_tie() -> None:
 
     assert meta["discarded_duplicate_source_url_records"] == 1
     assert payload[0]["ai_enriched"] is True
+
+
+def test_supabase_upload_sanitizer_normalizes_repayment_frequency_for_legacy_constraint() -> None:
+    payload, meta = _sanitize_records_for_upload(
+        [
+            {
+                "source_url": "https://example.org/programmes/once-off",
+                "source_domain": "example.org",
+                "program_name": "Once Off Incentive",
+                "funder_name": "Example Fund",
+                "repayment_frequency": "Once-off",
+            }
+        ]
+    )
+
+    assert meta["sanitized_records"] == 1
+    assert payload[0]["repayment_frequency"] == "Variable"
+    assert any("Once-off to Variable" in note for note in payload[0]["notes"])
+
+
+def test_supabase_upload_sanitizer_removes_nested_null_bytes() -> None:
+    payload, meta = _sanitize_records_for_upload(
+        [
+            {
+                "source_url": "https://example.org/programmes/null-byte",
+                "source_domain": "example.org",
+                "program_name": "Null Byte\x00 Grant",
+                "funder_name": "Example Fund",
+                "raw_funding_offer_data": ["Funding support\x00 for qualifying firms."],
+                "raw_eligibility_data": ["Registered\x00 businesses"],
+                "raw_text_snippets": {"terms": ["Applications\x00 are open"]},
+            }
+        ]
+    )
+
+    serialized = json.dumps(payload)
+
+    assert meta["sanitized_records"] == 1
+    assert payload[0]["program_name"] == "Null Byte Grant"
+    assert payload[0]["raw_funding_offer_data"] == ["Funding support for qualifying firms."]
+    assert payload[0]["raw_eligibility_data"] == ["Registered businesses"]
+    assert payload[0]["raw_text_snippets"]["terms"] == ["Applications are open"]
+    assert "\\u0000" not in serialized

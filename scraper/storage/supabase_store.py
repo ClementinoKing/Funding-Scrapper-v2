@@ -16,6 +16,10 @@ from scraper.utils.text import clean_text, generate_program_id, looks_like_suppo
 from scraper.utils.urls import canonicalize_url
 
 
+LEGACY_REPAYMENT_FREQUENCY_VALUES = {"Weekly", "Monthly", "Variable", "Unknown"}
+POSTGRES_TEXT_UNSUPPORTED_CHARS = ("\x00",)
+
+
 def _normalize_record_identity(record: FundingProgrammeRecord) -> FundingProgrammeRecord:
     normalized = record.model_copy(deep=True)
     normalized.program_id = generate_program_id(normalized.source_domain, normalized.funder_name, normalized.program_name)
@@ -23,6 +27,36 @@ def _normalize_record_identity(record: FundingProgrammeRecord) -> FundingProgram
     normalized.program_slug = slugify(normalized.program_name or normalized.program_id, max_length=80)
     normalized.funder_slug = slugify(normalized.funder_name or normalized.source_domain, max_length=80)
     return FundingProgrammeRecord.model_validate(normalized.model_dump(mode="python"))
+
+
+def _normalize_payload_for_rpc(record: FundingProgrammeRecord) -> Dict[str, Any]:
+    payload = record.model_dump(mode="json")
+    repayment_frequency = clean_text(str(payload.get("repayment_frequency") or ""))
+    if repayment_frequency and repayment_frequency not in LEGACY_REPAYMENT_FREQUENCY_VALUES:
+        payload["repayment_frequency"] = "Variable"
+        notes = [clean_text(item) for item in payload.get("notes") or [] if clean_text(item)]
+        notes.append(
+            "Upload sanitizer normalized repayment_frequency from %s to Variable for Supabase constraint compatibility."
+            % repayment_frequency
+        )
+        payload["notes"] = list(dict.fromkeys(notes))
+    return _sanitize_payload_text(payload)
+
+
+def _sanitize_payload_text(value: Any) -> Any:
+    if isinstance(value, str):
+        sanitized = value
+        for unsupported_char in POSTGRES_TEXT_UNSUPPORTED_CHARS:
+            sanitized = sanitized.replace(unsupported_char, "")
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_payload_text(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _sanitize_payload_text(key) if isinstance(key, str) else key: _sanitize_payload_text(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _record_rank(record: FundingProgrammeRecord) -> Tuple[int, int, int, int, int, int, int]:
@@ -82,7 +116,7 @@ def _sanitize_records_for_upload(records: Any) -> Tuple[List[Dict[str, Any]], Di
         sanitized.append(winner)
         discarded_records += len(group) - 1
 
-    payload = [record.model_dump(mode="json") for record in sanitized]
+    payload = [_normalize_payload_for_rpc(record) for record in sanitized]
     meta = {
         "input_records": len(normalized_records),
         "sanitized_records": len(payload),

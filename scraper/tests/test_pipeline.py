@@ -125,6 +125,94 @@ def test_pipeline_runs_end_to_end_with_raw_content_and_classified_records(settin
     assert all(item["source_domain"] == "example.org" for item in payload)
 
 
+def test_fallback_classifier_splits_multi_program_listing(settings, fixture_dir: Path, tmp_path: Path) -> None:
+    html = (fixture_dir / "three_program_listing.html").read_text(encoding="utf-8")
+    page = _page(
+        "https://example.org/funding-products",
+        html,
+        "Funding Products - Growth Finance Agency",
+    )
+    parser = GenericFundingParser(settings)
+    document = parser.parse(page, allowed_domains=["example.org"])
+    classifier = AIClassifier(
+        {"disableRemoteAi": True, "industry_taxonomy": {}, "use_of_funds_taxonomy": {}},
+        storage=LocalJsonStore(tmp_path),
+    )
+
+    records = classifier.classify_document(document)
+
+    names = {record.program_name for record in records}
+    assert names == {"Youth Growth Grant", "Asset Finance Loan", "Expansion Equity Facility"}
+    assert {record.funding_type.value for record in records} == {"Grant", "Loan", "Equity"}
+    assert all(record.source_url == "https://example.org/funding-products" for record in records)
+    assert all(record.page_type == "funding_listing" for record in records)
+
+
+def test_pipeline_dedupes_multi_program_listing_with_detail_pages(settings, fixture_dir: Path) -> None:
+    listing_html = (fixture_dir / "three_program_listing.html").read_text(encoding="utf-8")
+    pages = {
+        "https://example.org/funding-products": _page(
+            "https://example.org/funding-products",
+            listing_html,
+            "Funding Products - Growth Finance Agency",
+        ),
+        "https://example.org/programmes/youth-growth-grant": _page(
+            "https://example.org/programmes/youth-growth-grant",
+            """
+            <html><body><main>
+              <h1>Youth Growth Grant</h1>
+              <p>Grant funding up to R250 000 for youth-owned startups.</p>
+              <h2>Eligibility</h2><p>Youth-owned South African businesses may apply.</p>
+            </main></body></html>
+            """,
+            "Youth Growth Grant - Growth Finance Agency",
+        ),
+        "https://example.org/programmes/asset-finance-loan": _page(
+            "https://example.org/programmes/asset-finance-loan",
+            """
+            <html><body><main>
+              <h1>Asset Finance Loan</h1>
+              <p>Loan funding from R500 000 to R5 million for machinery and equipment.</p>
+              <h2>Repayment</h2><p>Repayment terms are up to 60 months.</p>
+            </main></body></html>
+            """,
+            "Asset Finance Loan - Growth Finance Agency",
+        ),
+        "https://example.org/programmes/expansion-equity-facility": _page(
+            "https://example.org/programmes/expansion-equity-facility",
+            """
+            <html><body><main>
+              <h1>Expansion Equity Facility</h1>
+              <p>Equity investment facility for established SMEs expanding into new markets.</p>
+            </main></body></html>
+            """,
+            "Expansion Equity Facility - Growth Finance Agency",
+        ),
+    }
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=FixtureFetcher(pages),
+        browser_fetcher=None,
+    )
+
+    summary = pipeline.run(["https://example.org/funding-products"])
+    payload = json.loads((settings.output_path / "normalized" / "funding_programmes.json").read_text(encoding="utf-8"))
+    report = json.loads((settings.output_path / "logs" / "qa_coverage_report.json").read_text(encoding="utf-8"))
+
+    assert summary.pages_fetched_successfully == 4
+    assert summary.programmes_after_dedupe == 3
+    assert {item["program_name"] for item in payload} == {
+        "Youth Growth Grant",
+        "Asset Finance Loan",
+        "Expansion Equity Facility",
+    }
+    assert report[0]["multi_program_pages_detected"] == 1
+    assert report[0]["records_per_source_page"]["https://example.org/funding-products"] == 3
+    assert report[0]["max_records_from_single_page"] == 3
+
+
 def test_pipeline_does_not_persist_rejected_page_types(settings) -> None:
     page_url = "https://example.org/tenders/rfp-2025"
     record = FundingProgrammeRecord(
@@ -161,6 +249,49 @@ def test_pipeline_does_not_persist_rejected_page_types(settings) -> None:
     assert summary.programmes_after_dedupe == 0
     assert summary.records_rejected_for_quality == 1
     assert payload == []
+
+
+def test_pipeline_writes_qa_coverage_report(settings) -> None:
+    page_url = "https://example.org/programmes/growth-grant"
+    record = FundingProgrammeRecord(
+        program_name="Growth Grant",
+        funder_name="Example Agency",
+        source_url=page_url,
+        source_urls=[page_url],
+        source_domain="example.org",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type="Grant",
+        application_channel="Online form",
+        application_url="https://example.org/apply/growth-grant",
+        page_type="funding_programme",
+    )
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=FixtureFetcher(
+            {
+                page_url: _page(
+                    page_url,
+                    "<html><body><main><h1>Growth Grant</h1><p>Grant funding with online application.</p></main></body></html>",
+                    "Growth Grant",
+                )
+            }
+        ),
+        browser_fetcher=None,
+        ai_enhancer=StaticClassifier([record]),
+    )
+
+    summary = pipeline.run([page_url])
+    report = json.loads((settings.output_path / "logs" / "qa_coverage_report.json").read_text(encoding="utf-8"))
+
+    assert summary.programmes_after_dedupe == 1
+    assert report[0]["domain"] == "example.org"
+    assert report[0]["candidate_programme_pages"] == 1
+    assert report[0]["records_accepted"] == 1
+    assert report[0]["records_missing_funding_type"] == 0
+    assert report[0]["records_missing_application_route"] == 0
+    assert page_url in report[0]["source_urls"]
 
 
 def test_pipeline_resume_skips_completed_domains(settings, fixture_dir: Path) -> None:

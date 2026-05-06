@@ -432,6 +432,7 @@ class ScraperPipeline:
             fetch_time_weighted_total = 0.0
             fetch_time_weight = 0
             domain_telemetry: List[Dict[str, Any]] = []
+            qa_coverage_report: List[Dict[str, Any]] = []
 
             pending_targets: List[tuple[int, CrawlTarget]] = []
             for index, target in enumerate(targets, start=1):
@@ -550,21 +551,59 @@ class ScraperPipeline:
                         last_processed_domain=target.primary_domain,
                     )
                 )
-                domain_telemetry.append(
-                    {
-                        "domain": target.primary_domain,
-                        "adapter": result.adapter_key,
-                        "pages_fetched_successfully": int(stats.get("pages_fetched_successfully", 0)),
-                        "pages_failed": int(stats.get("pages_failed", 0)),
-                        "records_extracted": len(result.classified_records),
-                        "records_accepted": len(result.accepted_records),
-                        "records_reviewed": len(result.borderline_records),
-                        "records_rejected": result.rejected_count,
-                        "browser_fallback_count": int(stats.get("browser_fallback_count", 0)),
-                        "retry_count": int(stats.get("retry_count", 0)),
-                        "queue_saturation_count": int(stats.get("queue_saturation_count", 0)),
-                    }
+                record_source_urls = unique_preserve_order(
+                    [
+                        url
+                        for record in [
+                            *result.classified_records,
+                            *result.accepted_records,
+                            *result.borderline_records,
+                        ]
+                        for url in [record.source_url, *record.source_urls]
+                        if url
+                    ]
                 )
+                records_per_source_page: Dict[str, int] = {}
+                for record in result.classified_records:
+                    if not record.source_url:
+                        continue
+                    records_per_source_page[record.source_url] = records_per_source_page.get(record.source_url, 0) + 1
+                multi_program_pages_detected = sum(1 for count in records_per_source_page.values() if count > 1)
+                max_records_from_single_page = max(records_per_source_page.values()) if records_per_source_page else 0
+                domain_report = {
+                    "site_key": target.key,
+                    "display_name": target.label,
+                    "domain": target.primary_domain,
+                    "adapter": result.adapter_key,
+                    "seed_urls": list(target.seed_urls),
+                    "pages_fetched_successfully": int(stats.get("pages_fetched_successfully", 0)),
+                    "pages_failed": int(stats.get("pages_failed", 0)),
+                    "candidate_programme_pages": len({record.source_url for record in result.classified_records if record.source_url}),
+                    "multi_program_pages_detected": multi_program_pages_detected,
+                    "records_per_source_page": dict(sorted(records_per_source_page.items())),
+                    "max_records_from_single_page": max_records_from_single_page,
+                    "records_extracted": len(result.classified_records),
+                    "records_accepted": len(result.accepted_records),
+                    "records_reviewed": len(result.borderline_records),
+                    "records_rejected": result.rejected_count,
+                    "records_missing_funding_type": sum(
+                        1 for record in [*result.accepted_records, *result.borderline_records] if record.funding_type == FundingType.UNKNOWN
+                    ),
+                    "records_missing_application_route": sum(
+                        1
+                        for record in [*result.accepted_records, *result.borderline_records]
+                        if record.application_channel == ApplicationChannel.UNKNOWN and not record.application_url
+                    ),
+                    "browser_fallback_count": int(stats.get("browser_fallback_count", 0)),
+                    "retry_count": int(stats.get("retry_count", 0)),
+                    "queue_saturation_count": int(stats.get("queue_saturation_count", 0)),
+                    "source_urls": record_source_urls,
+                    "warnings": result.warnings,
+                    "errors": result.errors,
+                    "completed": result.completed,
+                }
+                domain_telemetry.append(domain_report)
+                qa_coverage_report.append(domain_report)
 
                 self.logger.info(
                     "domain_completed" if result.completed else "domain_failed",
@@ -618,6 +657,8 @@ class ScraperPipeline:
                 warnings=aggregate_warnings,
             )
             self.storage.write_run_summary(summary)
+            if hasattr(self.storage, "write_qa_coverage_report"):
+                self.storage.write_qa_coverage_report(qa_coverage_report)
             self.logger.info("pipeline_completed", run_id=run_id, summary=summary.model_dump(mode="json"))
             return summary
         finally:

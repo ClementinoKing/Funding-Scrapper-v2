@@ -85,6 +85,19 @@ def _load_seed_urls_from_file(seed_file: Path) -> List[str]:
     return unique_preserve_order(urls)
 
 
+def _load_site_rows_from_file(seed_file: Path) -> List[Dict[str, Any]]:
+    payload = json.loads(seed_file.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        if item.get("site_key") or item.get("primary_domain") or item.get("adapter_config"):
+            rows.append(dict(item))
+    return rows
+
+
 @dataclass(frozen=True)
 class SiteDefinition:
     """One crawl target loaded from the `sites` table."""
@@ -178,6 +191,14 @@ class SiteRepository:
             return [row for row in payload if isinstance(row, dict)]
 
     def _load_local_sites(self, seed_file: Path) -> List[SiteDefinition]:
+        rows = _load_site_rows_from_file(seed_file)
+        if rows:
+            return [
+                SiteDefinition.from_row(row, adapter_registry=self.adapter_registry)
+                for row in rows
+                if _coerce_bool(row.get("active", True))
+            ]
+
         seed_urls = _load_seed_urls_from_file(seed_file)
         grouped: Dict[str, Dict[str, Any]] = {}
         for seed_url in seed_urls:

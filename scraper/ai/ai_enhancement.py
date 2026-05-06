@@ -35,6 +35,7 @@ from scraper.schemas import (
     GeographyScope,
     InterestType,
     PageContentDocument,
+    PageContentSection,
     PageAIRecordSnapshot,
     ProgrammeStatus,
     RepaymentFrequency,
@@ -474,6 +475,17 @@ class FieldEvidenceBundle:
     field_values: Dict[str, Any] = field(default_factory=dict)
     validation_errors: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class FallbackProgrammeCandidate:
+    """One deterministic programme block found on a listing-like page."""
+
+    label: str
+    content: str
+    source_scope: str
+    source_section: Optional[str] = None
+
 
 # Normalization helpers convert loose upstream values into compact text, numeric,
 # and enum shapes before any AI prompt or record payload is assembled.
@@ -1051,6 +1063,203 @@ def _build_content_items_from_document(document: PageContentDocument) -> List[Co
             confidence_hint=0.6,
         )
     return items
+
+
+FALLBACK_CANDIDATE_SIGNAL_TERMS = (
+    "fund",
+    "funding",
+    "grant",
+    "loan",
+    "finance",
+    "financial",
+    "equity",
+    "investment",
+    "facility",
+    "incentive",
+    "voucher",
+    "working capital",
+    "seed capital",
+    "repayment",
+    "interest",
+    "eligibility",
+    "qualifying",
+    "apply",
+    "application",
+    "amount",
+    "ticket",
+)
+FALLBACK_DIRECT_FUNDING_TERMS = (
+    "fund",
+    "funding",
+    "grant",
+    "loan",
+    "finance",
+    "equity",
+    "investment",
+    "facility",
+    "incentive",
+    "voucher",
+    "capital",
+)
+FALLBACK_BLOCK_EXCLUDE_TERMS = (
+    "career",
+    "careers",
+    "vacancy",
+    "vacancies",
+    "graduate",
+    "internship",
+    "internships",
+    "bursary",
+    "bursaries",
+    "procurement",
+    "tender",
+    "rfp",
+    "rfq",
+    "news",
+    "media",
+    "press release",
+    "privacy",
+    "contact us",
+)
+FALLBACK_GENERIC_CANDIDATE_LABELS = INVALID_PROGRAMME_NAME_TERMS | {
+    "applications",
+    "application process",
+    "criteria",
+    "documents",
+    "eligibility",
+    "funding offer",
+    "funding products",
+    "funding solutions",
+    "funding terms",
+    "how to apply",
+    "paperwork needed",
+    "required documents",
+    "repayment",
+    "terms",
+    "terms and conditions",
+}
+
+
+def _candidate_label_from_block(label: str, content: str) -> Optional[str]:
+    cleaned = strip_leading_numbered_prefix(clean_text(label or ""))
+    cleaned = re.sub(r"\s+(?:learn more|view facility|apply now|read more)\b.*$", "", cleaned, flags=re.I)
+    cleaned = clean_text(cleaned)
+    if not cleaned:
+        return None
+    lowered = cleaned.casefold()
+    if lowered in FALLBACK_GENERIC_CANDIDATE_LABELS:
+        return None
+    if looks_like_support_title(cleaned):
+        return None
+    if len(cleaned) < 4 or len(cleaned) > 110:
+        return None
+    if len(cleaned.split()) > 12:
+        return None
+    return cleaned
+
+
+def _fallback_candidate_has_fundable_signal(label: str, content: str) -> bool:
+    haystack = clean_text(" ".join([label, content])).casefold()
+    return any(term in haystack for term in FALLBACK_CANDIDATE_SIGNAL_TERMS)
+
+
+def _fallback_candidate_is_excluded(label: str, content: str) -> bool:
+    haystack = clean_text(" ".join([label, content])).casefold()
+    if not any(term in haystack for term in FALLBACK_BLOCK_EXCLUDE_TERMS):
+        return False
+    return not any(term in haystack for term in FALLBACK_DIRECT_FUNDING_TERMS)
+
+
+def _fallback_link_matches_label(link: str, label: str) -> bool:
+    lowered_link = clean_text(link).casefold()
+    tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", clean_text(label).casefold())
+        if len(token) >= 4 and token not in {"fund", "loan", "grant", "finance", "facility", "programme", "program"}
+    ]
+    if not tokens:
+        return False
+    return any(token in lowered_link for token in tokens)
+
+
+def _document_for_fallback_candidate(document: PageContentDocument, candidate: FallbackProgrammeCandidate) -> PageContentDocument:
+    related_links = unique_preserve_order(
+        [
+            link
+            for link in [*document.discovered_links, *document.internal_links, *document.document_links]
+            if _fallback_link_matches_label(link, candidate.label)
+        ]
+    )
+    application_links = unique_preserve_order(
+        [
+            link
+            for link in document.application_links
+            if _fallback_link_matches_label(link, candidate.label)
+        ]
+    )
+    original_title = document.title or document.page_title or ""
+    title_suffix = ""
+    if " - " in original_title:
+        title_suffix = original_title.split(" - ", 1)[1].strip()
+    elif " | " in original_title:
+        title_suffix = original_title.split(" | ", 1)[1].strip()
+    candidate_title = f"{candidate.label} - {title_suffix}" if title_suffix else candidate.label
+    return PageContentDocument(
+        page_url=document.page_url,
+        title=candidate_title,
+        page_title=candidate_title,
+        source_content_type=document.source_content_type,
+        headings=[candidate.label],
+        full_body_text=candidate.content,
+        structured_sections=[
+            PageContentSection(
+                heading=candidate.label,
+                content=candidate.content,
+            )
+        ],
+        interactive_sections=[],
+        discovered_links=related_links,
+        internal_links=related_links,
+        application_links=application_links,
+        document_links=[link for link in document.document_links if _fallback_link_matches_label(link, candidate.label)],
+        document_evidence=document.document_evidence,
+        main_content_hint=document.main_content_hint,
+        source_domain=document.source_domain,
+    )
+
+
+def _collect_fallback_programme_candidates(document: PageContentDocument) -> List[FallbackProgrammeCandidate]:
+    candidates: List[FallbackProgrammeCandidate] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(label: str, content: str, source_scope: str, source_section: Optional[str] = None) -> None:
+        cleaned_content = clean_text(content)
+        candidate_label = _candidate_label_from_block(label, cleaned_content)
+        if not candidate_label or not cleaned_content:
+            return
+        if not _fallback_candidate_has_fundable_signal(candidate_label, cleaned_content):
+            return
+        if _fallback_candidate_is_excluded(candidate_label, cleaned_content):
+            return
+        signature = (candidate_label.casefold(), compact_document_text(cleaned_content, max_chars=280).casefold())
+        if signature in seen:
+            return
+        seen.add(signature)
+        candidates.append(
+            FallbackProgrammeCandidate(
+                label=candidate_label,
+                content=cleaned_content,
+                source_scope=source_scope,
+                source_section=source_section or candidate_label,
+            )
+        )
+
+    for section in document.structured_sections:
+        add(section.heading, section.content, "structured_sections", section.heading)
+    for section in document.interactive_sections:
+        add(section.label, section.content, section.type or "interactive_sections", section.label)
+
+    return candidates
 
 
 def _merge_snippet_map(target: Dict[str, List[str]], source: Dict[str, List[str]]) -> Dict[str, List[str]]:
@@ -3642,14 +3851,21 @@ class AIClassifier:
             raise ValueError("AI response must be a JSON object.")
         return AIClassificationResponse.model_validate(payload)
 
-    def _fallback_classify(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
+    def _fallback_classify_single(
+        self,
+        document: PageContentDocument,
+        *,
+        forced_page_type: Optional[str] = None,
+        fallback_note: str = "Fallback classification used because no AI key was configured.",
+    ) -> List[FundingProgrammeRecord]:
         # If remote AI is unavailable, fall back to deterministic heuristics so
         # the pipeline still produces a best-effort record instead of failing.
         document = self._prepare_document_context(document)
-        page_decision, decision_reasons = _page_decision_hint(document)
-        if page_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
-            logger.info("fallback_rejected_non_program_page", page_url=document.page_url, reasons=decision_reasons)
-            return []
+        if not forced_page_type:
+            page_decision, decision_reasons = _page_decision_hint(document)
+            if page_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
+                logger.info("fallback_rejected_non_program_page", page_url=document.page_url, reasons=decision_reasons)
+                return []
         derived = _derive_page_evidence(document)
         document_context = _document_evidence_context(document)
         content_bundle = _document_content_annotation_bundle(document)
@@ -3735,7 +3951,7 @@ class AIClassifier:
             ]
         )
 
-        page_type = _classify_enhancer_page_type(
+        page_type = forced_page_type or _classify_enhancer_page_type(
             record_count=1,
             candidate_block_count=max(1, len(document.structured_sections) or len(document.headings) or 1),
             internal_link_count=len(document.internal_links),
@@ -3811,7 +4027,7 @@ class AIClassifier:
             notes=unique_preserve_order(
                 [
                     *document_context["notes"],
-                    "Fallback classification used because no AI key was configured.",
+                    fallback_note,
                 ]
             ),
             ai_enriched=False,
@@ -3825,6 +4041,30 @@ class AIClassifier:
         record = _apply_record_review_flags(record)
         finalized = _finalize_record_acceptance(record)
         return [finalized] if finalized else []
+
+    def _fallback_classify(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
+        document = self._prepare_document_context(document)
+        page_decision, decision_reasons = _page_decision_hint(document)
+        if page_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
+            logger.info("fallback_rejected_non_program_page", page_url=document.page_url, reasons=decision_reasons)
+            return []
+
+        candidates = _collect_fallback_programme_candidates(document)
+        if len(candidates) > 1:
+            records: List[FundingProgrammeRecord] = []
+            for candidate in candidates:
+                candidate_document = _document_for_fallback_candidate(document, candidate)
+                records.extend(
+                    self._fallback_classify_single(
+                        candidate_document,
+                        forced_page_type=PAGE_TYPE_FUNDING_LISTING,
+                        fallback_note="Fallback multi-program candidate classification used because no AI key was configured.",
+                    )
+                )
+            if records:
+                return records
+
+        return self._fallback_classify_single(document)
 
     def classify_document(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
         # This is the main AI path: prepare context, call the model, retry on
