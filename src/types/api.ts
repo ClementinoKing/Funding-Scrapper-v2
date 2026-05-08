@@ -69,6 +69,7 @@ export interface UserProfileView {
   owner_country?: string;
   owner_province?: string;
   owner_postal_code?: string;
+  profile_completeness?: number;
 
   // Financials
   finance_type?: string;

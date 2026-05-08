@@ -7,10 +7,10 @@ export interface NavItem {
 
 export const navByRole: Record<Role, NavItem[]> = {
   applicant: [
-    { label: "Overview", path: "/app/dashboard" },
+    { label: "Home", path: "/app/dashboard" },
     { label: "My Profile", path: "/app/profile" },
-    { label: "Programs", path: "/app/programs" },
-    { label: "My Matches", path: "/app/matches" },
+    { label: "All Programs", path: "/app/programs" },
+    // { label: "My Matches", path: "/app/matches" },
     { label: "Notifications", path: "/app/notifications" }
   ],
   admin: [

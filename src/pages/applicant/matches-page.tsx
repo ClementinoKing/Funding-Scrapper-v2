@@ -12,8 +12,18 @@ import { ProgramCard } from "@/components/shared/program-card";
 import { Button } from "@/components/ui/button";
 import { RefreshCw } from "lucide-react";
 import { ViewToggle } from "@/components/shared/view-toggle";
+import { StatCard } from "@/components/shared/stat-card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { useNavigate } from "react-router-dom";
 
 export function MatchesPage() {
+  const navigate = useNavigate();
   const { data: profile } = useProfile();
 
   const [matches, setMatches] = useState<any[]>([]);
@@ -111,6 +121,11 @@ export function MatchesPage() {
   useEffect(() => {
     if (!userProfile?.business_id) return;
 
+    if((userProfile?.profile_completeness || 0) < 80) {
+      return;
+    }
+
+    
     const init = async () => {
       setLoading(true);
 
@@ -141,13 +156,12 @@ export function MatchesPage() {
   // ---------------- OTHERS -------------
   const matchStats = {
     total: matches.length,
-    excellent: matches.filter((m) => m.match_score >= 80).length,
-    good: matches.filter((m) => m.match_score >= 60 && m.match_score < 80)
+    good: matches.filter((m) => m.final_score >= 60)
       .length,
     averageScore:
       matches.length > 0
         ? Math.round(
-            matches.reduce((sum, m) => sum + m.match_score, 0) / matches.length,
+            matches.reduce((sum, m) => sum + m.final_score, 0) / matches.length,
           )
         : 0,
   };
@@ -169,25 +183,44 @@ export function MatchesPage() {
 
   return (
     <div>
+
+      <Dialog open={(userProfile?.profile_completeness || 0) < 80} onOpenChange={() => {}}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Profile Not Complete</DialogTitle>
+            <DialogDescription>
+              Please complete your profile to see your matches and access funding opportunities. Click the button below to go to your profile page and fill in the missing details. The more complete your profile, the better your match quality and funding chances!
+            </DialogDescription>
+          </DialogHeader>
+          <Button onClick={() => navigate('/app/profile')}>Go to Profile</Button>
+        </DialogContent>
+      </Dialog>
+
       <SectionHeader
-        title="Match Results"
-        description="Computed matches from funding programs."
+        title="Applicant Dashboard"
+        description="See your profile readiness, latest matches, and Computed matches from funding programs."
       />
 
+      <div className="grid gap-4 md:grid-cols-4">
+        <StatCard
+          label="Profile completeness"
+          value={`${userProfile?.profile_completeness ?? 0}%`}
+          caption="Aim for 90%+ to improve match quality"
+        />
+        <StatCard
+          label="Qualified opportunities"
+          value={String(matches?.length ?? 0)}
+          caption="Updated from the latest matching run"
+        />
+        <StatCard label="Good Matches" value={String(matchStats.good)} caption="Matches with a score of 60 or higher" />
+
+        <StatCard label="Average Score" value={String(matchStats.averageScore)} caption="Average score of your matches" />
+      </div>
+
       {/* Controls Bar */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 my-6">
         {/* Actions */}
         <div className="flex flex-col sm:flex-row gap-2 pt-2">
-          <Button
-            onClick={() => triggerMatching(true)}
-            disabled={refreshing}
-            className="gap-2"
-          >
-            <RefreshCw
-              className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`}
-            />
-            Refresh Matches (AI)
-          </Button>
           <Button
             variant="outline"
             onClick={() => triggerMatching(false)}
@@ -197,7 +230,17 @@ export function MatchesPage() {
             <RefreshCw
               className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`}
             />
-            Quick Refresh
+            Refresh Matches
+          </Button>
+          <Button
+            onClick={() => triggerMatching(true)}
+            disabled={refreshing}
+            className="gap-2"
+          >
+            <RefreshCw
+              className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`}
+            />
+            Refresh Matches (With AI)
           </Button>
           <Button variant="ghost" onClick={loadMatches} disabled={loading}>
             Check Matches
