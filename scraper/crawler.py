@@ -22,7 +22,7 @@ from scraper.schemas import CrawlTraceEntry, PageContentDocument, PageFetchResul
 from scraper.storage.interfaces import StorageBackend
 from scraper.utils.logging import get_logger
 from scraper.utils.text import unique_preserve_order
-from scraper.utils.urls import canonicalize_url, extract_host, is_internal_url, looks_irrelevant_url, score_url_relevance
+from scraper.utils.urls import canonicalize_url, extract_host, is_internal_url, is_probably_document_url, looks_irrelevant_url, score_url_relevance
 from scraper.utils.quality import score_programme_quality
 
 
@@ -111,6 +111,8 @@ class Crawler:
 
     def _browser_fallback_reason(self, page: PageFetchResult, adapter: Optional[SiteAdapter]) -> Optional[str]:
         if not self.browser_fetcher:
+            return None
+        if is_probably_document_url(page.requested_url or page.canonical_url or page.final_url or page.url):
             return None
         if adapter and adapter.should_use_browser(page):
             return "adapter-browser-rule"

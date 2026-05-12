@@ -295,6 +295,53 @@ def test_crawler_uses_browser_fallback_on_forbidden_response(settings) -> None:
     assert "restricted-or-rate-limited-status" in trace
 
 
+def test_crawler_does_not_browser_fetch_document_urls_even_when_adapter_requires_browser(settings) -> None:
+    pdf_url = "https://www.pic.gov.za/assets/funding-form.pdf"
+    pdf_page = PageFetchResult(
+        url=pdf_url,
+        requested_url=pdf_url,
+        canonical_url=pdf_url,
+        final_url=pdf_url,
+        status_code=200,
+        content_type="application/pdf",
+        html="Funding form",
+        title="Funding form",
+        fetch_method="http",
+        headers={"content-type": "application/pdf"},
+        js_rendered=False,
+        notes=[],
+    )
+    fetcher = FixtureFetcher({pdf_url: pdf_page})
+    browser_fetcher = TrackingBrowserFetcher(_page(pdf_url, "<html></html>", "Browser document"))
+    pipeline = ScraperPipeline(
+        settings=settings,
+        storage=LocalJsonStore(settings.output_path),
+        parser=GenericFundingParser(settings),
+        http_fetcher=fetcher,
+        browser_fetcher=browser_fetcher,
+    )
+
+    summary = pipeline.run_sites(
+        [
+            SiteDefinition(
+                site_key="pic",
+                display_name="PIC",
+                primary_domain="www.pic.gov.za",
+                adapter_key="generic",
+                seed_urls=(pdf_url,),
+                adapter_config={
+                    "allowed_path_prefixes": ["/assets"],
+                    "playwright_required_by_default": True,
+                    "force_browser_url_terms": ["pic.gov.za"],
+                },
+            )
+        ]
+    )
+
+    assert summary.pages_fetched_successfully == 1
+    assert browser_fetcher.calls == []
+
+
 def test_crawler_treats_www_and_root_domain_as_same_site(settings) -> None:
     home = _page(
         "https://example.org/",

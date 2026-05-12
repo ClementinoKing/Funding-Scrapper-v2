@@ -571,7 +571,7 @@ class AIProgrammeDraft(BaseModel):
     @field_validator("raw_text_snippets", "extraction_confidence", mode="before")
     @classmethod
     def _normalize_mapping_fields(cls, value: Any) -> Dict[str, Any]:
-        return value or {}
+        return value if isinstance(value, dict) else {}
 
 
 class AIClassificationResponse(BaseModel):
@@ -582,6 +582,18 @@ class AIClassificationResponse(BaseModel):
     page_decision_confidence: Optional[float] = None
     records: List[AIProgrammeDraft] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _normalize_notes(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            cleaned = clean_text(value)
+            return [cleaned] if cleaned else []
+        if isinstance(value, list):
+            return [clean_text(str(item)) for item in value if clean_text(str(item))]
+        return []
 
 
 class AIMergeDecisionResponse(BaseModel):

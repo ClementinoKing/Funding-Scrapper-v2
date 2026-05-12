@@ -140,3 +140,38 @@ def test_supabase_upload_sanitizer_removes_nested_null_bytes() -> None:
     assert payload[0]["raw_eligibility_data"] == ["Registered businesses"]
     assert payload[0]["raw_text_snippets"]["terms"] == ["Applications are open"]
     assert "\\u0000" not in serialized
+
+
+def test_supabase_upload_sanitizer_preserves_web_search_metadata() -> None:
+    payload, meta = _sanitize_records_for_upload(
+        [
+            {
+                "source_url": "https://example.org/programmes/search-programme",
+                "source_domain": "example.org",
+                "source_page_title": "Search Programme",
+                "program_name": "Search Programme",
+                "funder_name": "Example Fund",
+                "raw_text_snippets": {
+                    "web_search_metadata": [
+                        "source_type=official_website",
+                        "extracted_from_search=true",
+                        "confidence_score=91",
+                    ]
+                },
+                "evidence_by_field": {
+                    "web_search_metadata": [
+                        "source_type=official_website",
+                        "extracted_from_search=true",
+                    ]
+                },
+                "extraction_confidence": {"program_name": 0.91, "source_url": 0.91},
+                "notes": ["OpenAI Web Search extraction.", "confidence_score=91"],
+            }
+        ]
+    )
+
+    assert meta["sanitized_records"] == 1
+    assert payload[0]["raw_text_snippets"]["web_search_metadata"][1] == "extracted_from_search=true"
+    assert payload[0]["evidence_by_field"]["web_search_metadata"][0] == "source_type=official_website"
+    assert payload[0]["extraction_confidence"]["program_name"] == 0.91
+    assert "confidence_score=91" in payload[0]["notes"]

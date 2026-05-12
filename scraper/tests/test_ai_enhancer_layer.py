@@ -128,6 +128,67 @@ def test_ai_enhancer_rejects_listing_with_unknown_funding_type() -> None:
     assert records == []
 
 
+def test_ai_enhancer_rejects_faq_support_record_with_unknown_funding_type() -> None:
+    document = PageContentDocument(
+        page_url="https://www.pic.gov.za/faq-isibaya",
+        title="Isibaya FAQ",
+        page_title="Isibaya FAQ",
+        source_domain="pic.gov.za",
+        full_body_text="Frequently asked questions about Isibaya applications.",
+    )
+    classifier = StubClassifier(
+        {
+            "page_decision": "funding_program",
+            "page_type": "funding_programme",
+            "records": [
+                {
+                    "program_name": "Isibaya",
+                    "funder_name": "Public Investment Corporation",
+                    "funding_type": "Unknown",
+                }
+            ],
+            "notes": [],
+        }
+    )
+
+    records = classifier.classify_document(document)
+
+    assert records == []
+
+
+def test_ai_enhancer_accepts_recoverable_response_shape_variants() -> None:
+    document = PageContentDocument(
+        page_url="https://example.org/programmes/green-grant",
+        title="Green Grant",
+        page_title="Green Grant",
+        source_domain="example.org",
+        full_body_text="Green Grant offers grant funding up to R1 million for SMEs. Apply online.",
+        structured_sections=[PageContentSection(heading="Funding", content="Grant funding up to R1 million for SMEs.")],
+    )
+    classifier = StubClassifier(
+        {
+            "page_decision": "funding_program",
+            "page_type": "funding_programme",
+            "records": [
+                {
+                    "program_name": "Green Grant",
+                    "funder_name": "Example Agency",
+                    "funding_type": "Grant",
+                    "ticket_max": 1000000,
+                    "extraction_confidence": 0.95,
+                    "raw_funding_offer_data": ["Grant funding up to R1 million for SMEs."],
+                }
+            ],
+            "notes": "",
+        }
+    )
+
+    records = classifier.classify_document(document)
+
+    assert len(records) == 1
+    assert records[0].program_name == "Green Grant"
+
+
 def test_ai_enhancer_forces_review_for_listing_even_with_known_funding_type() -> None:
     document = PageContentDocument(
         page_url="https://example.org/funding-opportunities/green-grant",

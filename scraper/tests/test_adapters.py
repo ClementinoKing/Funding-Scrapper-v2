@@ -336,6 +336,21 @@ def test_sharepoint_portal_profile_resolves_relative_seed_urls() -> None:
     ]
 
 
+def test_pic_adapter_has_direct_funding_route_seeds() -> None:
+    registry = build_default_registry()
+    configured = registry.build_for_site(
+        adapter_key="pic",
+        primary_domain="www.pic.gov.za",
+        config={},
+    )
+
+    seeds = configured.default_seed_urls_for_domain("www.pic.gov.za")
+
+    assert "https://www.pic.gov.za/isibaya" in seeds
+    assert "https://www.pic.gov.za/apply-for-funding/isibaya" in seeds
+    assert configured.should_allow_url("https://www.pic.gov.za/isibaya")
+
+
 def test_pipeline_applies_site_adapter_config_to_narrow_crawls(settings, monkeypatch) -> None:
     monkeypatch.setattr("scraper.pipeline.add_application_verification_note", lambda record, timeout_seconds: record)
 

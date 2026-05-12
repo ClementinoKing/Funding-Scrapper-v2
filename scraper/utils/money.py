@@ -17,6 +17,7 @@ CURRENCY_MAP = {
     "USD": "USD",
     "EUR": "EUR",
     "£": "GBP",
+    "MK": "MWK",
 }
 
 SCALE_MAP = {
@@ -31,7 +32,7 @@ SCALE_MAP = {
 }
 
 MONEY_TOKEN_RE = re.compile(
-    r"(?P<currency>ZAR|US\$|USD|EUR|GBP|R|\$|£)?\s*"
+    r"(?P<currency>ZAR|US\$|USD|EUR|GBP|MK|R|\$|£)?\s*"
     r"(?P<number>\d[\d\s,]*(?:\.\d+)?)\s*"
     r"(?P<scale>thousand|million|billion|mn|bn|k|m|b)?\b",
     re.I,

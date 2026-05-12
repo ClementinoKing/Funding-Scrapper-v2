@@ -85,6 +85,10 @@ PAGE_DECISION_FUNDING_PROGRAM = "funding_program"
 PAGE_DECISION_NOT_FUNDING_PROGRAM = "not_funding_program"
 PAGE_DECISION_UNCLEAR = "unclear"
 COMMON_TLDS = {"com", "co", "org", "net", "za", "gov", "edu", "ac", "io", "biz", "info", "co.za", "org.za", "gov.za"}
+DOMAIN_FUNDER_ALIASES = {
+    "pic.gov.za": "Public Investment Corporation",
+    "www.pic.gov.za": "Public Investment Corporation",
+}
 PROGRAMME_SIGNAL_TERMS = (
     "funding",
     "fund",
@@ -178,6 +182,7 @@ REVIEW_REASON_UNCONFIRMED_PAGE_TYPE = "unconfirmed_page_type"
 REVIEW_REASON_INVALID_PROGRAM_NAME = "invalid_program_name"
 REVIEW_REASON_INVALID_FUNDER_NAME = "invalid_funder_name"
 REVIEW_REASON_LISTING_UNKNOWN_FUNDING_TYPE = "listing_unknown_funding_type"
+REVIEW_REASON_SUPPORT_UNKNOWN_FUNDING_TYPE = "support_unknown_funding_type"
 REVIEW_REASON_UNFUNDABLE_OPEN_CALL = "unfundable_open_call"
 MONEY_INVALID_CONTEXT_RE = re.compile(
     r"\b(?:tender number|bid number|rfp|rfq|procurement|telephone|phone|fax|postal code|postcode|trl|technology readiness level)\b",
@@ -1132,6 +1137,7 @@ FALLBACK_GENERIC_CANDIDATE_LABELS = INVALID_PROGRAMME_NAME_TERMS | {
     "funding solutions",
     "funding terms",
     "how to apply",
+    "important information",
     "paperwork needed",
     "required documents",
     "repayment",
@@ -1260,6 +1266,49 @@ def _collect_fallback_programme_candidates(document: PageContentDocument) -> Lis
         add(section.label, section.content, section.type or "interactive_sections", section.label)
 
     return candidates
+
+
+def _normalized_candidate_name(value: Optional[str]) -> str:
+    return strip_leading_numbered_prefix(clean_text(value or "")).casefold()
+
+
+def _programme_name_matches_candidate(program_name: Optional[str], candidate_label: str) -> bool:
+    program = _normalized_candidate_name(program_name)
+    candidate = _normalized_candidate_name(candidate_label)
+    if not program or not candidate:
+        return False
+    if program == candidate:
+        return True
+    generic_tokens = {"fund", "funding", "programme", "program", "facility", "finance", "investment"}
+    program_tokens = {token for token in re.split(r"[^a-z0-9]+", program) if len(token) >= 4 and token not in generic_tokens}
+    candidate_tokens = {token for token in re.split(r"[^a-z0-9]+", candidate) if len(token) >= 4 and token not in generic_tokens}
+    if not program_tokens or not candidate_tokens:
+        return False
+    overlap = program_tokens & candidate_tokens
+    return len(overlap) >= min(len(program_tokens), len(candidate_tokens))
+
+
+def _is_listing_aggregate_record(record: FundingProgrammeRecord, document: PageContentDocument, candidates: Sequence[FallbackProgrammeCandidate]) -> bool:
+    program_name = _normalized_candidate_name(record.program_name)
+    if not program_name:
+        return False
+    if any(_programme_name_matches_candidate(record.program_name, candidate.label) for candidate in candidates):
+        return False
+    title = _normalized_candidate_name(document.title or document.page_title)
+    listing_terms = {"funding", "funding opportunities", "programmes", "programs", "products", "isibaya"}
+    if normalize_page_type(record.page_type) == PAGE_TYPE_FUNDING_LISTING:
+        return True
+    if title and (program_name == title or program_name in title or title in program_name):
+        return True
+    return program_name in listing_terms or any(term in program_name for term in ("listing", "funding products", "funding opportunities"))
+
+
+def _is_domain_navigation_homepage(document: PageContentDocument) -> bool:
+    path = urlparse(document.page_url).path.rstrip("/")
+    if path not in {"", "/"}:
+        return False
+    domain = (document.source_domain or extract_domain(document.page_url) or "").lower().removeprefix("www.")
+    return domain in {"pic.gov.za"}
 
 
 def _merge_snippet_map(target: Dict[str, List[str]], source: Dict[str, List[str]]) -> Dict[str, List[str]]:
@@ -1817,7 +1866,13 @@ def _humanize_source_domain(domain: Optional[str]) -> Optional[str]:
     cleaned = clean_text(domain or "")
     if not cleaned:
         return None
+    alias = DOMAIN_FUNDER_ALIASES.get(cleaned.lower().removeprefix("https://").removeprefix("http://").strip("/"))
+    if alias:
+        return alias
     host = cleaned.lower().removeprefix("www.")
+    alias = DOMAIN_FUNDER_ALIASES.get(host)
+    if alias:
+        return alias
     parts = [part for part in host.split(".") if part]
     while parts and parts[-1] in COMMON_TLDS:
         parts.pop()
@@ -2308,6 +2363,12 @@ def _finalize_record_acceptance(record: FundingProgrammeRecord) -> Optional[Fund
     if page_type == PAGE_TYPE_FUNDING_LISTING and record.funding_type == FundingType.UNKNOWN:
         record = _add_review_reason(record, REVIEW_REASON_LISTING_UNKNOWN_FUNDING_TYPE, "Rejected listing-derived record because funding type remained Unknown.")
         logger.info("ai_record_rejected_listing_unknown_funding_type", source_url=record.source_url, program_name=record.program_name)
+        return None
+
+    path = urlparse(record.source_url).path.casefold()
+    if record.funding_type == FundingType.UNKNOWN and re.search(r"(?:^|/)(?:faq|faqs|frequently-asked-questions)(?:-|/|$)", path):
+        record = _add_review_reason(record, REVIEW_REASON_SUPPORT_UNKNOWN_FUNDING_TYPE, "Rejected support/FAQ record because funding type remained Unknown.")
+        logger.info("ai_record_rejected_support_unknown_funding_type", source_url=record.source_url, program_name=record.program_name)
         return None
 
     valid_program_name = _looks_like_valid_programme_name(record.program_name)
@@ -3888,7 +3949,7 @@ class AIClassifier:
             funding_type = FundingType.GRANT
         elif "loan" in lowered or "debt" in lowered:
             funding_type = FundingType.LOAN
-        elif "equity" in lowered or "shareholding" in lowered:
+        elif "equity" in lowered or "shareholding" in lowered or "investment" in lowered:
             funding_type = FundingType.EQUITY
         elif "guarantee" in lowered:
             funding_type = FundingType.GUARANTEE
@@ -4066,6 +4127,49 @@ class AIClassifier:
 
         return self._fallback_classify_single(document)
 
+    def _recover_missing_listing_records(
+        self,
+        document: PageContentDocument,
+        records: Sequence[FundingProgrammeRecord],
+    ) -> List[FundingProgrammeRecord]:
+        if urlparse(document.page_url).path.rstrip("/") in {"", "/"}:
+            return list(records)
+        candidates = _collect_fallback_programme_candidates(document)
+        if len(candidates) <= 1:
+            return list(records)
+
+        recovered_records: List[FundingProgrammeRecord] = []
+        existing_records = list(records)
+        for candidate in candidates:
+            if any(_programme_name_matches_candidate(record.program_name, candidate.label) for record in existing_records):
+                continue
+            candidate_document = _document_for_fallback_candidate(document, candidate)
+            recovered_records.extend(
+                self._fallback_classify_single(
+                    candidate_document,
+                    forced_page_type=PAGE_TYPE_FUNDING_LISTING,
+                    fallback_note="Deterministic multi-program recovery used because AI omitted a fundable listing section.",
+                )
+            )
+
+        if not recovered_records:
+            return existing_records
+
+        specific_records = [
+            record
+            for record in existing_records
+            if not _is_listing_aggregate_record(record, document, candidates)
+        ]
+        combined = [*specific_records, *recovered_records]
+        logger.info(
+            "ai_multi_program_recovery_added_records",
+            page_url=document.page_url,
+            original_records=len(existing_records),
+            recovered_records=len(recovered_records),
+            final_records=len(combined),
+        )
+        return combined
+
     def classify_document(self, document: PageContentDocument) -> List[FundingProgrammeRecord]:
         # This is the main AI path: prepare context, call the model, retry on
         # malformed or incomplete responses, and fall back if everything fails.
@@ -4123,6 +4227,9 @@ class AIClassifier:
 
         if response.page_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
             logger.info("ai_classification_rejected_non_program_page", page_url=document.page_url)
+            return []
+        if _is_domain_navigation_homepage(document):
+            logger.info("ai_classification_rejected_navigation_homepage", page_url=document.page_url)
             return []
 
         records: List[FundingProgrammeRecord] = []
@@ -4204,6 +4311,7 @@ class AIClassifier:
         if not records:
             logger.info("ai_classification_rejected_all_records", page_url=document.page_url, page_type=page_type)
             return []
+        records = self._recover_missing_listing_records(document, records)
 
         duration = time.time() - start
         logger.info("ai_classification_success", page_url=document.page_url, duration=duration, records=len(records))

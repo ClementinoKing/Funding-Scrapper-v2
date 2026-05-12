@@ -13,6 +13,9 @@ from scraper.adapters.registry import build_default_registry
 from scraper.pipeline import ScraperPipeline, build_settings_from_options
 from scraper.storage.site_repository import SiteRepository
 from scraper.storage.supabase_store import SupabaseUploader
+from scraper.hybrid import HybridScraperPipeline
+from scraper.web_search import WebSearchFunder, WebSearchPipeline
+from scraper.utils.urls import extract_host
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -89,6 +92,145 @@ def _run_seed_pipeline(
     return pipeline.run_sites(sites, max_sites=max_domains)
 
 
+def _load_site_definitions():
+    registry = build_default_registry()
+    try:
+        supabase_settings = SupabaseSettings.from_env()
+    except ValueError:
+        supabase_settings = None
+    site_repository = SiteRepository(
+        settings=supabase_settings,
+        adapter_registry=registry,
+    )
+    return site_repository.load_sites(fallback_seed_file=PACKAGE_ROOT / "resources" / "source_sites.json")
+
+
+def _upload_web_search_artifacts(settings) -> None:
+    if settings.dry_run:
+        typer.echo("Dry run enabled; skipping Supabase upload.")
+        return
+    try:
+        supabase_settings = SupabaseSettings.from_env()
+    except ValueError as exc:
+        typer.echo("Web Search artifacts were written, but Supabase upload cannot run: %s" % exc)
+        raise typer.Exit(code=1)
+
+    uploader = SupabaseUploader(supabase_settings)
+    try:
+        result = uploader.upload_from_files(
+            settings.output_path / "normalized" / "funding_programmes.json",
+            settings.output_path / "logs" / "run_summary.json",
+        )
+    except Exception as exc:
+        typer.echo("Web Search Supabase upload failed: %s" % exc)
+        raise typer.Exit(code=1)
+    typer.echo("Web Search Supabase upload complete: %s" % result)
+
+
+def _upload_hybrid_artifacts(settings) -> None:
+    if settings.dry_run:
+        typer.echo("Dry run enabled; skipping Supabase upload.")
+        return
+    try:
+        supabase_settings = SupabaseSettings.from_env()
+    except ValueError as exc:
+        typer.echo("Hybrid artifacts were written, but Supabase upload cannot run: %s" % exc)
+        raise typer.Exit(code=1)
+
+    uploader = SupabaseUploader(supabase_settings)
+    try:
+        result = uploader.upload_from_files(
+            settings.output_path / "normalized" / "funding_programmes.json",
+            settings.output_path / "logs" / "run_summary.json",
+        )
+    except Exception as exc:
+        typer.echo("Hybrid Supabase upload failed: %s" % exc)
+        raise typer.Exit(code=1)
+    typer.echo("Hybrid Supabase upload complete: %s" % result)
+
+
+def _run_web_search_funders(
+    *,
+    funders: list[WebSearchFunder],
+    settings,
+    fresh: bool,
+    max_funders: Optional[int] = None,
+):
+    if fresh:
+        _clear_local_scrape_output(settings.output_path)
+    if not funders:
+        typer.echo("No funders were found for Web Search mode.")
+        raise typer.Exit(code=1)
+    pipeline = WebSearchPipeline(settings)
+    summary = pipeline.run_funders(funders, max_funders=max_funders)
+    _upload_web_search_artifacts(settings)
+    return summary
+
+
+def _run_web_search_seed_pipeline(
+    *,
+    output_path: Optional[Path],
+    max_domains: Optional[int],
+    fresh: bool,
+):
+    settings = build_settings_from_options(output_path, None, None, None, False, None, True)
+    sites = _load_site_definitions()
+    funders = [WebSearchFunder.from_site(site) for site in sites]
+    return _run_web_search_funders(funders=funders, settings=settings, fresh=fresh, max_funders=max_domains)
+
+
+def _run_hybrid_sites(
+    *,
+    sites,
+    settings,
+    fresh: bool,
+    max_sites: Optional[int] = None,
+):
+    if fresh:
+        _clear_local_scrape_output(settings.output_path)
+    if not sites:
+        typer.echo("No sites were found for Hybrid mode.")
+        raise typer.Exit(code=1)
+    pipeline = HybridScraperPipeline(settings, adapter_registry=build_default_registry())
+    summary = pipeline.run_sites(sites, max_sites=max_sites)
+    _upload_hybrid_artifacts(settings)
+    return summary
+
+
+def _run_hybrid_seed_pipeline(
+    *,
+    settings,
+    max_domains: Optional[int],
+    fresh: bool,
+):
+    sites = _load_site_definitions()
+    return _run_hybrid_sites(sites=sites, settings=settings, fresh=fresh, max_sites=max_domains)
+
+
+def _single_web_search_funder(url: str) -> WebSearchFunder:
+    return WebSearchFunder(
+        funder_name=url.split("//", 1)[-1].split("/", 1)[0] or url,
+        website_url=url,
+        country="South Africa",
+        currency="ZAR",
+        site_key="single-web-search",
+    )
+
+
+def _single_site_definition(url: str):
+    from scraper.storage.site_repository import SiteDefinition
+
+    host = extract_host(url)
+    return SiteDefinition(
+        site_key=host or "single-site",
+        display_name=host or url,
+        primary_domain=host,
+        adapter_key=build_default_registry().generic_adapter.key,
+        seed_urls=(url,),
+        adapter_config={},
+    )
+
+
 @app.command("scrape-url")
 def scrape_url(
     url: str = typer.Argument(..., help="The funding page URL to scrape."),
@@ -121,6 +263,24 @@ def scrape_url(
         max_links_per_page,
         fetch_cache,
     )
+    if settings.scraper_mode == "web_search":
+        summary = _run_web_search_funders(
+            funders=[_single_web_search_funder(url)],
+            settings=settings,
+            fresh=True,
+            max_funders=1,
+        )
+        _print_summary(summary)
+        return
+    if settings.scraper_mode == "hybrid":
+        summary = _run_hybrid_sites(
+            sites=[_single_site_definition(url)],
+            settings=settings,
+            fresh=True,
+            max_sites=1,
+        )
+        _print_summary(summary)
+        return
     pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     summary = pipeline.run([url])
     _print_summary(summary)
@@ -158,6 +318,24 @@ def crawl_domain(
         max_links_per_page,
         fetch_cache,
     )
+    if settings.scraper_mode == "web_search":
+        summary = _run_web_search_funders(
+            funders=[_single_web_search_funder(url)],
+            settings=settings,
+            fresh=True,
+            max_funders=1,
+        )
+        _print_summary(summary)
+        return
+    if settings.scraper_mode == "hybrid":
+        summary = _run_hybrid_sites(
+            sites=[_single_site_definition(url)],
+            settings=settings,
+            fresh=True,
+            max_sites=1,
+        )
+        _print_summary(summary)
+        return
     pipeline = ScraperPipeline(settings, adapter_registry=build_default_registry())
     summary = pipeline.run([url])
     _print_summary(summary)
@@ -187,6 +365,35 @@ def run_seeds(
     max_links_per_page: Optional[int] = typer.Option(None, help="Maximum discovered links to score per fetched page."),
     fetch_cache: Optional[bool] = typer.Option(None, "--fetch-cache/--no-fetch-cache", help="Enable in-run fetch caching."),
 ) -> None:
+    settings = build_settings_from_options(
+        output_path,
+        max_pages,
+        depth_limit,
+        headless,
+        browser_fallback,
+        respect_robots,
+        ai_enrichment,
+        domain_concurrency,
+        max_queue_urls,
+        max_links_per_page,
+        fetch_cache,
+    )
+    if settings.scraper_mode == "web_search":
+        summary = _run_web_search_seed_pipeline(
+            output_path=output_path,
+            max_domains=max_domains,
+            fresh=fresh,
+        )
+        _print_summary(summary)
+        return
+    if settings.scraper_mode == "hybrid":
+        summary = _run_hybrid_seed_pipeline(
+            settings=settings,
+            max_domains=max_domains,
+            fresh=fresh,
+        )
+        _print_summary(summary)
+        return
     summary = _run_seed_pipeline(
         max_pages=max_pages,
         depth_limit=depth_limit,
@@ -223,6 +430,35 @@ def run_next_seed(
     max_links_per_page: Optional[int] = typer.Option(None, help="Maximum discovered links to score per fetched page."),
     fetch_cache: Optional[bool] = typer.Option(None, "--fetch-cache/--no-fetch-cache", help="Enable in-run fetch caching."),
 ) -> None:
+    settings = build_settings_from_options(
+        output_path,
+        max_pages,
+        depth_limit,
+        headless,
+        browser_fallback,
+        respect_robots,
+        ai_enrichment,
+        domain_concurrency,
+        max_queue_urls,
+        max_links_per_page,
+        fetch_cache,
+    )
+    if settings.scraper_mode == "web_search":
+        summary = _run_web_search_seed_pipeline(
+            output_path=output_path,
+            max_domains=1,
+            fresh=False,
+        )
+        _print_summary(summary)
+        return
+    if settings.scraper_mode == "hybrid":
+        summary = _run_hybrid_seed_pipeline(
+            settings=settings,
+            max_domains=1,
+            fresh=False,
+        )
+        _print_summary(summary)
+        return
     summary = _run_seed_pipeline(
         max_pages=max_pages,
         depth_limit=depth_limit,

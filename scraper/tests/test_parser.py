@@ -65,6 +65,53 @@ def test_generic_parser_keeps_listing_pages_generic(settings, fixture_dir: Path)
     assert "https://example.org/programmes/asset-finance-facility" in result.discovered_links
 
 
+def test_generic_parser_extracts_card_title_sections(settings) -> None:
+    parser = GenericFundingParser(settings)
+    html = """
+    <html>
+      <body>
+        <main>
+          <h1>Isibaya Fund</h1>
+          <section class="portfolio-grid">
+            <div class="card portfolio-card">
+              <div class="card-head">
+                <div class="brand-icon">DISA</div>
+                <h5 class="card-title">Developmental Investments South Africa</h5>
+              </div>
+              <div class="card-body">
+                <strong>Purpose:</strong>
+                <div>Invest in unlisted South African entities for financial and developmental returns.</div>
+                <strong>Investment Guidance:</strong>
+                <div>Min R100m. Structure Debt, Equity or Hybrid.</div>
+              </div>
+            </div>
+            <div class="card portfolio-card">
+              <div class="card-head">
+                <div class="brand-icon">DIISA</div>
+                <h5 class="card-title">Developmental Infrastructure Investments South Africa</h5>
+              </div>
+              <div class="card-body">
+                <strong>Purpose:</strong>
+                <div>Invest in unlisted SA entities for infrastructure development.</div>
+                <strong>Investment Guidance:</strong>
+                <div>Min R100m. Typical tenor 5 to 15 years.</div>
+              </div>
+            </div>
+          </section>
+        </main>
+      </body>
+    </html>
+    """
+    page = _page("https://www.pic.gov.za/isibaya", html, "PIC")
+
+    result = parser.parse(page, allowed_domains=["www.pic.gov.za"])
+
+    sections = {section.heading: section.content for section in result.structured_sections}
+    assert "Developmental Investments South Africa" in sections
+    assert "Developmental Infrastructure Investments South Africa" in sections
+    assert "Min R100m" in sections["Developmental Investments South Africa"]
+
+
 def test_generic_parser_discovers_route_like_internal_links(settings) -> None:
     parser = GenericFundingParser(settings)
     html = """

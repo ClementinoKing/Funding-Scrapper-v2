@@ -68,13 +68,13 @@ INTERACTIVE_PANEL_SELECTORS = (
 
 
 def _is_heading_tag(node: Tag) -> bool:
-    return bool(node.name and re.match(r"^h[1-3]$", node.name))
+    return bool(node.name and re.match(r"^h[1-5]$", node.name))
 
 
 def _heading_level(node: Tag) -> int:
     if not node.name:
         return 1
-    match = re.match(r"^h([1-3])$", node.name)
+    match = re.match(r"^h([1-5])$", node.name)
     return int(match.group(1)) if match else 1
 
 
@@ -363,7 +363,7 @@ def _title_from_page(soup: BeautifulSoup, fallback: Optional[str]) -> Optional[s
 
 def _collect_headings(root: BeautifulSoup) -> List[str]:
     headings: List[str] = []
-    for tag in root.find_all(re.compile(r"^h[1-3]$")):
+    for tag in root.find_all(re.compile(r"^h[1-5]$")):
         text = clean_text(tag.get_text(" ", strip=True))
         if text:
             headings.append(text)
@@ -405,7 +405,7 @@ def _collect_structured_metadata(soup: BeautifulSoup, page_url: str) -> List[Pag
 
 def _collect_sections(root: BeautifulSoup) -> List[PageContentSection]:
     sections: List[PageContentSection] = []
-    headings = list(root.find_all(re.compile(r"^h[1-3]$")))
+    headings = list(root.find_all(re.compile(r"^h[1-5]$")))
     for index, heading in enumerate(headings):
         heading_text = clean_text(heading.get_text(" ", strip=True))
         if not heading_text:
@@ -423,6 +423,23 @@ def _collect_sections(root: BeautifulSoup) -> List[PageContentSection]:
                 if text:
                     content_parts.append(text)
         content = clean_text(" ".join(content_parts))
+        if content:
+            sections.append(PageContentSection(heading=heading_text, content=content))
+    return sections
+
+
+def _collect_card_sections(root: BeautifulSoup) -> List[PageContentSection]:
+    sections: List[PageContentSection] = []
+    for heading in root.select(".card h1, .card h2, .card h3, .card h4, .card h5, .tile h1, .tile h2, .tile h3, .tile h4, .tile h5, .panel h1, .panel h2, .panel h3, .panel h4, .panel h5"):
+        heading_text = clean_text(heading.get_text(" ", strip=True))
+        if not heading_text:
+            continue
+        container = heading.find_parent(class_=re.compile(r"(?:^|\s)(?:card|tile|panel)(?:\s|$)", re.I))
+        if not isinstance(container, Tag):
+            continue
+        content = _extract_text(container)
+        if content and heading_text.casefold() in content.casefold():
+            content = clean_text(re.sub(re.escape(heading_text), "", content, count=1, flags=re.I))
         if content:
             sections.append(PageContentSection(heading=heading_text, content=content))
     return sections
@@ -484,7 +501,7 @@ class GenericFundingParser:
         title = _title_from_page(soup, page.title)
         headings = _collect_headings(cleaned_root)
         metadata_sections = _collect_structured_metadata(soup, page.canonical_url)
-        structured_sections = _remove_duplicate_sections([*metadata_sections, *_collect_sections(cleaned_root)])
+        structured_sections = _remove_duplicate_sections([*metadata_sections, *_collect_card_sections(cleaned_root), *_collect_sections(cleaned_root)])
         full_body_text = _extract_text(cleaned_root)
         if metadata_sections:
             full_body_text = _dedupe_lines("\n".join([full_body_text, *[section.content for section in metadata_sections]]))

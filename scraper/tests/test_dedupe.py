@@ -269,3 +269,35 @@ def test_dedupe_can_use_ai_decider_to_keep_ambiguous_same_named_programmes_separ
     deduped = dedupe_records([left, right], merge_decider=_RejectingDecider())
 
     assert len(deduped) == 2
+
+
+def test_dedupe_keeps_same_page_listing_child_programmes_separate() -> None:
+    sme = FundingProgrammeRecord(
+        program_name="SME Fund",
+        funder_name="Public Investment Corporation",
+        source_url="https://www.pic.gov.za/isibaya",
+        source_urls=["https://www.pic.gov.za/isibaya"],
+        source_domain="pic.gov.za",
+        source_page_title="Isibaya Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.EQUITY,
+        page_type="funding_listing",
+        raw_funding_offer_data=["Equity investment funding for growing small and medium businesses."],
+    )
+    housing = FundingProgrammeRecord(
+        program_name="Affordable Housing Fund",
+        funder_name="Public Investment Corporation",
+        source_url="https://www.pic.gov.za/isibaya",
+        source_urls=["https://www.pic.gov.za/isibaya"],
+        source_domain="pic.gov.za",
+        source_page_title="Isibaya Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.EQUITY,
+        page_type="funding_listing",
+        raw_funding_offer_data=["Investment funding for affordable and social housing projects."],
+    )
+
+    deduped = dedupe_records([sme, housing])
+
+    assert len(deduped) == 2
+    assert {record.program_name for record in deduped} == {"SME Fund", "Affordable Housing Fund"}

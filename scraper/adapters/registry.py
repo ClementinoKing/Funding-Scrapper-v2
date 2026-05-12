@@ -220,6 +220,42 @@ def _build_sharepoint_portal_adapter() -> SiteAdapter:
     )
 
 
+def _build_pic_adapter() -> SiteAdapter:
+    adapter = _build_sharepoint_portal_adapter()
+    return SiteAdapter(
+        key="pic",
+        domain="www.pic.gov.za",
+        allowed_path_prefixes=(
+            "/isibaya",
+            "/early-stage-fund",
+            "/unlisted-investments",
+            "/properties",
+            "/apply-for-funding",
+            "/pic/site/site-map",
+            "/Pages",
+        ),
+        allowed_hosts=("www.pic.gov.za", "pic.gov.za"),
+        default_seed_urls=(
+            "https://www.pic.gov.za/",
+            "https://www.pic.gov.za/isibaya",
+            "https://www.pic.gov.za/apply-for-funding/isibaya",
+            "https://www.pic.gov.za/early-stage-fund",
+            "https://www.pic.gov.za/properties",
+            "https://www.pic.gov.za/pic/site/site-map",
+        ),
+        include_url_terms=adapter.include_url_terms,
+        exclude_url_terms=adapter.exclude_url_terms,
+        discovery_terms=adapter.discovery_terms,
+        content_selectors=adapter.content_selectors,
+        candidate_selectors=adapter.candidate_selectors,
+        content_exclude_selectors=adapter.content_exclude_selectors,
+        section_heading_selectors=adapter.section_heading_selectors,
+        force_browser_url_terms=("pic.gov.za",),
+        playwright_required_by_default=True,
+        site_profile=adapter.site_profile,
+    )
+
+
 @dataclass
 class SiteAdapterRegistry:
     """Compatibility wrapper around the generic adapter.
@@ -244,7 +280,12 @@ class SiteAdapterRegistry:
     def default(cls) -> "SiteAdapterRegistry":
         # The default registry keeps the generic adapter and a reusable portal
         # profile available for site rows that need SharePoint-style crawling.
-        return cls(adapters_by_key={"sharepoint_portal": _build_sharepoint_portal_adapter()})
+        return cls(
+            adapters_by_key={
+                "sharepoint_portal": _build_sharepoint_portal_adapter(),
+                "pic": _build_pic_adapter(),
+            }
+        )
 
     def register(self, adapter: SiteAdapter) -> None:
         # Still supported for tests or edge cases, but not used by the normal

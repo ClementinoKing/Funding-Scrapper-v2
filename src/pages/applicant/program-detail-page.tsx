@@ -41,7 +41,19 @@ const formatMoney = (value?: number | string | null): string => {
   }).format(numeric);
 };
 
-const asList = (value?: string[] | null): string[] => (value ?? []).filter(Boolean);
+const coerceToString = (item: unknown): string => {
+  if (typeof item === "string") return item;
+  if (item && typeof item === "object") {
+    const obj = item as Record<string, unknown>;
+    // Handle taxonomy objects like { name, parent }
+    if (typeof obj.name === "string") return obj.name;
+    return JSON.stringify(item);
+  }
+  return String(item ?? "");
+};
+
+const asList = (value?: unknown[] | string[] | null): string[] =>
+  (value ?? []).map(coerceToString).filter(Boolean);
 
 const listOrFallback = (value?: string[] | null): string => {
   const items = asList(value);

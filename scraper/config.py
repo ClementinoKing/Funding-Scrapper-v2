@@ -79,6 +79,11 @@ def _env_list(name: str, default: List[str]) -> List[str]:
     return values or list(default)
 
 
+def _env_mode(name: str, default: str, allowed: set[str]) -> str:
+    raw = os.getenv(name, default).strip().lower().replace("-", "_")
+    return raw if raw in allowed else default
+
+
 def load_json_resource(filename: str) -> Any:
     path = RESOURCE_DIR / filename
     return json.loads(path.read_text(encoding="utf-8"))
@@ -142,6 +147,19 @@ class ScraperSettings:
     document_ai_max_documents_per_page: int = 4
     document_ai_max_extracted_chars: int = 5000
     document_ai_timeout_seconds: int = 45
+    scraper_mode: str = "playwright"
+    web_search_model: str = "gpt-5"
+    web_search_max_queries_per_funder: int = 4
+    web_search_concurrency: int = 1
+    web_search_min_insert_confidence: int = 50
+    web_search_stop_after_success: bool = True
+    hybrid_web_search_max_calls_per_funder: int = 1
+    hybrid_min_accepted_records: int = 1
+    hybrid_min_confidence: float = 0.70
+    hybrid_min_completeness_score: float = 0.60
+    hybrid_enrich_low_confidence: bool = True
+    hybrid_allow_external_search: bool = False
+    dry_run: bool = False
     document_ai_skip_content_types: List[str] = field(
         default_factory=lambda: [
             "application/zip",
@@ -201,6 +219,19 @@ class ScraperSettings:
             document_ai_max_documents_per_page=_env_int("SCRAPER_DOCUMENT_AI_MAX_DOCUMENTS_PER_PAGE", 4),
             document_ai_max_extracted_chars=_env_int("SCRAPER_DOCUMENT_AI_MAX_EXTRACTED_CHARS", 5000),
             document_ai_timeout_seconds=_env_int("SCRAPER_DOCUMENT_AI_TIMEOUT_SECONDS", 45),
+            scraper_mode=_env_mode("SCRAPER_MODE", "playwright", {"playwright", "web_search", "hybrid"}),
+            web_search_model=os.getenv("SCRAPER_WEB_SEARCH_MODEL", "gpt-5").strip() or "gpt-5",
+            web_search_max_queries_per_funder=max(1, _env_int("SCRAPER_WEB_SEARCH_MAX_QUERIES_PER_FUNDER", 4)),
+            web_search_concurrency=max(1, _env_int("SCRAPER_WEB_SEARCH_CONCURRENCY", 1)),
+            web_search_min_insert_confidence=max(0, min(_env_int("SCRAPER_WEB_SEARCH_MIN_INSERT_CONFIDENCE", 50), 100)),
+            web_search_stop_after_success=_env_bool("SCRAPER_WEB_SEARCH_STOP_AFTER_SUCCESS", True),
+            hybrid_web_search_max_calls_per_funder=max(0, _env_int("SCRAPER_HYBRID_WEB_SEARCH_MAX_CALLS_PER_FUNDER", 1)),
+            hybrid_min_accepted_records=max(0, _env_int("SCRAPER_HYBRID_MIN_ACCEPTED_RECORDS", 1)),
+            hybrid_min_confidence=max(0.0, min(_env_float("SCRAPER_HYBRID_MIN_CONFIDENCE", 0.70), 1.0)),
+            hybrid_min_completeness_score=max(0.0, min(_env_float("SCRAPER_HYBRID_MIN_COMPLETENESS_SCORE", 0.60), 1.0)),
+            hybrid_enrich_low_confidence=_env_bool("SCRAPER_HYBRID_ENRICH_LOW_CONFIDENCE", True),
+            hybrid_allow_external_search=_env_bool("SCRAPER_HYBRID_ALLOW_EXTERNAL_SEARCH", False),
+            dry_run=_env_bool("SCRAPER_DRY_RUN", False),
             document_ai_skip_content_types=_env_list(
                 "SCRAPER_DOCUMENT_AI_SKIP_CONTENT_TYPES",
                 [
@@ -259,6 +290,19 @@ class ScraperSettings:
             document_ai_max_documents_per_page=self.document_ai_max_documents_per_page,
             document_ai_max_extracted_chars=self.document_ai_max_extracted_chars,
             document_ai_timeout_seconds=self.document_ai_timeout_seconds,
+            scraper_mode=self.scraper_mode,
+            web_search_model=self.web_search_model,
+            web_search_max_queries_per_funder=self.web_search_max_queries_per_funder,
+            web_search_concurrency=self.web_search_concurrency,
+            web_search_min_insert_confidence=self.web_search_min_insert_confidence,
+            web_search_stop_after_success=self.web_search_stop_after_success,
+            hybrid_web_search_max_calls_per_funder=self.hybrid_web_search_max_calls_per_funder,
+            hybrid_min_accepted_records=self.hybrid_min_accepted_records,
+            hybrid_min_confidence=self.hybrid_min_confidence,
+            hybrid_min_completeness_score=self.hybrid_min_completeness_score,
+            hybrid_enrich_low_confidence=self.hybrid_enrich_low_confidence,
+            hybrid_allow_external_search=self.hybrid_allow_external_search,
+            dry_run=self.dry_run,
             document_ai_skip_content_types=list(self.document_ai_skip_content_types),
             document_ai_skip_url_terms=list(self.document_ai_skip_url_terms),
         )
