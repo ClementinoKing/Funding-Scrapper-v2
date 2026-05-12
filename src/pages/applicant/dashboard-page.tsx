@@ -88,7 +88,7 @@ export function ApplicantDashboardPage() {
         clearInterval(pollingRef.current);
         pollingRef.current = null;
       }
-    }, 3000);
+    }, 1500);
   };
 
   useEffect(() => {
@@ -105,7 +105,7 @@ export function ApplicantDashboardPage() {
           filter: `business_id=eq.${userProfile.business_id}`,
         },
         (payload) => {
-          // setMatches((prev) => [payload.new, ...prev]);
+          setMatches((prev) => [payload.new, ...prev]);
           console.log(payload.new);
         },
       )
@@ -156,7 +156,7 @@ export function ApplicantDashboardPage() {
   // ---------------- OTHERS -------------
   const matchStats = {
     total: matches.length,
-    good: matches.filter((m) => m.final_score >= 60)
+    good: matches.filter((m) => m.final_score >= 65)
       .length,
     averageScore:
       matches.length > 0

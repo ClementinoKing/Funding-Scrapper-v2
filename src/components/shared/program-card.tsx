@@ -62,7 +62,7 @@ export const ProgramCard = memo(function ProgramCard({
                         <TooltipTrigger asChild>
                           <Badge
                             variant="default"
-                            className="mt-2 gap-1 bg-emerald-600 hover:bg-emerald-700 text-xs"
+                            className={`mt-2 gap-1 text-xs ${program?.final_score >= 70 ? "bg-green-600 hover:bg-green-700" : "bg-amber-600 hover:bg-amber-700"}`}
                           >
                             <CheckCircle2 className="w-3 h-3" />
                             Qualified (
@@ -202,7 +202,7 @@ export const ProgramCard = memo(function ProgramCard({
                   <TooltipTrigger asChild>
                     <Badge
                       variant="default"
-                      className="mt-2 gap-1 bg-emerald-600 hover:bg-emerald-700"
+                      className={`mt-2 gap-1 ${program?.final_score >= 70 ? "bg-green-600 hover:bg-green-700" : "bg-amber-600 hover:bg-amber-700"}`}
                     >
                       <CheckCircle2 className="w-3 h-3" />
                       Qualified ({program?.final_score}%
