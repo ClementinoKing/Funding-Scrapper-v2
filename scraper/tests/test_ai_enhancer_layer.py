@@ -12,8 +12,10 @@ class StubClassifier(AIClassifier):
     def __init__(self, response: dict):
         super().__init__({"openaiKey": "test", "aiProvider": "openai", "disableRemoteAi": False})
         self._response = response
+        self.call_count = 0
 
     def _call_model(self, system_prompt: str, user_prompt: str) -> str:
+        self.call_count += 1
         return json.dumps(self._response)
 
 
@@ -37,6 +39,35 @@ def test_ai_enhancer_rejects_support_programmes_before_persistence() -> None:
     records = classifier.classify_document(document)
 
     assert records == []
+
+
+def test_ai_enhancer_skips_ai_for_obvious_non_program_pages() -> None:
+    document = PageContentDocument(
+        page_url="https://example.org/investment-philosophy",
+        title="Investment Philosophy",
+        page_title="Investment Philosophy",
+        source_domain="example.org",
+        full_body_text="Our investment philosophy and governance process are outlined here.",
+    )
+    classifier = StubClassifier(
+        {
+            "page_decision": "funding_program",
+            "page_type": "generic_content",
+            "records": [
+                {
+                    "program_name": "Should Not Be Used",
+                    "funder_name": "Example Agency",
+                    "funding_type": "Grant",
+                }
+            ],
+            "notes": [],
+        }
+    )
+
+    records = classifier.classify_document(document)
+
+    assert records == []
+    assert classifier.call_count == 0
 
 
 def test_ai_enhancer_rejects_technology_station_pages() -> None:

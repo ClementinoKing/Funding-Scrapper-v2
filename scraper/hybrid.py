@@ -102,7 +102,9 @@ class HybridScraperPipeline:
                 reason=list(decision.reasons),
                 crawler_records=len(decision.crawler_records),
             )
-            result = self._get_web_search_pipeline()._process_funder(funder)
+            result = self._get_web_search_pipeline()._process_funder(
+                _funder_with_programme_hints(funder, decision.crawler_records)
+            )
             web_results.append(result)
             if _is_quota_result(result):
                 self.logger.warning(
@@ -166,8 +168,12 @@ class HybridScraperPipeline:
             self.web_search_pipeline = WebSearchPipeline(
                 replace(
                     self.settings,
-                    web_search_max_queries_per_funder=max(1, self.settings.hybrid_web_search_max_calls_per_funder),
-                    web_search_stop_after_success=True,
+                    web_search_max_queries_per_funder=max(
+                        1,
+                        self.settings.hybrid_max_web_search_calls_per_funder
+                        or self.settings.hybrid_web_search_max_calls_per_funder,
+                    ),
+                    web_search_stop_after_success=self.settings.hybrid_stop_after_first_success,
                     web_search_concurrency=1,
                 ),
                 storage=self.storage,
@@ -209,6 +215,9 @@ class HybridScraperPipeline:
             reasons.append("crawl_failed")
         if len(crawler_records) < self.settings.hybrid_min_accepted_records:
             reasons.append("zero_accepted_records")
+        critical_gap_ratio = _critical_field_gap_ratio(crawler_records)
+        if critical_gap_ratio > max(0.0, 1.0 - self.settings.hybrid_min_completeness_score):
+            reasons.append("critical_fields_missing")
         for record in crawler_records:
             quality = score_hybrid_record(record, funder_domain=funder.domain)
             reasons.extend(quality.reasons)
@@ -264,6 +273,67 @@ def score_hybrid_record(record: FundingProgrammeRecord, *, funder_domain: str) -
         completeness=round(completeness, 4),
         official_source_score=official,
         reasons=tuple(reasons),
+    )
+
+
+def _looks_like_multi_programme_page(records: Sequence[FundingProgrammeRecord]) -> bool:
+    if len(records) > 1:
+        source_urls = {record.source_url for record in records if record.source_url}
+        parent_names = {clean_text(record.parent_programme_name or "").casefold() for record in records if record.parent_programme_name}
+        program_names = {clean_text(record.program_name or "").casefold() for record in records if record.program_name}
+        if len(source_urls) == 1 and len(program_names) > 1:
+            return True
+        if len(source_urls) == 1 and len(parent_names) > 0:
+            return True
+    return any(record.page_type == "funding_listing" for record in records)
+
+
+def _critical_field_gap_ratio(records: Sequence[FundingProgrammeRecord]) -> float:
+    if not records:
+        return 0.0
+    missing = 0
+    for record in records:
+        if not record.program_name or not record.funder_name or not record.source_url:
+            missing += 1
+            continue
+        if record.funding_type == FundingType.UNKNOWN:
+            missing += 1
+            continue
+        if record.ticket_min is None and record.ticket_max is None and record.program_budget_total is None:
+            missing += 1
+            continue
+        if not (record.raw_eligibility_criteria or record.raw_eligibility_data):
+            missing += 1
+    return missing / len(records)
+
+
+def _programme_hints_from_records(records: Sequence[FundingProgrammeRecord], limit: int = 5) -> List[str]:
+    hints: List[str] = []
+    for record in records:
+        for value in (record.program_name, record.parent_programme_name):
+            cleaned = clean_text(value or "")
+            if not cleaned:
+                continue
+            if cleaned not in hints:
+                hints.append(cleaned)
+            if len(hints) >= limit:
+                return hints
+    return hints
+
+
+def _funder_with_programme_hints(funder: WebSearchFunder, records: Sequence[FundingProgrammeRecord]) -> WebSearchFunder:
+    hints = _programme_hints_from_records(records)
+    if not hints:
+        return funder
+    raw = dict(funder.raw)
+    raw["programme_hints"] = hints
+    return WebSearchFunder(
+        funder_name=funder.funder_name,
+        website_url=funder.website_url,
+        country=funder.country,
+        currency=funder.currency,
+        site_key=funder.site_key,
+        raw=raw,
     )
 
 

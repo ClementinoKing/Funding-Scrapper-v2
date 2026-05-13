@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scraper.utils.money import extract_budget_total, extract_money_range
+from scraper.utils.money import extract_amount_evidence, extract_budget_total, extract_money_range
 
 
 def test_extract_money_range_between() -> None:
@@ -77,6 +77,41 @@ def test_extract_money_range_accepts_scaled_amount_with_funding_context() -> Non
     assert currency == "ZAR"
     assert "ZAR 1 million" in snippet
     assert confidence >= 0.65
+
+
+def test_extract_money_range_handles_shared_scale_in_ranges() -> None:
+    minimum, maximum, currency, snippet, confidence = extract_money_range(
+        "Ideal R300–R500m for strategic expansion opportunities.",
+        default_currency="ZAR",
+    )
+    assert minimum == 300000000
+    assert maximum == 500000000
+    assert currency == "ZAR"
+    assert "R300" in snippet
+    assert confidence >= 0.8
+
+
+def test_extract_money_range_handles_usd_ranges_and_billion_notation() -> None:
+    minimum, maximum, currency, snippet, confidence = extract_money_range(
+        "The fund targets US$20–US$40m investments and can scale to R1.35 billion in larger mandates.",
+        default_currency=None,
+    )
+    assert minimum == 20000000
+    assert maximum == 40000000
+    assert currency == "USD"
+    assert "US$20" in snippet
+    assert confidence >= 0.8
+
+
+def test_extract_amount_evidence_preserves_ideal_and_minimum_ranges() -> None:
+    evidence = extract_amount_evidence(
+        "Min R100m. Ideal R300–R500m. Funding is for strategic infrastructure deals.",
+        default_currency="ZAR",
+    )
+    assert evidence["minimum"]["value"] == 100000000
+    assert evidence["minimum"]["currency"] == "ZAR"
+    assert evidence["ideal_range"]["min"] == 300000000
+    assert evidence["ideal_range"]["max"] == 500000000
 
 
 def test_extract_budget_total() -> None:

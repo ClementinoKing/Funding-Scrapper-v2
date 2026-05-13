@@ -170,7 +170,11 @@ class WebSearchPipeline:
     def _process_funder(self, funder: WebSearchFunder) -> FunderWebSearchResult:
         self.logger.info("web_search_funder_started", message="[WEB_SEARCH] Starting funder: %s" % funder.funder_name)
         self.logger.info("web_search_domain", message="[WEB_SEARCH] Domain: %s" % funder.domain)
-        queries = generate_funder_queries(funder, self.settings.web_search_max_queries_per_funder)
+        queries = generate_funder_queries(
+            funder,
+            self.settings.web_search_max_queries_per_funder,
+            programme_hints=funder.raw.get("programme_hints", []),
+        )
         records: List[FundingProgrammeRecord] = []
         review_records: List[FundingProgrammeRecord] = []
         skipped_low_confidence = 0

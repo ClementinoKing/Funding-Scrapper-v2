@@ -187,6 +187,8 @@ def _should_merge(
     right_program = _normalized_name(right.program_name, adapter=adapter, kind="program")
     left_funder = _normalized_name(left.funder_name, adapter=adapter, kind="funder")
     right_funder = _normalized_name(right.funder_name, adapter=adapter, kind="funder")
+    left_parent = _normalized_parent_name(left, adapter=adapter)
+    right_parent = _normalized_parent_name(right, adapter=adapter)
 
     if left_sources & right_sources:
         if (
@@ -195,6 +197,8 @@ def _should_merge(
             and left_program != right_program
             and not (_is_generic_support_program(left_program) or _is_generic_support_program(right_program))
         ):
+            return False
+        if left_parent and right_parent and left_parent != right_parent:
             return False
         if left_funder and right_funder and left_funder != right_funder:
             return False
@@ -229,8 +233,6 @@ def _should_merge(
         if ai_decision is not None:
             return bool(ai_decision)
 
-    left_parent = _normalized_parent_name(left, adapter=adapter)
-    right_parent = _normalized_parent_name(right, adapter=adapter)
     if left_parent and right_parent and left_parent != right_parent:
         return False
 

@@ -105,6 +105,7 @@ class ApprovalStatus(str, Enum):
 
 class ProgrammeNature(str, Enum):
     DIRECT_FUNDING = "direct_funding"
+    SUB_PROGRAMME = "sub_programme"
     VOUCHER_SUPPORT = "voucher_support"
     NON_FINANCIAL_SUPPORT = "non_financial_support"
     UNKNOWN = "unknown"
@@ -280,9 +281,22 @@ class PageContentDocument(BaseModel):
             for index, record in enumerate(self.records)
         ]
         candidate_blocks: List[CandidateBlockSnapshot] = []
+
+        def add_candidate_block(block: CandidateBlockSnapshot) -> None:
+            heading_key, text_key = _candidate_block_signature(block.heading, block.text)
+            if not heading_key or not text_key:
+                return
+            for index, existing_block in enumerate(candidate_blocks):
+                if not _candidate_block_matches(existing_block, block):
+                    continue
+                if _candidate_block_is_more_specific(existing_block, block):
+                    candidate_blocks[index] = block
+                return
+            candidate_blocks.append(block)
+
         if self.structured_sections:
             for section in self.structured_sections:
-                candidate_blocks.append(
+                add_candidate_block(
                     CandidateBlockSnapshot(
                         heading=section.heading,
                         text=section.content,
@@ -297,7 +311,7 @@ class PageContentDocument(BaseModel):
                     )
                 )
         for interactive_section in self.interactive_sections:
-            candidate_blocks.append(
+            add_candidate_block(
                 CandidateBlockSnapshot(
                     heading=interactive_section.label or interactive_section.type,
                     text=interactive_section.content,
@@ -641,6 +655,39 @@ class CandidateBlockSnapshot(BaseModel):
     detail_links: List[str] = Field(default_factory=list)
     application_links: List[str] = Field(default_factory=list)
     document_links: List[str] = Field(default_factory=list)
+
+
+def _candidate_block_signature(heading: str, text: str) -> tuple[str, str]:
+    normalized_heading = strip_leading_numbered_prefix(clean_text(heading or "")).casefold()
+    normalized_text = clean_text(text or "")
+    if normalized_heading and normalized_text.casefold().startswith(normalized_heading):
+        normalized_text = clean_text(normalized_text[len(normalized_heading) :])
+    return normalized_heading, normalized_text.casefold()
+
+
+def _candidate_block_is_more_specific(existing: CandidateBlockSnapshot, candidate: CandidateBlockSnapshot) -> bool:
+    existing_heading, existing_text = _candidate_block_signature(existing.heading, existing.text)
+    candidate_heading, candidate_text = _candidate_block_signature(candidate.heading, candidate.text)
+    if not existing_heading or not candidate_heading:
+        return False
+    heading_overlap = existing_heading == candidate_heading or existing_heading in candidate_heading or candidate_heading in existing_heading
+    if not heading_overlap:
+        return False
+    text_overlap = existing_text == candidate_text or existing_text in candidate_text or candidate_text in existing_text
+    if not text_overlap:
+        return False
+    return len(candidate_heading) + len(candidate_text) > len(existing_heading) + len(existing_text)
+
+
+def _candidate_block_matches(existing: CandidateBlockSnapshot, candidate: CandidateBlockSnapshot) -> bool:
+    existing_heading, existing_text = _candidate_block_signature(existing.heading, existing.text)
+    candidate_heading, candidate_text = _candidate_block_signature(candidate.heading, candidate.text)
+    if not existing_heading or not candidate_heading:
+        return False
+    heading_overlap = existing_heading == candidate_heading or existing_heading in candidate_heading or candidate_heading in existing_heading
+    if not heading_overlap:
+        return False
+    return existing_text == candidate_text or existing_text in candidate_text or candidate_text in existing_text
 
 
 class PageAIContext(BaseModel):

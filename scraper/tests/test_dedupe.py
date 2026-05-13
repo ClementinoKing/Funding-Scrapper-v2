@@ -240,6 +240,35 @@ def test_dedupe_does_not_merge_same_named_programmes_when_parent_context_is_only
     assert {record.program_name for record in deduped} == {"Expansion Capital"}
 
 
+def test_dedupe_does_not_merge_same_source_url_records_when_parent_programmes_differ() -> None:
+    left = FundingProgrammeRecord(
+        program_name="Developmental Investments South Africa",
+        funder_name="Public Investment Corporation",
+        parent_programme_name="Isibaya Fund",
+        source_url="https://www.pic.gov.za/isibaya",
+        source_urls=["https://www.pic.gov.za/isibaya"],
+        source_domain="pic.gov.za",
+        source_page_title="Isibaya Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.HYBRID,
+    )
+    right = FundingProgrammeRecord(
+        program_name="Developmental Investments South Africa",
+        funder_name="Public Investment Corporation",
+        parent_programme_name="Other Fund",
+        source_url="https://www.pic.gov.za/isibaya",
+        source_urls=["https://www.pic.gov.za/isibaya"],
+        source_domain="pic.gov.za",
+        source_page_title="Other Fund",
+        scraped_at=datetime.now(timezone.utc),
+        funding_type=FundingType.HYBRID,
+    )
+
+    deduped = dedupe_records([left, right])
+
+    assert len(deduped) == 2
+
+
 def test_dedupe_can_use_ai_decider_to_keep_ambiguous_same_named_programmes_separate() -> None:
     left = FundingProgrammeRecord(
         program_name="Expansion Capital",

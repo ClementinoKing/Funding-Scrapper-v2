@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -24,12 +25,13 @@ from scraper.schemas import (
     InterestType,
     PageDebugPackage,
     PageDebugRecord,
+    ProgrammeNature,
     ProgrammeStatus,
     RepaymentFrequency,
     TriState,
 )
 from scraper.utils.dates import looks_expired, parse_deadline_info
-from scraper.utils.money import extract_budget_total, extract_money_range, infer_default_currency
+from scraper.utils.money import extract_amount_evidence, extract_budget_total, extract_money_range, infer_default_currency
 from scraper.utils.page_classification import classify_global_page_type
 from scraper.utils.text import (
     clean_text,
@@ -176,6 +178,12 @@ def _source_scope_for_record(page_url: str, page_title: Optional[str], text: str
     if page_type in {"application_support_page", "support-document", "supporting_or_complementary_programme_page"}:
         return "support_page"
     return _scope_from_text(page_url, page_title, text, heading)
+
+
+def _is_parent_programme_candidate(candidate: str) -> bool:
+    text = clean_text(candidate or "")
+    lowered = text.casefold()
+    return bool(text) and any(term in lowered for term in ("fund", "funds", "programme", "program", "facility", "scheme"))
 
 
 def _method_confidence(method: str, fallback: float = 0.0) -> float:
@@ -503,6 +511,47 @@ def _infer_program_name(block: CandidateBlock, page_title: Optional[str]) -> Opt
     return None
 
 
+def _infer_parent_programme_name(
+    block: CandidateBlock,
+    page_title: Optional[str],
+    program_name: Optional[str],
+    funder_name: Optional[str],
+) -> Optional[str]:
+    candidates: List[str] = []
+    for source in (
+        block.section_bundle.identity,
+        block.section_bundle.overview,
+        list(block.section_map.keys()),
+    ):
+        for value in source:
+            cleaned = clean_text(value)
+            if cleaned and _is_parent_programme_candidate(cleaned):
+                candidates.append(cleaned)
+    if page_title:
+        cleaned_title = clean_text(page_title)
+        if cleaned_title:
+            for separator in [" | ", " - ", " — ", " :: "]:
+                if separator in cleaned_title:
+                    fragments = [clean_text(part) for part in cleaned_title.split(separator) if clean_text(part)]
+                    if fragments and _is_parent_programme_candidate(fragments[0]):
+                        candidates.append(fragments[0])
+                    for fragment in fragments[1:]:
+                        if _is_parent_programme_candidate(fragment):
+                            candidates.append(fragment)
+                    break
+            else:
+                candidates.append(cleaned_title)
+    for candidate in unique_preserve_order(candidates):
+        if program_name and clean_text(candidate).casefold() == clean_text(program_name).casefold():
+            continue
+        if funder_name and clean_text(candidate).casefold() == clean_text(funder_name).casefold():
+            continue
+        if program_name and clean_text(program_name).casefold() in clean_text(candidate).casefold():
+            continue
+        return candidate
+    return None
+
+
 def _infer_funder_name(page_title: Optional[str], text: str) -> Optional[str]:
     patterns = [
         re.compile(r"(?:offered|provided|managed|administered)\s+by\s+([A-Z][A-Za-z0-9&.,'\- ]{3,80})"),
@@ -724,6 +773,13 @@ def _extract_turnover_range(text: str, source_domain: str) -> Tuple[Optional[flo
     for sentence in sentences:
         minimum, maximum, _currency, snippet, confidence = extract_money_range(sentence, default_currency=default_currency)
         if minimum is not None or maximum is not None:
+            lowered = sentence.lower()
+            lower_bound_terms = ("exceed", "exceeds", "exceeding", "above", "over", "more than", "at least", "minimum", "min ")
+            upper_bound_terms = ("below", "under", "less than", "up to", "maximum", "max ")
+            if minimum is None and maximum is not None and any(term in lowered for term in lower_bound_terms):
+                minimum, maximum = maximum, None
+            elif maximum is None and minimum is not None and any(term in lowered for term in upper_bound_terms):
+                minimum, maximum = None, minimum
             return minimum, maximum, snippet, confidence
     return None, None, None, 0.0
 
@@ -823,6 +879,13 @@ def build_programme_record(
             method="regex_from_prose",
         )
 
+    parent_programme_name = _infer_parent_programme_name(block, page_title, program_name, funder_name)
+    programme_nature = (
+        ProgrammeNature.SUB_PROGRAMME
+        if parent_programme_name and program_name and clean_text(parent_programme_name).casefold() != clean_text(program_name).casefold()
+        else ProgrammeNature.DIRECT_FUNDING
+    )
+
     funding_type, funding_type_confidence, funding_hits = classify_funding_type(" ".join([funding_text, overview_text, combined_text]))
     if funding_hits:
         _add_evidence(
@@ -874,15 +937,50 @@ def build_programme_record(
             method="direct_page_evidence",
         )
 
-    ticket_min, ticket_max, currency, money_snippet, money_confidence = extract_money_range(
-        funding_text or combined_text,
-        default_currency=default_currency,
-    )
-    if money_snippet is None and funding_text:
-        ticket_min, ticket_max, currency, money_snippet, money_confidence = extract_money_range(
-            combined_text,
-            default_currency=default_currency,
+    funding_amount_text = clean_text(
+        " ".join(
+            unique_preserve_order(
+                [
+                    funding_text,
+                    " ".join(block.section_bundle.funding_offer),
+                    " ".join(raw_funding_offer_data),
+                    _scoped_section_text(
+                        block.section_map,
+                        USE_OF_FUNDS_SECTION_HINTS,
+                        block.section_aliases.get("funding", ()) + block.section_aliases.get("use_of_funds", ()),
+                    ),
+                ]
+            )
         )
+    ) or combined_text
+    amount_evidence = extract_amount_evidence(funding_amount_text, default_currency=default_currency)
+    if not amount_evidence:
+        amount_evidence = extract_amount_evidence(combined_text, default_currency=default_currency)
+    ticket_min = ticket_max = None
+    currency = default_currency
+    money_snippet = None
+    money_confidence = 0.0
+    if amount_evidence.get("minimum"):
+        minimum_evidence = amount_evidence["minimum"]
+        ticket_min = minimum_evidence.get("value")
+        currency = minimum_evidence.get("currency") or currency
+        money_snippet = minimum_evidence.get("raw")
+        money_confidence = float(minimum_evidence.get("confidence") or 0.0)
+    elif amount_evidence.get("range"):
+        range_evidence = amount_evidence["range"]
+        ticket_min = range_evidence.get("min")
+        ticket_max = range_evidence.get("max")
+        currency = range_evidence.get("currency") or currency
+        money_snippet = range_evidence.get("raw")
+        money_confidence = float(range_evidence.get("confidence") or 0.0)
+    elif amount_evidence.get("ideal_range"):
+        ideal_evidence = amount_evidence["ideal_range"]
+        ticket_min = ideal_evidence.get("min")
+        ticket_max = ideal_evidence.get("max")
+        currency = ideal_evidence.get("currency") or currency
+        money_snippet = ideal_evidence.get("raw")
+        money_confidence = 0.72
+
     if money_snippet:
         _add_evidence(
             "ticket_range",
@@ -894,6 +992,20 @@ def build_programme_record(
             raw_text_snippets,
             extraction_confidence,
             raw_value=money_snippet,
+            source_section="funding_offer",
+            source_scope=source_scope,
+            method="deterministic_parser",
+        )
+        _add_evidence(
+            "amount_evidence",
+            amount_evidence,
+            json.dumps(amount_evidence, ensure_ascii=False),
+            money_confidence or 0.72,
+            page_url,
+            evidence_store,
+            raw_text_snippets,
+            extraction_confidence,
+            raw_value=amount_evidence,
             source_section="funding_offer",
             source_scope=source_scope,
             method="deterministic_parser",
@@ -1605,6 +1717,8 @@ def build_programme_record(
     record = FundingProgrammeRecord(
         program_name=program_name,
         funder_name=funder_name,
+        parent_programme_name=parent_programme_name,
+        programme_nature=programme_nature,
         source_url=page_url,
         source_urls=[page_url],
         source_domain=source_domain,

@@ -44,6 +44,16 @@ def test_generate_funder_queries_uses_domain_and_funder_name_without_site_specif
     assert len({len(queries) for queries in query_sets}) == 1
 
 
+def test_generate_funder_queries_prefers_programme_hints_when_available() -> None:
+    funder = WebSearchFunder("PIC", "https://www.pic.gov.za/")
+
+    queries = generate_funder_queries(funder, max_queries=3, programme_hints=["Isibaya Fund"])
+
+    assert queries[0] == 'site:pic.gov.za "Isibaya Fund"'
+    assert queries[1] == 'site:pic.gov.za "Isibaya Fund" funding'
+    assert queries[2] == 'site:pic.gov.za "Isibaya Fund" application'
+
+
 def test_web_search_mapper_preserves_source_metadata_and_sub_programme_hierarchy() -> None:
     funder = WebSearchFunder("SEFA", "https://www.sefa.org.za/products/direct-lending-products")
     draft = WebSearchProgrammeDraft(

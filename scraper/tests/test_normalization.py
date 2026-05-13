@@ -90,6 +90,61 @@ def test_build_programme_record_classifies_debt_quasi_equity_and_equity_as_hybri
     assert record.funding_type.value == "Hybrid"
 
 
+def test_build_programme_record_extracts_parent_child_hierarchy_and_ideal_amounts(settings) -> None:
+    block = CandidateBlock(
+        heading="Developmental Investments South Africa",
+        text=(
+            "Purpose: Invest in unlisted South African entities for financial and developmental returns. "
+            "Investment Guidance: Min R100m. Ideal R300–R500m. Structure Debt • Equity • Hybrid."
+        ),
+        source_url="https://www.pic.gov.za/isibaya",
+    )
+    record, _evidence = build_programme_record(
+        block=block,
+        page_url="https://www.pic.gov.za/isibaya",
+        page_title="Isibaya Fund - Public Investment Corporation",
+        settings=settings,
+    )
+
+    assert record is not None
+    assert record.program_name == "Developmental Investments South Africa"
+    assert record.parent_programme_name == "Isibaya Fund"
+    assert record.programme_nature.value == "sub_programme"
+    assert record.funding_type.value == "Hybrid"
+    assert record.ticket_min == 100000000
+    assert record.ticket_max is None
+    assert "amount_evidence" in record.field_evidence
+    amount_evidence = record.field_evidence["amount_evidence"][0]
+    assert amount_evidence.normalized_value["ideal_range"]["min"] == 300000000
+    assert amount_evidence.normalized_value["ideal_range"]["max"] == 500000000
+
+
+def test_build_programme_record_parses_usd_ideal_range_without_polluting_turnover(settings) -> None:
+    block = CandidateBlock(
+        heading="Developmental Investments Rest of Africa",
+        text=(
+            "Purpose: Invest in unlisted African entities outside South Africa. "
+            "Investment Guidance: Min US$10m. Ideal US$20–US$40m. "
+            "Eligibility: annual turnover must exceed R300m."
+        ),
+        source_url="https://www.pic.gov.za/isibaya",
+    )
+    record, _evidence = build_programme_record(
+        block=block,
+        page_url="https://www.pic.gov.za/isibaya",
+        page_title="Isibaya Fund - Public Investment Corporation",
+        settings=settings,
+    )
+
+    assert record is not None
+    assert record.ticket_min == 10000000
+    assert record.currency == "USD"
+    assert record.turnover_min == 300000000
+    assert record.turnover_max is None
+    assert record.field_evidence["amount_evidence"][0].normalized_value["ideal_range"]["min"] == 20000000
+    assert record.field_evidence["amount_evidence"][0].normalized_value["ideal_range"]["max"] == 40000000
+
+
 def test_build_programme_record_falls_back_to_body_text_for_ticket_range_when_funding_section_is_requirements(settings) -> None:
     block = CandidateBlock(
         heading="Women Empowerment Fund (WEF)",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -13,7 +14,7 @@ from scraper.schemas import (
     ProgrammeStatus,
     RepaymentFrequency,
 )
-from scraper.utils.money import extract_money_range, parse_money_token
+from scraper.utils.money import extract_amount_evidence, extract_money_range, parse_money_token
 from scraper.utils.text import clean_text, unique_preserve_order
 from scraper.utils.urls import canonicalize_url, extract_host
 from scraper.web_search.models import WebSearchFunder, WebSearchProgrammeDraft, WebSearchSource
@@ -45,6 +46,7 @@ def draft_to_record(
     funding_type = _classify_funding_type(draft)
     ticket_min = _coerce_money_value(draft.ticket_min, funder.currency)
     ticket_max = _coerce_money_value(draft.ticket_max, funder.currency)
+    amount_evidence = extract_amount_evidence(" ".join([*draft.funding_lines, draft.ideal_range or "", draft.extraction_notes or ""]), default_currency=funder.currency)
     if ticket_min is None or ticket_max is None:
         parsed_min, parsed_max, _currency, _snippet, _confidence = extract_money_range(
             " ".join([*draft.funding_lines, draft.ideal_range or ""]),
@@ -52,6 +54,10 @@ def draft_to_record(
         )
         ticket_min = ticket_min if ticket_min is not None else parsed_min
         ticket_max = ticket_max if ticket_max is not None else parsed_max
+    if ticket_min is None and amount_evidence.get("minimum"):
+        ticket_min = amount_evidence["minimum"].get("value")
+    if ticket_max is None and amount_evidence.get("maximum"):
+        ticket_max = amount_evidence["maximum"].get("value")
 
     secondary_payload = [
         source.model_dump(mode="json")
@@ -82,6 +88,7 @@ def draft_to_record(
                 *("secondary_sources=%s" % secondary_payload for _ in [0] if secondary_payload),
             ]
         ),
+        "amount_evidence": [json.dumps(amount_evidence, ensure_ascii=False)] if amount_evidence else [],
         "raw_eligibility_criteria": list(draft.raw_eligibility_criteria),
         "raw_repayment_terms": list(draft.raw_repayment_terms),
         "application_process": [draft.application_process] if draft.application_process else [],
@@ -133,6 +140,7 @@ def draft_to_record(
             "raw_eligibility_criteria": list(draft.raw_eligibility_criteria),
             "required_documents": list(draft.required_documents),
             "web_search_metadata": raw_text_snippets.get("web_search_metadata", []),
+            "amount_evidence": raw_text_snippets.get("amount_evidence", []),
         },
         extraction_confidence={
             "program_name": confidence,
@@ -164,18 +172,21 @@ def _classify_funding_type(draft: WebSearchProgrammeDraft) -> FundingType:
             *draft.raw_eligibility_criteria,
             draft.extraction_notes or "",
         ]
-    ).casefold()
-    has_debt = any(term in text for term in FUNDING_TYPE_TERMS[FundingType.LOAN])
+    ).casefold().replace("•", " ").replace("+", " ").replace("&", " ")
+    has_debt = any(term in text for term in FUNDING_TYPE_TERMS[FundingType.LOAN]) or "debt" in text
     has_equity = any(term in text for term in FUNDING_TYPE_TERMS[FundingType.EQUITY])
-    if has_debt and has_equity:
+    has_grant = any(term in text for term in FUNDING_TYPE_TERMS[FundingType.GRANT])
+    has_guarantee = any(term in text for term in FUNDING_TYPE_TERMS[FundingType.GUARANTEE])
+    has_hybrid = "hybrid" in text or "blended finance" in text or "mezzanine" in text or "convertible" in text
+    if sum(bool(flag) for flag in (has_debt, has_equity, has_grant, has_guarantee, has_hybrid)) > 1 or (has_hybrid and (has_debt or has_equity or has_grant or has_guarantee)):
         return FundingType.HYBRID
     if has_debt:
         return FundingType.LOAN
     if has_equity:
         return FundingType.EQUITY
-    if any(term in text for term in FUNDING_TYPE_TERMS[FundingType.GRANT]):
+    if has_grant:
         return FundingType.GRANT
-    if any(term in text for term in FUNDING_TYPE_TERMS[FundingType.GUARANTEE]):
+    if has_guarantee:
         return FundingType.GUARANTEE
     return FundingType.UNKNOWN
 

@@ -65,6 +65,26 @@ def test_generic_parser_keeps_listing_pages_generic(settings, fixture_dir: Path)
     assert "https://example.org/programmes/asset-finance-facility" in result.discovered_links
 
 
+def test_generic_parser_dedupes_card_listing_sections(settings, fixture_dir: Path) -> None:
+    parser = GenericFundingParser(settings)
+    html = (fixture_dir / "three_program_listing.html").read_text(encoding="utf-8")
+    page = _page(
+        "https://example.org/funding-products",
+        html,
+        "Funding Products - Growth Finance Agency",
+    )
+
+    result = parser.parse(page, allowed_domains=["example.org"])
+
+    assert len(result.structured_sections) == 3
+    assert [section.heading for section in result.structured_sections] == [
+        "Youth Growth Grant",
+        "Asset Finance Loan",
+        "Expansion Equity Facility",
+    ]
+    assert len(result.page_ai_context.candidate_blocks) == 3
+
+
 def test_generic_parser_extracts_card_title_sections(settings) -> None:
     parser = GenericFundingParser(settings)
     html = """

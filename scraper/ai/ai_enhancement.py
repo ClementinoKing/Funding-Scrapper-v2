@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from scraper import __version__ as SCRAPER_VERSION
 from scraper.classifiers.eligibility import extract_eligibility_criteria
+from scraper.classifiers.funding_type import classify_funding_type
 from scraper.schemas import (
     CandidateBlockSnapshot,
     AIMergeDecisionResponse,
@@ -143,9 +145,15 @@ NON_PROGRAMME_SIGNAL_TERMS = (
     "news",
     "article",
     "blog",
+    "philosophy",
+    "governance",
+    "process",
+    "procedure",
     "press release",
     "media",
     "publication",
+    "report",
+    "annual report",
     "case study",
     "success story",
     "about us",
@@ -153,6 +161,12 @@ NON_PROGRAMME_SIGNAL_TERMS = (
     "privacy",
     "terms",
     "policy",
+    "faq",
+    "download",
+    "procurement",
+    "tender",
+    "pdf",
+    "xlsx",
     "screenshot",
     "image",
     "gallery",
@@ -464,6 +478,7 @@ class ContentItem:
     label: str
     content: str
     source_url: str
+    page_structure: str = "single_programme_page"
     source_section: Optional[str] = None
     source_scope: Optional[str] = None
     confidence_hint: float = 0.0
@@ -490,6 +505,36 @@ class FallbackProgrammeCandidate:
     content: str
     source_scope: str
     source_section: Optional[str] = None
+
+
+def _fallback_candidate_signature(label: str, content: str) -> tuple[str, str]:
+    normalized_label = strip_leading_numbered_prefix(clean_text(label or "")).casefold()
+    normalized_content = clean_text(content or "")
+    if normalized_label and normalized_content.casefold().startswith(normalized_label):
+        normalized_content = clean_text(normalized_content[len(normalized_label) :])
+    return normalized_label, normalized_content.casefold()
+
+
+def _fallback_candidate_is_more_specific(existing: FallbackProgrammeCandidate, candidate: FallbackProgrammeCandidate) -> bool:
+    existing_label, existing_content = _fallback_candidate_signature(existing.label, existing.content)
+    candidate_label, candidate_content = _fallback_candidate_signature(candidate.label, candidate.content)
+    if not existing_label or not candidate_label:
+        return False
+    if existing_label != candidate_label:
+        return False
+    if existing_content == candidate_content:
+        return False
+    if len(candidate_content) <= len(existing_content):
+        return False
+    return existing_content in candidate_content
+
+
+PAGE_STRUCTURE_SINGLE = "single_programme_page"
+PAGE_STRUCTURE_MULTI = "multi_programme_listing"
+PAGE_STRUCTURE_PARENT = "parent_programme_with_sub_programmes"
+PAGE_STRUCTURE_APPLICATION = "application_page"
+PAGE_STRUCTURE_GENERIC = "generic_content"
+PAGE_STRUCTURE_DOCUMENT = "document_page"
 
 
 # Normalization helpers convert loose upstream values into compact text, numeric,
@@ -680,6 +725,17 @@ def _coerce_enum(enum_cls, value: Any):
     enum_map = aliases.get(enum_cls, {})
     if text in enum_map:
         return enum_map[text]
+    if enum_cls is FundingType:
+        normalized = text.replace("•", " ").replace("+", " ").replace("&", " ").replace("/", " ")
+        normalized = " ".join(normalized.split())
+        if any(term in normalized for term in ("hybrid", "blended finance", "mezzanine", "convertible", "quasi-equity", "quasi equity")):
+            return FundingType.HYBRID
+        has_debt = "debt" in normalized or any(term in normalized for term in ("loan", "working capital loan", "bridging loan", "asset finance", "credit facility", "repayable finance"))
+        has_grant = "grant" in normalized
+        has_equity = "equity" in normalized
+        has_guarantee = "guarantee" in normalized
+        if sum(bool(flag) for flag in (has_debt, has_grant, has_equity, has_guarantee)) > 1:
+            return FundingType.HYBRID
     for member in enum_cls:
         if text == clean_text(member.value).casefold():
             return member
@@ -983,10 +1039,34 @@ def _content_item_signature(item: ContentItem) -> tuple[str, str, str]:
     )
 
 
+def _detect_page_structure(document: PageContentDocument) -> str:
+    source_kind = infer_document_kind(document.page_url, document.source_content_type)
+    if source_kind in {"pdf", "docx", "xlsx", "image"}:
+        return PAGE_STRUCTURE_DOCUMENT
+
+    structured_count = len(document.structured_sections)
+    interactive_count = len(document.interactive_sections)
+    heading_text = " ".join(document.headings[:8]).casefold()
+    body_text = " ".join([document.title or "", document.page_title or "", document.full_body_text or "", heading_text]).casefold()
+    has_application_signals = any(term in body_text for term in ("apply", "application", "portal", "register"))
+    has_funding_signals = any(term in body_text for term in ("fund", "grant", "loan", "equity", "investment", "finance", "ticket", "funding"))
+
+    if has_application_signals and not has_funding_signals and structured_count <= 1 and interactive_count <= 1:
+        return PAGE_STRUCTURE_APPLICATION
+    if structured_count > 1 or interactive_count > 1:
+        if any(term in heading_text for term in ("fund", "programme", "program", "isibaya", "portfolio", "products", "facilities")):
+            return PAGE_STRUCTURE_PARENT
+        return PAGE_STRUCTURE_MULTI
+    if has_funding_signals:
+        return PAGE_STRUCTURE_SINGLE
+    return PAGE_STRUCTURE_GENERIC
+
+
 def _build_content_items_from_document(document: PageContentDocument) -> List[ContentItem]:
     """Flatten the scraped page into the text blocks the AI layer can route."""
     items: List[ContentItem] = []
     seen: set[tuple[str, str, str]] = set()
+    page_structure = _detect_page_structure(document)
 
     def add_item(
         item_type: str,
@@ -1006,6 +1086,7 @@ def _build_content_items_from_document(document: PageContentDocument) -> List[Co
             label=cleaned_label,
             content=cleaned_content,
             source_url=document.page_url,
+            page_structure=page_structure,
             source_section=cleaned_label if source_section is None else clean_text(source_section),
             source_scope=clean_text(source_scope or "") or None,
             confidence_hint=max(0.0, min(float(confidence_hint), 1.0)),
@@ -1236,7 +1317,7 @@ def _document_for_fallback_candidate(document: PageContentDocument, candidate: F
 
 def _collect_fallback_programme_candidates(document: PageContentDocument) -> List[FallbackProgrammeCandidate]:
     candidates: List[FallbackProgrammeCandidate] = []
-    seen: set[tuple[str, str]] = set()
+    candidate_index: Dict[str, int] = {}
 
     def add(label: str, content: str, source_scope: str, source_section: Optional[str] = None) -> None:
         cleaned_content = clean_text(content)
@@ -1247,18 +1328,23 @@ def _collect_fallback_programme_candidates(document: PageContentDocument) -> Lis
             return
         if _fallback_candidate_is_excluded(candidate_label, cleaned_content):
             return
-        signature = (candidate_label.casefold(), compact_document_text(cleaned_content, max_chars=280).casefold())
-        if signature in seen:
-            return
-        seen.add(signature)
-        candidates.append(
-            FallbackProgrammeCandidate(
-                label=candidate_label,
-                content=cleaned_content,
-                source_scope=source_scope,
-                source_section=source_section or candidate_label,
-            )
+        candidate = FallbackProgrammeCandidate(
+            label=candidate_label,
+            content=cleaned_content,
+            source_scope=source_scope,
+            source_section=source_section or candidate_label,
         )
+        label_key, _content_key = _fallback_candidate_signature(candidate.label, candidate.content)
+        if not label_key:
+            return
+        existing_index = candidate_index.get(label_key)
+        if existing_index is None:
+            candidate_index[label_key] = len(candidates)
+            candidates.append(candidate)
+            return
+        existing_candidate = candidates[existing_index]
+        if _fallback_candidate_is_more_specific(existing_candidate, candidate):
+            candidates[existing_index] = candidate
 
     for section in document.structured_sections:
         add(section.heading, section.content, "structured_sections", section.heading)
@@ -1309,6 +1395,108 @@ def _is_domain_navigation_homepage(document: PageContentDocument) -> bool:
         return False
     domain = (document.source_domain or extract_domain(document.page_url) or "").lower().removeprefix("www.")
     return domain in {"pic.gov.za"}
+
+
+def _document_source_basename(url: str) -> str:
+    path = urlparse(url or "").path.rstrip("/")
+    return clean_text(path.rsplit("/", 1)[-1] if path else "").casefold()
+
+
+def _document_source_text(document: PageContentDocument) -> str:
+    sections = " ".join(section.heading + " " + section.content for section in document.structured_sections)
+    interactive = " ".join(section.label + " " + section.content for section in document.interactive_sections)
+    return clean_text(
+        " ".join(
+            [
+                document.page_url or "",
+                document.title or "",
+                document.page_title or "",
+                document.source_content_type or "",
+                document.main_content_hint or "",
+                " ".join(document.headings or []),
+                sections,
+                interactive,
+                (document.full_body_text or "")[:4000],
+            ]
+        )
+    ).casefold()
+
+
+def _preflight_page_decision(document: PageContentDocument) -> Tuple[str, str, float, List[str]]:
+    text = _document_source_text(document)
+    inferred_page_type = _classify_enhancer_page_type(
+        record_count=max(1, len(document.headings) // 2) if document.headings else 0,
+        candidate_block_count=max(1, len(document.structured_sections) or len(document.headings) or 1),
+        internal_link_count=len(document.internal_links),
+        detail_link_count=len(document.discovered_links),
+        application_link_count=len(document.application_links),
+        document_link_count=len(document.document_links),
+        text=text,
+    )
+    program_hits = [term for term in PROGRAMME_SIGNAL_TERMS if term in text]
+    non_program_hits = [term for term in NON_PROGRAMME_SIGNAL_TERMS if term in text]
+    file_kind = infer_document_kind(document.page_url, document.source_content_type)
+    file_like = file_kind in {"pdf", "docx", "xlsx", "image"}
+    file_basename = _document_source_basename(document.page_url)
+    strong_program_hits = [term for term in program_hits if term not in {"investment"}]
+    file_block_hits = [
+        term
+        for term in (
+            "performance",
+            "current",
+            "signature",
+            "report",
+            "annual report",
+            "news",
+            "article",
+            "success story",
+            "media",
+            "procurement",
+            "tender",
+            "faq",
+            "policy",
+            "governance",
+            "process",
+        )
+        if term in text or term in file_basename
+    ]
+    file_allow_hits = [
+        term
+        for term in ("fund", "funding", "programme", "program", "application", "eligibility", "criteria", "investment", "loan", "grant", "equity", "apply", "form", "checklist")
+        if term in text or term in file_basename
+    ]
+
+    if _is_domain_navigation_homepage(document) and not program_hits:
+        return PAGE_DECISION_NOT_FUNDING_PROGRAM, PAGE_TYPE_GENERIC_CONTENT, 0.99, ["homepage navigation only"]
+
+    if inferred_page_type in {
+        PAGE_TYPE_TENDER_PROCUREMENT,
+        PAGE_TYPE_NEWS_ARTICLE,
+        PAGE_TYPE_TECHNOLOGY_STATION,
+        PAGE_TYPE_SUPPORT_PROGRAMME,
+        PAGE_TYPE_GENERIC_CONTENT,
+    }:
+        confidence = 0.95
+        if inferred_page_type == PAGE_TYPE_GENERIC_CONTENT and len(strong_program_hits) >= 2:
+            confidence = 0.55
+        return PAGE_DECISION_NOT_FUNDING_PROGRAM, inferred_page_type, confidence, [f"inferred page_type {inferred_page_type}"]
+
+    if any(term in text for term in ("philosophy", "governance", "process", "procedure")) and not strong_program_hits:
+        return PAGE_DECISION_NOT_FUNDING_PROGRAM, PAGE_TYPE_GENERIC_CONTENT, 0.97, ["page is governance or philosophy content"]
+
+    if file_like:
+        if not file_allow_hits and not strong_program_hits:
+            return PAGE_DECISION_NOT_FUNDING_PROGRAM, PAGE_TYPE_GENERIC_CONTENT, 0.96, ["file-like document lacks programme terms"]
+        if file_block_hits and not strong_program_hits:
+            return PAGE_DECISION_NOT_FUNDING_PROGRAM, PAGE_TYPE_GENERIC_CONTENT, 0.94, ["file-like document looks like a generic report or media asset"]
+
+    if len(non_program_hits) >= 2 and not strong_program_hits:
+        return PAGE_DECISION_NOT_FUNDING_PROGRAM, PAGE_TYPE_GENERIC_CONTENT, 0.93, ["page matches generic article/media/policy signals"]
+    if len(strong_program_hits) >= 2:
+        return PAGE_DECISION_FUNDING_PROGRAM, inferred_page_type, 0.9, [f"contains programme signals: {', '.join(program_hits[:4])}"]
+    if len(strong_program_hits) == 1 and not non_program_hits and len((document.full_body_text or "").strip()) >= 600:
+        return PAGE_DECISION_FUNDING_PROGRAM, inferred_page_type, 0.8, [f"contains funding signal: {program_hits[0]}"]
+    return PAGE_DECISION_UNCLEAR, inferred_page_type, 0.55, []
 
 
 def _merge_snippet_map(target: Dict[str, List[str]], source: Dict[str, List[str]]) -> Dict[str, List[str]]:
@@ -1372,6 +1560,10 @@ def _route_content_item_to_fields(item: ContentItem) -> FieldEvidenceBundle:
     snippet = compact_document_text(text, max_chars=900) or text
     label_lower = clean_text(item.label).lower()
     content_lower = clean_text(item.content).lower()
+    if item.source_scope in {"structured_sections", "interactive_sections"}:
+        _add_bundle_snippet(bundle, "local_section_text", snippet)
+    if item.source_scope in {"metadata", "headings", "full_body_text"}:
+        _add_bundle_snippet(bundle, "shared_page_context", snippet)
     route_hits = [
         bucket
         for bucket, terms in CONTENT_BUCKET_TERMS.items()
@@ -1384,6 +1576,11 @@ def _route_content_item_to_fields(item: ContentItem) -> FieldEvidenceBundle:
             route_hits = ["program"]
         else:
             route_hits = ["supporting"]
+
+    if item.page_structure in {PAGE_STRUCTURE_MULTI, PAGE_STRUCTURE_PARENT} and item.source_scope in {"metadata", "headings", "full_body_text"}:
+        route_hits = ["program"] if item.item_type in {"title", "page_title", "heading"} else ["supporting"]
+        if item.source_scope == "full_body_text":
+            _add_bundle_snippet(bundle, "shared_page_context", snippet)
 
     source_confidence = max(0.0, min(item.confidence_hint, 1.0))
     if item.item_type in {"title", "page_title"}:
@@ -2050,55 +2247,8 @@ def _infer_page_role(document: PageContentDocument, page_type: str, existing_rol
 
 
 def _page_decision_hint(document: PageContentDocument) -> Tuple[str, List[str]]:
-    # This is the cheap pre-model heuristic that guesses whether the page is a
-    # real funding programme or just generic site content.
-    text = " ".join(
-        [
-            document.page_url or "",
-            document.title or "",
-            document.page_title or "",
-            " ".join(document.headings or []),
-            document.main_content_hint or "",
-            (document.full_body_text or "")[:2000],
-            _interactive_sections_text(document),
-        ]
-    ).casefold()
-    inferred_page_type = _classify_enhancer_page_type(
-        record_count=max(1, len(document.headings) // 2) if document.headings else 0,
-        candidate_block_count=max(1, len(document.structured_sections) or len(document.headings) or 1),
-        internal_link_count=len(document.internal_links),
-        detail_link_count=len(document.discovered_links),
-        application_link_count=len(document.application_links),
-        document_link_count=len(document.document_links),
-        text=text,
-    )
-    program_hits = [term for term in PROGRAMME_SIGNAL_TERMS if term in text]
-    non_program_hits = [term for term in NON_PROGRAMME_SIGNAL_TERMS if term in text]
-    file_like = bool(re.search(r"\bimg[-_ ]?\d|\.(?:jpe?g|png|gif|webp|pdf)(?:\b|$)", text))
-    if inferred_page_type in {
-        PAGE_TYPE_TENDER_PROCUREMENT,
-        PAGE_TYPE_NEWS_ARTICLE,
-        PAGE_TYPE_TECHNOLOGY_STATION,
-        PAGE_TYPE_SUPPORT_PROGRAMME,
-        PAGE_TYPE_GENERIC_CONTENT,
-    }:
-        return PAGE_DECISION_NOT_FUNDING_PROGRAM, [f"inferred page_type {inferred_page_type}"]
-    if file_like and len(program_hits) < 2:
-        # File-like URLs without enough programme evidence are treated as
-        # non-program pages because they are usually attachments or media.
-        return PAGE_DECISION_NOT_FUNDING_PROGRAM, ["title or URL looks like a file or media asset"]
-    if len(non_program_hits) >= 2 and len(program_hits) == 0:
-        # Generic article/news/privacy signals override weak funding language.
-        return PAGE_DECISION_NOT_FUNDING_PROGRAM, ["page matches generic article/media/policy signals"]
-    if len(program_hits) >= 2:
-        # Multiple programme signals are enough to treat the page as a likely
-        # funding page even before the model sees it.
-        return PAGE_DECISION_FUNDING_PROGRAM, [f"contains programme signals: {', '.join(program_hits[:4])}"]
-    if len(program_hits) == 1 and len(non_program_hits) == 0 and len((document.full_body_text or "").strip()) >= 600:
-        # A single strong funding signal can still be enough if the page body is
-        # substantial and otherwise clean.
-        return PAGE_DECISION_FUNDING_PROGRAM, [f"contains funding signal: {program_hits[0]}"]
-    return PAGE_DECISION_UNCLEAR, []
+    decision, _page_type, _confidence, reasons = _preflight_page_decision(document)
+    return decision, reasons
 
 
 def _source_scope_for_page_type(page_type: str) -> str:
@@ -2782,7 +2932,24 @@ def _normalize_draft(
     payload["source_scope"] = _coerce_optional_text(payload.get("source_scope")) or _source_scope_for_page_type(payload["page_type"])
     # All enum-like fields are normalized to schema values so the downstream
     # record validator receives exactly one representation.
-    payload["funding_type"] = (_coerce_enum(FundingType, payload.get("funding_type")) or FundingType.UNKNOWN).value
+    funding_type = _coerce_enum(FundingType, payload.get("funding_type")) or FundingType.UNKNOWN
+    funding_type_text = " ".join(
+        unique_preserve_order(
+            [
+                _coerce_text(payload.get("funding_type")),
+                " ".join(_coerce_list(payload.get("funding_lines"))),
+                " ".join(derived["raw_funding_offer_data"]),
+                " ".join(derived["raw_terms_data"]),
+                " ".join(document_context["funding_lines"]),
+                _coerce_optional_text(payload.get("payback_structure")) or "",
+                _coerce_optional_text(payload.get("payback_raw_text")) or "",
+            ]
+        )
+    )
+    classified_type, _classified_confidence, _classified_hits = classify_funding_type(funding_type_text)
+    if classified_type == FundingType.HYBRID or funding_type == FundingType.UNKNOWN:
+        funding_type = classified_type if classified_type != FundingType.UNKNOWN else funding_type
+    payload["funding_type"] = funding_type.value
     payload["deadline_type"] = (_coerce_enum(DeadlineType, payload.get("deadline_type")) or DeadlineType.UNKNOWN).value
     payload["geography_scope"] = (_coerce_enum(GeographyScope, payload.get("geography_scope")) or GeographyScope.UNKNOWN).value
     payload["security_required"] = (_coerce_enum(TriState, payload.get("security_required")) or TriState.UNKNOWN).value
@@ -2988,6 +3155,25 @@ def _draft_to_record(
     source_url = document.page_url
     source_domain = payload.get("source_domain") or extract_domain(source_url)
     funding_type = _coerce_enum(FundingType, payload.get("funding_type")) or FundingType.UNKNOWN
+    funding_type_source_text = " ".join(
+        unique_preserve_order(
+            [
+                _coerce_text(payload.get("funding_type")),
+                " ".join(_coerce_list(payload.get("funding_lines"))),
+                " ".join(derived.get("raw_funding_offer_data") or []),
+                " ".join(document_context.get("funding_lines") or []),
+                " ".join(derived.get("raw_terms_data") or []),
+                payload.get("payback_structure") or "",
+                payload.get("payback_raw_text") or "",
+            ]
+        )
+    )
+    classified_funding_type, _funding_confidence, classified_hits = classify_funding_type(funding_type_source_text)
+    if classified_funding_type == FundingType.HYBRID or funding_type == FundingType.UNKNOWN:
+        funding_type = classified_funding_type if classified_funding_type != FundingType.UNKNOWN else funding_type
+    elif classified_funding_type != FundingType.UNKNOWN and funding_type != classified_funding_type:
+        if classified_funding_type == FundingType.HYBRID:
+            funding_type = FundingType.HYBRID
     deadline_type = _coerce_enum(DeadlineType, payload.get("deadline_type")) or DeadlineType.UNKNOWN
     geography_scope = _coerce_enum(GeographyScope, payload.get("geography_scope")) or GeographyScope.UNKNOWN
     security_required = _coerce_enum(TriState, payload.get("security_required")) or TriState.UNKNOWN
@@ -3259,11 +3445,22 @@ class AIClassifier:
             )
         self.min_confidence = float(config.get("aiMinConfidence", 0.55))
         self.max_retries = int(config.get("aiMaxRetries", 2))
+        self.max_ai_calls_per_funder = max(0, int(config.get("aiMaxCallsPerFunder", 5)))
+        self.max_ai_calls_per_run = max(0, int(config.get("aiMaxCallsPerRun", 30)))
+        self.max_pdf_ai_calls_per_funder = max(0, int(config.get("aiMaxPdfCallsPerFunder", 1)))
         self.industry_taxonomy = _as_taxonomy(config.get("industry_taxonomy"))
         self.use_of_funds_taxonomy = _as_taxonomy(config.get("use_of_funds_taxonomy"))
         self.ownership_target_keywords = _as_taxonomy(config.get("ownership_target_keywords"))
         self.entity_type_keywords = _as_taxonomy(config.get("entity_type_keywords"))
         self.certification_keywords = _as_taxonomy(config.get("certification_keywords"))
+        self._ai_calls_total = 0
+        self._ai_calls_by_funder: Dict[str, int] = {}
+        self._pdf_ai_calls_by_funder: Dict[str, int] = {}
+        self._classification_cache: Dict[str, Dict[str, Any]] = {}
+        self._classification_cache_path: Optional[Path] = None
+        if self.storage is not None and hasattr(self.storage, "output_root"):
+            self._classification_cache_path = Path(self.storage.output_root) / "raw" / "ai" / "page_classification_cache.json"
+            self._classification_cache = self._load_classification_cache()
 
     def _document_headers(self) -> Dict[str, str]:
         # Remote document requests use a simple browser-like header set.
@@ -3271,6 +3468,95 @@ class AIClassifier:
             "User-Agent": "Mozilla/5.0 (compatible; Scrapper/1.0; +https://example.org)",
             "Accept": "*/*",
         }
+
+    def _classification_scope_key(self, document: PageContentDocument) -> str:
+        scope = document.source_domain or extract_domain(document.page_url) or document.page_url
+        return clean_text(scope).casefold()
+
+    def _classification_cache_key(self, document: PageContentDocument) -> str:
+        payload = {
+            "page_url": document.page_url,
+            "title": document.title,
+            "page_title": document.page_title,
+            "source_content_type": document.source_content_type,
+            "headings": document.headings,
+            "full_body_text": (document.full_body_text or "")[:4000],
+            "main_content_hint": document.main_content_hint,
+            "structured_sections": [
+                {"heading": section.heading, "content": section.content}
+                for section in document.structured_sections
+            ],
+            "interactive_sections": [
+                {"type": section.type, "label": section.label, "content": section.content}
+                for section in document.interactive_sections
+            ],
+        }
+        fingerprint = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+
+    def _load_classification_cache(self) -> Dict[str, Dict[str, Any]]:
+        if not self._classification_cache_path or not self._classification_cache_path.exists():
+            return {}
+        try:
+            payload = json.loads(self._classification_cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if isinstance(payload, dict):
+            return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+        return {}
+
+    def _save_classification_cache(self) -> None:
+        if not self._classification_cache_path:
+            return
+        try:
+            self._classification_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._classification_cache_path.write_text(
+                json.dumps(self._classification_cache, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.debug("ai_classification_cache_write_failed", path=str(self._classification_cache_path))
+
+    def _cached_page_decision(self, document: PageContentDocument) -> Optional[Tuple[str, str, float, List[str]]]:
+        cache_entry = self._classification_cache.get(self._classification_cache_key(document))
+        if not cache_entry:
+            return None
+        decision = _normalize_page_decision(cache_entry.get("page_decision"))
+        page_type = normalize_page_type(cache_entry.get("page_type")) if cache_entry.get("page_type") else PAGE_TYPE_GENERIC_CONTENT
+        confidence = float(cache_entry.get("page_decision_confidence") or 0.0)
+        reasons = list(cache_entry.get("reasons") or [])
+        if decision == PAGE_DECISION_NOT_FUNDING_PROGRAM and confidence >= 0.85:
+            return decision, page_type, confidence, reasons
+        return None
+
+    def _store_page_decision_cache(self, document: PageContentDocument, decision: str, page_type: str, confidence: float, reasons: Sequence[str]) -> None:
+        entry = {
+            "page_url": document.page_url,
+            "page_decision": decision,
+            "page_type": page_type,
+            "page_decision_confidence": confidence,
+            "reasons": list(reasons),
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._classification_cache[self._classification_cache_key(document)] = entry
+        self._save_classification_cache()
+
+    def _budget_allowed(self, document: PageContentDocument, *, is_pdf: bool = False) -> Tuple[bool, Optional[str]]:
+        scope_key = self._classification_scope_key(document)
+        if self.max_ai_calls_per_run and self._ai_calls_total >= self.max_ai_calls_per_run:
+            return False, "ai_budget_exceeded"
+        if self.max_ai_calls_per_funder and self._ai_calls_by_funder.get(scope_key, 0) >= self.max_ai_calls_per_funder:
+            return False, "ai_budget_exceeded"
+        if is_pdf and self.max_pdf_ai_calls_per_funder and self._pdf_ai_calls_by_funder.get(scope_key, 0) >= self.max_pdf_ai_calls_per_funder:
+            return False, "pdf_ai_budget_exceeded"
+        return True, None
+
+    def _record_ai_usage(self, document: PageContentDocument, *, is_pdf: bool = False) -> None:
+        scope_key = self._classification_scope_key(document)
+        self._ai_calls_total += 1
+        self._ai_calls_by_funder[scope_key] = self._ai_calls_by_funder.get(scope_key, 0) + 1
+        if is_pdf:
+            self._pdf_ai_calls_by_funder[scope_key] = self._pdf_ai_calls_by_funder.get(scope_key, 0) + 1
 
     def _artifact_slug(self, document: PageContentDocument) -> str:
         # Artifact filenames are derived from the URL so each page gets a stable
@@ -3292,15 +3578,19 @@ class AIClassifier:
             except Exception:
                 logger.debug("ai_artifact_write_failed", kind=kind, page_url=document.page_url)
 
-    def _should_skip_document_source(self, url: str, content_type: Optional[str]) -> bool:
+    def _should_skip_document_source(self, url: str, content_type: Optional[str], hint_text: str = "") -> bool:
         # Some document types and URL patterns are intentionally skipped because
         # they are noisy, unsupported, or not useful as AI evidence.
         lowered_url = (url or "").lower()
         lowered_content_type = clean_text(content_type or "").lower()
+        lowered_hint = clean_text(hint_text or "").casefold()
         if lowered_content_type and any(lowered_content_type.startswith(item) for item in self.document_ai_skip_content_types):
             return True
         if any(term and term in lowered_url for term in self.document_ai_skip_url_terms):
             return True
+        if infer_document_kind(url, content_type) in {"pdf", "docx", "xlsx", "image"}:
+            if any(term in lowered_hint for term in ("performance", "current", "signature", "report", "annual report", "news", "article", "success story", "media", "procurement", "tender", "faq", "policy", "governance", "process")) and not any(term in lowered_hint for term in ("fund", "funding", "programme", "program", "application", "eligibility", "criteria", "investment", "loan", "grant", "equity", "apply", "form", "checklist")):
+                return True
         return False
 
     def _read_remote_document(self, url: str) -> tuple[Optional[bytes], Optional[str], List[str]]:
@@ -3368,6 +3658,16 @@ class AIClassifier:
         # compact evidence summary before the classifier sees it.
         if not self.api_key or self.ai_provider != "openai":
             return {}
+        scope_domain = (programme_context or {}).get("source_domain") or extract_domain((programme_context or {}).get("page_url") or document_url) or extract_domain(document_url)
+        budget_document = PageContentDocument(
+            page_url=document_url,
+            source_domain=scope_domain,
+            source_content_type=content_type,
+        )
+        allowed, reason = self._budget_allowed(budget_document, is_pdf=kind in {"pdf", "docx", "xlsx", "image"})
+        if not allowed:
+            logger.info("ai_document_summary_skipped_budget", document_url=document_url, reason=reason)
+            return {}
 
         client = OpenAI(api_key=self.api_key)
         prompt = self._build_document_summary_prompt(
@@ -3406,6 +3706,7 @@ class AIClassifier:
 
         # The response is forced to JSON so the summary payload can be parsed
         # deterministically.
+        self._record_ai_usage(budget_document, is_pdf=kind in {"pdf", "docx", "xlsx", "image"})
         response = client.responses.create(
             model=self.model,
             instructions=prompt,
@@ -3431,7 +3732,7 @@ class AIClassifier:
     ) -> Optional[DocumentEvidenceSnapshot]:
         # Each linked file is converted into a compact evidence snapshot that
         # carries both a summary and the cleaned text that was actually read.
-        if self._should_skip_document_source(document_url, content_type):
+        if self._should_skip_document_source(document_url, content_type, hint_text=" ".join([programme_context.get("programme_name") if programme_context else "", programme_context.get("page_title") if programme_context else "", programme_context.get("source_domain") if programme_context else ""])):
             return None
         kind = infer_document_kind(document_url, content_type)
         if kind == "unsupported":
@@ -3525,7 +3826,7 @@ class AIClassifier:
 
         evidence: List[DocumentEvidenceSnapshot] = []
         for document_url in candidate_urls[: self.document_ai_max_documents_per_page]:
-            if self._should_skip_document_source(document_url, None):
+            if self._should_skip_document_source(document_url, None, hint_text=programme_context.get("programme_name") if programme_context else ""):
                 continue
             try:
                 if document_url == document.page_url and source_kind in {"pdf", "docx", "xlsx"} and document.full_body_text:
@@ -3943,16 +4244,8 @@ class AIClassifier:
         interactive_text = _interactive_sections_text(document)
         body = document.full_body_text or section_text or interactive_text or document_text
         source_domain = document.source_domain or extract_domain(document.page_url)
-        funding_type = FundingType.UNKNOWN
+        funding_type, _funding_confidence, _funding_hits = classify_funding_type(body)
         lowered = body.lower()
-        if "grant" in lowered:
-            funding_type = FundingType.GRANT
-        elif "loan" in lowered or "debt" in lowered:
-            funding_type = FundingType.LOAN
-        elif "equity" in lowered or "shareholding" in lowered or "investment" in lowered:
-            funding_type = FundingType.EQUITY
-        elif "guarantee" in lowered:
-            funding_type = FundingType.GUARANTEE
 
         combined_text = " ".join([title, body, section_text, interactive_text, document_text])
         money_min, money_max, currency, _snippet, _confidence = extract_money_range(combined_text, default_currency=None)
@@ -4140,6 +4433,8 @@ class AIClassifier:
 
         recovered_records: List[FundingProgrammeRecord] = []
         existing_records = list(records)
+        if len(existing_records) >= len(candidates):
+            return existing_records
         for candidate in candidates:
             if any(_programme_name_matches_candidate(record.program_name, candidate.label) for record in existing_records):
                 continue
@@ -4176,6 +4471,42 @@ class AIClassifier:
         if not document.page_url:
             return []
         document = self._prepare_document_context(document)
+        cached_decision = self._cached_page_decision(document)
+        if cached_decision:
+            decision, page_type, confidence, reasons = cached_decision
+            logger.info(
+                "ai_classification_cache_hit",
+                page_url=document.page_url,
+                page_decision=decision,
+                page_type=page_type,
+                confidence=confidence,
+            )
+            if decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
+                return []
+        preflight_decision, preflight_page_type, preflight_confidence, preflight_reasons = _preflight_page_decision(document)
+        if preflight_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM and preflight_confidence >= 0.85:
+            logger.info(
+                "ai_classification_skipped_pre_filter",
+                page_url=document.page_url,
+                page_type=preflight_page_type,
+                confidence=preflight_confidence,
+                reasons=preflight_reasons,
+            )
+            self._store_page_decision_cache(document, preflight_decision, preflight_page_type, preflight_confidence, preflight_reasons)
+            return []
+        budget_allowed, budget_reason = self._budget_allowed(
+            document,
+            is_pdf=infer_document_kind(document.page_url, document.source_content_type) in {"pdf", "docx", "xlsx", "image"},
+        )
+        if not budget_allowed:
+            logger.info(
+                "ai_classification_skipped_budget",
+                page_url=document.page_url,
+                reason=budget_reason,
+                page_type=preflight_page_type,
+                confidence=preflight_confidence,
+            )
+            return self._fallback_classify(document)
         if not self.api_key:
             if self.require_remote_ai:
                 raise RuntimeError("Remote AI classification is required but no AI API key is configured.")
@@ -4191,6 +4522,10 @@ class AIClassifier:
         response: Optional[AIClassificationResponse] = None
         for attempt in range(self.max_retries + 1):
             try:
+                self._record_ai_usage(
+                    document,
+                    is_pdf=infer_document_kind(document.page_url, document.source_content_type) in {"pdf", "docx", "xlsx", "image"},
+                )
                 raw_response = self._call_model(system_prompt, user_prompt)
                 parsed = self._parse_response(raw_response)
                 parsed.page_decision = _normalize_page_decision(parsed.page_decision)
@@ -4227,9 +4562,11 @@ class AIClassifier:
 
         if response.page_decision == PAGE_DECISION_NOT_FUNDING_PROGRAM:
             logger.info("ai_classification_rejected_non_program_page", page_url=document.page_url)
+            self._store_page_decision_cache(document, response.page_decision, response.page_type or PAGE_TYPE_GENERIC_CONTENT, float(response.page_decision_confidence or 0.0), response.notes)
             return []
         if _is_domain_navigation_homepage(document):
             logger.info("ai_classification_rejected_navigation_homepage", page_url=document.page_url)
+            self._store_page_decision_cache(document, PAGE_DECISION_NOT_FUNDING_PROGRAM, PAGE_TYPE_GENERIC_CONTENT, 0.99, ["navigation homepage"])
             return []
 
         records: List[FundingProgrammeRecord] = []
@@ -4290,6 +4627,7 @@ class AIClassifier:
             PAGE_TYPE_GENERIC_CONTENT,
         }:
             logger.info("ai_classification_rejected_page_type", page_url=document.page_url, page_type=page_type)
+            self._store_page_decision_cache(document, PAGE_DECISION_NOT_FUNDING_PROGRAM, page_type, preflight_confidence, [f"inferred page_type {page_type}"])
             return []
         finalized_records: List[FundingProgrammeRecord] = []
         for record in records:

@@ -144,6 +144,9 @@ class ScraperSettings:
     ai_enrichment: bool = False
     ai_provider: str = "openai"
     ai_model: Optional[str] = None
+    ai_max_calls_per_funder: int = 5
+    ai_max_calls_per_run: int = 30
+    ai_max_pdf_calls_per_funder: int = 1
     document_ai_max_documents_per_page: int = 4
     document_ai_max_extracted_chars: int = 5000
     document_ai_timeout_seconds: int = 45
@@ -154,6 +157,9 @@ class ScraperSettings:
     web_search_min_insert_confidence: int = 50
     web_search_stop_after_success: bool = True
     hybrid_web_search_max_calls_per_funder: int = 1
+    hybrid_max_web_search_calls_per_funder: int = 3
+    hybrid_stop_after_first_success: bool = False
+    hybrid_enrich_sub_programmes: bool = True
     hybrid_min_accepted_records: int = 1
     hybrid_min_confidence: float = 0.70
     hybrid_min_completeness_score: float = 0.60
@@ -216,6 +222,9 @@ class ScraperSettings:
             ai_enrichment=_env_bool("SCRAPER_AI_ENRICHMENT", False),
             ai_provider=os.getenv("AI_PROVIDER", "openai").strip() or "openai",
             ai_model=os.getenv("SCRAPER_AI_MODEL", "").strip() or None,
+            ai_max_calls_per_funder=max(0, _env_int("SCRAPER_MAX_AI_CALLS_PER_FUNDER", 5)),
+            ai_max_calls_per_run=max(0, _env_int("SCRAPER_MAX_AI_CALLS_PER_RUN", 30)),
+            ai_max_pdf_calls_per_funder=max(0, _env_int("SCRAPER_MAX_PDF_AI_CALLS_PER_FUNDER", 1)),
             document_ai_max_documents_per_page=_env_int("SCRAPER_DOCUMENT_AI_MAX_DOCUMENTS_PER_PAGE", 4),
             document_ai_max_extracted_chars=_env_int("SCRAPER_DOCUMENT_AI_MAX_EXTRACTED_CHARS", 5000),
             document_ai_timeout_seconds=_env_int("SCRAPER_DOCUMENT_AI_TIMEOUT_SECONDS", 45),
@@ -225,7 +234,19 @@ class ScraperSettings:
             web_search_concurrency=max(1, _env_int("SCRAPER_WEB_SEARCH_CONCURRENCY", 1)),
             web_search_min_insert_confidence=max(0, min(_env_int("SCRAPER_WEB_SEARCH_MIN_INSERT_CONFIDENCE", 50), 100)),
             web_search_stop_after_success=_env_bool("SCRAPER_WEB_SEARCH_STOP_AFTER_SUCCESS", True),
-            hybrid_web_search_max_calls_per_funder=max(0, _env_int("SCRAPER_HYBRID_WEB_SEARCH_MAX_CALLS_PER_FUNDER", 1)),
+            hybrid_web_search_max_calls_per_funder=max(
+                0,
+                _env_int(
+                    "SCRAPER_HYBRID_WEB_SEARCH_MAX_CALLS_PER_FUNDER",
+                    _env_int("SCRAPER_HYBRID_MAX_WEB_SEARCH_CALLS_PER_FUNDER", 3),
+                ),
+            ),
+            hybrid_max_web_search_calls_per_funder=max(
+                0,
+                _env_int("SCRAPER_HYBRID_MAX_WEB_SEARCH_CALLS_PER_FUNDER", 3),
+            ),
+            hybrid_stop_after_first_success=_env_bool("SCRAPER_HYBRID_STOP_AFTER_FIRST_SUCCESS", False),
+            hybrid_enrich_sub_programmes=_env_bool("SCRAPER_HYBRID_ENRICH_SUB_PROGRAMMES", True),
             hybrid_min_accepted_records=max(0, _env_int("SCRAPER_HYBRID_MIN_ACCEPTED_RECORDS", 1)),
             hybrid_min_confidence=max(0.0, min(_env_float("SCRAPER_HYBRID_MIN_CONFIDENCE", 0.70), 1.0)),
             hybrid_min_completeness_score=max(0.0, min(_env_float("SCRAPER_HYBRID_MIN_COMPLETENESS_SCORE", 0.60), 1.0)),
@@ -287,6 +308,9 @@ class ScraperSettings:
             certification_keywords=dict(self.certification_keywords),
             ai_provider=self.ai_provider,
             ai_model=self.ai_model,
+            ai_max_calls_per_funder=self.ai_max_calls_per_funder,
+            ai_max_calls_per_run=self.ai_max_calls_per_run,
+            ai_max_pdf_calls_per_funder=self.ai_max_pdf_calls_per_funder,
             document_ai_max_documents_per_page=self.document_ai_max_documents_per_page,
             document_ai_max_extracted_chars=self.document_ai_max_extracted_chars,
             document_ai_timeout_seconds=self.document_ai_timeout_seconds,
@@ -297,6 +321,9 @@ class ScraperSettings:
             web_search_min_insert_confidence=self.web_search_min_insert_confidence,
             web_search_stop_after_success=self.web_search_stop_after_success,
             hybrid_web_search_max_calls_per_funder=self.hybrid_web_search_max_calls_per_funder,
+            hybrid_max_web_search_calls_per_funder=self.hybrid_max_web_search_calls_per_funder,
+            hybrid_stop_after_first_success=self.hybrid_stop_after_first_success,
+            hybrid_enrich_sub_programmes=self.hybrid_enrich_sub_programmes,
             hybrid_min_accepted_records=self.hybrid_min_accepted_records,
             hybrid_min_confidence=self.hybrid_min_confidence,
             hybrid_min_completeness_score=self.hybrid_min_completeness_score,

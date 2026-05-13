@@ -410,6 +410,12 @@ def _collect_sections(root: BeautifulSoup) -> List[PageContentSection]:
         heading_text = clean_text(heading.get_text(" ", strip=True))
         if not heading_text:
             continue
+        card_parent = heading.find_parent(class_=re.compile(r"(?:^|\s)(?:card|tile|panel)(?:\s|$)", re.I))
+        if isinstance(card_parent, Tag):
+            # Card-like containers are already captured by _collect_card_sections.
+            # Skipping them here avoids duplicating the same programme block with
+            # slightly different text slices.
+            continue
         content_parts: List[str] = []
         for sibling in heading.next_siblings:
             if isinstance(sibling, Tag) and _is_heading_tag(sibling):

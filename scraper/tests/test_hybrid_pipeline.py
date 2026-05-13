@@ -120,6 +120,28 @@ def test_hybrid_does_not_call_web_search_when_crawler_is_strong(tmp_path) -> Non
     assert summary.domain_telemetry[0]["web_search_status"] == "not_needed"
 
 
+def test_hybrid_does_not_call_web_search_for_strong_multi_programme_pages(tmp_path) -> None:
+    site = _site()
+    storage = LocalJsonStore(tmp_path)
+    crawler_records = [
+        _record(name="Isibaya Fund", source_url="https://www.pic.gov.za/isibaya", source_domain="www.pic.gov.za"),
+        _record(name="Developmental Investments South Africa", source_url="https://www.pic.gov.za/isibaya", source_domain="www.pic.gov.za"),
+    ]
+    web = FakeWebSearchPipeline([])
+    pipeline = HybridScraperPipeline(
+        ScraperSettings(output_path=tmp_path, scraper_mode="hybrid"),
+        storage=storage,
+        crawler_runner=_crawler_runner(storage, crawler_records, site),
+        web_search_pipeline=web,
+    )
+
+    summary = pipeline.run_sites([site])
+
+    assert summary.status == "success"
+    assert len(web.calls) == 0
+    assert summary.domain_telemetry[0]["web_search_status"] == "not_needed"
+
+
 def test_hybrid_calls_web_search_for_zero_accepted_records(tmp_path) -> None:
     site = _site()
     storage = LocalJsonStore(tmp_path)
